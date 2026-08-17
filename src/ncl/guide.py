@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-GUIDE = """ncl — read and write explicitly allowlisted Nextcloud calendars.
+GUIDE = """ncl — use a Nextcloud instance programmatically, from a command line.
 
-`ncl` is a deterministic command-line surface for an agent. It speaks CalDAV
+`ncl` is a deterministic surface for an agent. It speaks Nextcloud's protocols
 directly instead of driving a browser, and is deliberately neither an MCP
 server nor browser automation.
+
+Calendars are what it implements today, and the only thing it claims to do.
+Everything outside the `cal` commands — profiles, scope allowlists, exit codes,
+the plan/apply boundary — is app-agnostic and will carry the Nextcloud apps
+added after them.
 
 THE ORDER
   ncl doctor                    Local preconditions. Run it first; it reports

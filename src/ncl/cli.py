@@ -24,103 +24,194 @@ from . import (
 from .config import ConfigError
 
 
+class _Formatter(argparse.HelpFormatter):
+    """Two-column help with room for a sentence, not a fragment.
+
+    argparse's default wraps descriptions at whatever the flag names leave
+    over, which for a command set of any size is a ragged column two words
+    wide. A fixed, generous split reads like the help of the other tools in
+    this family.
+    """
+
+    def __init__(self, prog: str) -> None:
+        super().__init__(prog, max_help_position=32, width=96)
+
+    def _format_action(self, action: argparse.Action) -> str:
+        # The subcommand group prints its own metavar above the commands it
+        # holds, which says nothing the commands do not. Render the children
+        # and drop the header.
+        if isinstance(action, argparse._SubParsersAction):
+            return "".join(
+                super(_Formatter, self)._format_action(child)
+                for child in action._get_subactions()
+            )
+        return super()._format_action(action)
+
+
+class _Parser(argparse.ArgumentParser):
+    """An argparse parser that renders the way the sibling tools do.
+
+    The description leads, the usage line follows it, and the sections are
+    named for what they hold rather than for argparse's internal categories.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("formatter_class", _Formatter)
+        super().__init__(*args, **kwargs)
+        self._positionals.title = "Commands"
+        self._optionals.title = "Options"
+        for action in self._actions:
+            if isinstance(action, argparse._HelpAction):
+                action.help = "Print help"
+
+    def format_help(self) -> str:
+        formatter = self._get_formatter()
+        if self.description:
+            formatter.add_text(self.description)
+        formatter.add_usage(
+            self.usage, self._actions, self._mutually_exclusive_groups, prefix="Usage: "
+        )
+        for group in self._action_groups:
+            if not group._group_actions:
+                continue
+            formatter.start_section(group.title)
+            formatter.add_text(group.description)
+            formatter.add_arguments(group._group_actions)
+            formatter.end_section()
+        formatter.add_text(self.epilog)
+        return formatter.format_help()
+
+
 def _add_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--json", action="store_true", default=argparse.SUPPRESS, help="emit JSON"
+        "--json", action="store_true", default=argparse.SUPPRESS, help="Emit JSON"
     )
     parser.add_argument(
-        "--profile", default=argparse.SUPPRESS, help="select a configured profile"
+        "--profile", default=argparse.SUPPRESS, help="Select a configured profile"
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="ncl", description="Deterministic Nextcloud access")
-    parser.add_argument("--json", action="store_true", help="emit JSON")
-    parser.add_argument("--profile", help="select a configured profile")
-    commands = parser.add_subparsers(dest="command")
+    parser = _Parser(
+        prog="ncl",
+        description=(
+            "ncl — programmatic Nextcloud access for agents: calendars today, other "
+            "Nextcloud apps as they are added. Run `ncl` with no arguments for the "
+            "workflow guide."
+        ),
+    )
+    parser.add_argument("--json", action="store_true", help="Emit JSON")
+    parser.add_argument("--profile", help="Select a configured profile")
+    commands = parser.add_subparsers(
+        dest="command", metavar="<command>", parser_class=_Parser
+    )
 
-    doctor = commands.add_parser("doctor", help="check local preconditions")
+    doctor = commands.add_parser("doctor", help="Check every local precondition")
     _add_options(doctor)
 
-    profile = commands.add_parser("profile", help="inspect configured profiles")
-    profile_commands = profile.add_subparsers(dest="profile_command", required=True)
-    list_profiles = profile_commands.add_parser("list", help="list profiles")
+    profile = commands.add_parser("profile", help="Inspect configured profiles")
+    profile_commands = profile.add_subparsers(
+        dest="profile_command", required=True, metavar="<command>", parser_class=_Parser
+    )
+    list_profiles = profile_commands.add_parser("list", help="List configured profiles")
     _add_options(list_profiles)
-    show_profile = profile_commands.add_parser("show", help="show one profile")
+    show_profile = profile_commands.add_parser("show", help="Show one profile")
     _add_options(show_profile)
 
-    login_command = commands.add_parser("login", help="obtain an application password")
+    login_command = commands.add_parser("login", help="Obtain a credential through browser consent")
     _add_options(login_command)
     login_command.add_argument(
         "--force",
         action="store_true",
         help=(
-            "revoke an existing stored credential before browser consent; cancelling "
-            "leaves the profile without a credential"
+            "Revoke an existing stored credential before browser consent; "
+            "cancelling then leaves the profile without a credential"
         ),
     )
     login_command.add_argument(
         "--timeout",
         type=float,
         default=1200,
-        help="seconds to wait for browser consent (default: 1200)",
+        help="Seconds to wait for browser consent",
     )
 
-    logout_command = commands.add_parser("logout", help="revoke and remove the credential")
+    logout_command = commands.add_parser("logout", help="Revoke the credential, then forget it")
     _add_options(logout_command)
 
-    whoami = commands.add_parser("whoami", help="show the authenticated principal")
+    whoami = commands.add_parser("whoami", help="Show which account the credential reaches")
     _add_options(whoami)
 
-    cal = commands.add_parser("cal", help="calendars and events")
-    cal_commands = cal.add_subparsers(dest="cal_command", required=True)
-    cal_list = cal_commands.add_parser("list", help="discover calendars by href")
+    cal = commands.add_parser("cal",
+        help="Calendars and events",
+        description=(
+            "Calendars and events. A calendar is addressed by href, never by display name."
+        ),)
+    cal_commands = cal.add_subparsers(
+        dest="cal_command", required=True, metavar="<command>", parser_class=_Parser
+    )
+    cal_list = cal_commands.add_parser("list", help="Discover calendars, with href and scope")
     _add_options(cal_list)
 
-    cal_events = cal_commands.add_parser("events", help="list events in a window")
+    cal_events = cal_commands.add_parser("events", help="List events overlapping a required window")
     _add_options(cal_events)
-    cal_events.add_argument("calendar", help="calendar href, or an unambiguous display name")
-    cal_events.add_argument("--from", dest="start", required=True, help="ISO 8601 start")
-    cal_events.add_argument("--to", dest="end", required=True, help="ISO 8601 end")
+    cal_events.add_argument("calendar", help="Calendar href, or an unambiguous display name")
+    cal_events.add_argument(
+        "--from", dest="start", required=True, help="Start instant, ISO 8601 with an offset"
+    )
+    cal_events.add_argument(
+        "--to", dest="end", required=True, help="End instant, ISO 8601 with an offset"
+    )
 
-    cal_show = cal_commands.add_parser("show", help="read one event by href")
+    cal_show = cal_commands.add_parser("show", help="Read one event by href")
     _add_options(cal_show)
-    cal_show.add_argument("href", help="event resource href")
+    cal_show.add_argument("href", help="Event resource href")
 
-    cal_create = cal_commands.add_parser("create", help="plan a new event")
+    cal_create = cal_commands.add_parser("create", help="Plan a new event; changes nothing yet")
     _add_options(cal_create)
-    cal_create.add_argument("calendar", help="calendar href, or an unambiguous display name")
+    cal_create.add_argument("calendar", help="Calendar href, or an unambiguous display name")
     cal_create.add_argument("--summary", required=True)
-    cal_create.add_argument("--from", dest="start", required=True, help="ISO 8601 start")
-    cal_create.add_argument("--to", dest="end", required=True, help="ISO 8601 end")
+    cal_create.add_argument(
+        "--from", dest="start", required=True, help="Start instant, ISO 8601 with an offset"
+    )
+    cal_create.add_argument(
+        "--to", dest="end", required=True, help="End instant, ISO 8601 with an offset"
+    )
     cal_create.add_argument("--description", default="")
     cal_create.add_argument("--location", default="")
 
-    cal_update = cal_commands.add_parser("update", help="plan a change to one event")
+    cal_update = cal_commands.add_parser(
+        "update", help="Plan a change to one event; changes nothing yet"
+    )
     _add_options(cal_update)
-    cal_update.add_argument("href", help="event resource href")
+    cal_update.add_argument("href", help="Event resource href")
     cal_update.add_argument("--summary")
-    cal_update.add_argument("--from", dest="start", help="ISO 8601 start")
-    cal_update.add_argument("--to", dest="end", help="ISO 8601 end")
+    cal_update.add_argument("--from", dest="start", help="Start instant, ISO 8601 with an offset")
+    cal_update.add_argument("--to", dest="end", help="End instant, ISO 8601 with an offset")
     cal_update.add_argument("--description")
     cal_update.add_argument("--location")
 
-    cal_delete = cal_commands.add_parser("delete", help="plan a deletion")
+    cal_delete = cal_commands.add_parser("delete", help="Plan a deletion; changes nothing yet")
     _add_options(cal_delete)
-    cal_delete.add_argument("href", help="event resource href")
+    cal_delete.add_argument("href", help="Event resource href")
 
-    plan = commands.add_parser("plan", help="inspect frozen mutations")
-    plan_commands = plan.add_subparsers(dest="plan_command", required=True)
-    plan_list = plan_commands.add_parser("list", help="list pending plans")
+    plan = commands.add_parser("plan",
+        help="Inspect frozen mutations",
+        description=(
+            "Pending mutations. A plan changes nothing until `ncl apply` runs it."
+        ),)
+    plan_commands = plan.add_subparsers(
+        dest="plan_command", required=True, metavar="<command>", parser_class=_Parser
+    )
+    plan_list = plan_commands.add_parser("list", help="List pending plans")
     _add_options(plan_list)
-    plan_show = plan_commands.add_parser("show", help="show one plan")
+    plan_show = plan_commands.add_parser("show", help="Show one plan in full")
     _add_options(plan_show)
     plan_show.add_argument("plan_id")
-    plan_cancel = plan_commands.add_parser("cancel", help="discard a plan")
+    plan_cancel = plan_commands.add_parser("cancel", help="Discard a plan without applying it")
     _add_options(plan_cancel)
     plan_cancel.add_argument("plan_id")
 
-    apply_command = commands.add_parser("apply", help="execute a frozen plan")
+    apply_command = commands.add_parser("apply", help="Execute a frozen plan, once")
     _add_options(apply_command)
     apply_command.add_argument("plan_id")
 

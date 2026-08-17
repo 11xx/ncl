@@ -129,6 +129,14 @@ def _describe(raw: bytes, *, calendar_href: str, href: str, etag: str) -> EventR
     end_prop = component.get("DTEND") or component.get("DUE")
     start_value = getattr(start_prop, "dt", None)
     end_value = getattr(end_prop, "dt", None)
+    if end_value is None and start_value is not None:
+        # RFC 5545 lets an event state DURATION instead of DTEND, and clients
+        # commonly do. Reading only DTEND reported those events as having no
+        # end at all, which reads as missing data rather than as another
+        # spelling of the same fact.
+        duration = getattr(component.get("DURATION"), "dt", None)
+        if duration is not None:
+            end_value = start_value + duration
 
     return EventRef(
         calendar_href=calendar_href,

@@ -1060,6 +1060,11 @@ def test_public_cli_auth_commands_redact_registered_credential(
     monkeypatch.setattr(render, "_SECRETS", set())
     monkeypatch.setattr(secrets, "probe", lambda profile: True)
     monkeypatch.setattr(checks, "probe_pass", lambda: (True, "fixture pass"))
+    # This drives the real `login` command, which would otherwise open a tab in
+    # whoever is running the suite. The conftest guard turns that into a
+    # failure; recording the URL is what the test actually needs.
+    opened: list[str] = []
+    monkeypatch.setattr(login.webbrowser, "open", opened.append)
 
     def invoke(command, transport, *, has_credentials=True):
         monkeypatch.setattr(session, "UrllibTransport", lambda: transport)
@@ -1161,8 +1166,12 @@ def test_cli_help_passes_through_redacting_stream(monkeypatch):
         cli.main(["--help"])
 
     assert error.value.code == exits.OK
-    assert any("usage:" in value for value in writes)
-    assert output.getvalue().startswith("usage:")
+    assert any("Usage:" in value for value in writes)
+    # Help leads with what the tool is, then the usage line — the shape the
+    # sibling tools in this family use, rather than argparse's default.
+    rendered = output.getvalue()
+    assert rendered.startswith("ncl — ")
+    assert "\nUsage: ncl " in rendered
 
 
 def test_output_call_sites_keep_secondary_source_scan():
