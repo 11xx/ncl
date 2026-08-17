@@ -88,7 +88,26 @@ def _run_authenticated(profile: Any, checks: list[Check], *, transport: Any = No
         login_name = secret_store.get(profile, "login_name")
         app_password = secret_store.get(profile, "app_password")
     except secret_store.SecretError:
-        login_name = app_password = None
+        detail = "the secret backend could not read the credential"
+        checks.extend(
+            (
+                _check(f"credential:{profile.name}", "fail", detail),
+                _skip(f"principal:{profile.name}", "credential lookup failed"),
+                _skip(f"calendar-home:{profile.name}", "credential lookup failed"),
+            )
+        )
+        for field, entries in (
+            ("calendars", profile.calendars),
+            ("files_roots", profile.files_roots),
+        ):
+            for index, _entry in enumerate(entries):
+                checks.append(
+                    _skip(
+                        f"remote:{profile.name}:{field}:{index}",
+                        "credential lookup failed",
+                    )
+                )
+        return
     if not login_name or not app_password:
         detail = "no credential is stored; run `ncl login`"
         checks.extend(
