@@ -9,9 +9,11 @@ import urllib.parse
 import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC
+from email.utils import parsedate_to_datetime
 from typing import Any, Protocol
 
-from . import exits, secrets
+from . import exits, profiles, secrets
 
 
 class SessionError(RuntimeError):
@@ -108,16 +110,29 @@ class UrllibTransport:
 
 def _origin_parts(url: str) -> tuple[str, str, int | None]:
     try:
-        parsed = urllib.parse.urlsplit(url)
-        host = parsed.hostname
-        port = parsed.port
+        return profiles.origin_parts(url)
     except ValueError as exc:
         raise SessionError("the server URL is malformed", exits.MALFORMED_RESPONSE) from exc
-    if parsed.scheme not in {"http", "https"} or not host:
-        raise SessionError("the server URL is malformed", exits.MALFORMED_RESPONSE)
-    if port is None:
-        port = 443 if parsed.scheme == "https" else 80
-    return parsed.scheme.lower(), host.lower(), port
+
+
+def _retry_after_detail(value: str | None) -> str:
+    if value is None:
+        return "no retry delay was provided"
+    if not isinstance(value, str):
+        return "Retry-After was unparseable"
+    candidate = value.strip()
+    if candidate.isdigit():
+        return f"retry delay: {int(candidate)} seconds"
+    try:
+        parsed = parsedate_to_datetime(candidate)
+    except (TypeError, ValueError, OverflowError):
+        return "Retry-After was unparseable"
+    if parsed is None:
+        return "Retry-After was unparseable"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    parsed = parsed.astimezone(UTC)
+    return f"retry delay until {parsed.isoformat()}"
 
 
 def same_origin(origin: str, url: str) -> bool:
@@ -238,10 +253,19 @@ class Session:
                     exits.CREDENTIAL_REJECTED,
                 )
             retry_after = response.header("Retry-After")
-            if response.status == 429 or retry_after is not None:
-                detail = retry_after or "the server did not provide a delay"
+            if response.status == 429:
                 raise SessionError(
-                    f"the server is rate-limiting; Retry-After: {detail}", exits.THROTTLED
+                    f"the server is rate-limiting; {_retry_after_detail(retry_after)}",
+                    exits.THROTTLED,
+                )
+            if 500 <= response.status <= 599:
+                detail = (
+                    f"; {_retry_after_detail(retry_after)}"
+                    if retry_after is not None
+                    else ""
+                )
+                raise SessionError(
+                    f"the server returned a server error{detail}", exits.SERVER_ERROR
                 )
             return response
 

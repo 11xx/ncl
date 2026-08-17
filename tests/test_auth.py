@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import json
 import subprocess
+from datetime import UTC, datetime
+from email.utils import format_datetime
 
 import pytest
 
@@ -142,6 +144,65 @@ def test_session_refusal_paths_do_not_leak_secret(monkeypatch, status, headers, 
     assert "fixture-secret" not in capsys.readouterr().err
 
 
+def test_session_parses_invalid_retry_after_without_echoing_server_text(monkeypatch):
+    seed_credentials(
+        monkeypatch,
+        {"login_name": "alice", "app_password": "fixture-secret"},
+    )
+    server_text = "fixture-secret"
+    transport = FakeTransport([response(429, headers={"Retry-After": server_text})])
+
+    with pytest.raises(SessionError) as error:
+        Session(PROFILE, transport=transport).request("GET", "/remote.php/dav/")
+
+    assert error.value.code == exits.THROTTLED
+    assert "unparseable" in str(error.value)
+    assert server_text not in str(error.value)
+
+
+def test_session_reports_parsed_http_date_retry_after(monkeypatch):
+    seed_credentials(
+        monkeypatch,
+        {"login_name": "alice", "app_password": "fixture-secret"},
+    )
+    retry_after = format_datetime(datetime(2030, 1, 2, 3, 4, 5, tzinfo=UTC), usegmt=True)
+    transport = FakeTransport([response(429, headers={"Retry-After": retry_after})])
+
+    with pytest.raises(SessionError) as error:
+        Session(PROFILE, transport=transport).request("GET", "/remote.php/dav/")
+
+    assert error.value.code == exits.THROTTLED
+    assert "2030-01-02T03:04:05+00:00" in str(error.value)
+    assert retry_after not in str(error.value)
+
+
+def test_session_reports_503_as_server_error_even_with_retry_after(monkeypatch):
+    seed_credentials(
+        monkeypatch,
+        {"login_name": "alice", "app_password": "fixture-secret"},
+    )
+    transport = FakeTransport([response(503, headers={"Retry-After": "7"})])
+
+    with pytest.raises(SessionError) as error:
+        Session(PROFILE, transport=transport).request("GET", "/remote.php/dav/")
+
+    assert error.value.code == exits.SERVER_ERROR
+    assert "7 seconds" in str(error.value)
+
+
+def test_session_raises_server_error_for_500(monkeypatch):
+    seed_credentials(
+        monkeypatch,
+        {"login_name": "alice", "app_password": "fixture-secret"},
+    )
+    transport = FakeTransport([response(500)])
+
+    with pytest.raises(SessionError) as error:
+        Session(PROFILE, transport=transport).request("GET", "/remote.php/dav/")
+
+    assert error.value.code == exits.SERVER_ERROR
+
+
 def test_session_transport_failure_does_not_leak_secret(monkeypatch, capsys):
     seed_credentials(
         monkeypatch,
@@ -231,6 +292,65 @@ def test_login_rejects_off_origin_urls_before_opening_browser(monkeypatch):
 
     assert error.value.code == exits.MALFORMED_RESPONSE
     assert opened == []
+
+
+@pytest.mark.parametrize(
+    ("poll_payload", "expected_fragment"),
+    [
+        (
+            {"loginName": "alice", "appPassword": "fixture-secret"},
+            "omitted server",
+        ),
+        (
+            {
+                "server": "https://other.example.invalid",
+                "loginName": "alice",
+                "appPassword": "fixture-secret",
+            },
+            "server URL was refused",
+        ),
+        (
+            {
+                "server": "https://cloud.example.invalid",
+                "appPassword": "fixture-secret",
+            },
+            "could not be stored",
+        ),
+    ],
+)
+def test_login_reports_issued_credential_when_post_consent_validation_fails(
+    monkeypatch, poll_payload, expected_fragment
+):
+    seed_credentials(monkeypatch)
+    monkeypatch.setattr(secrets, "probe", lambda profile: True)
+    monkeypatch.setattr(secrets, "has_credentials", lambda profile: False)
+    transport = FakeTransport(
+        [
+            response(
+                200,
+                json.dumps(
+                    {
+                        "login": "https://cloud.example.invalid/login",
+                        "poll": {
+                            "endpoint": "https://cloud.example.invalid/poll",
+                            "token": "poll-token",
+                        },
+                    }
+                ).encode(),
+            ),
+            response(200, json.dumps(poll_payload).encode()),
+        ]
+    )
+
+    with pytest.raises(login.LoginError) as error:
+        login.authenticate(PROFILE, transport=transport, browser_open=lambda url: True)
+
+    assert error.value.code == exits.CREDENTIAL_STORE_FAILED
+    assert "consent succeeded" in str(error.value)
+    assert "application password" in str(error.value)
+    assert "Security settings" in str(error.value)
+    assert expected_fragment in str(error.value)
+    assert "fixture-secret" not in str(error.value)
 
 
 def test_login_polls_404_then_stores_once_and_confirms_identity(monkeypatch):
@@ -351,6 +471,81 @@ def test_second_login_refuses_and_points_to_logout(monkeypatch):
     assert transport.requests == []
 
 
+def test_force_login_revokes_existing_credential_before_starting_flow(monkeypatch):
+    stored = seed_credentials(
+        monkeypatch,
+        {"login_name": "old-alice", "app_password": "old-secret"},
+    )
+    monkeypatch.setattr(secrets, "probe", lambda profile: True)
+    revoked = []
+
+    def record_logout(profile, *, transport):
+        revoked.append((profile, transport))
+
+    monkeypatch.setattr(login, "logout", record_logout)
+    transport = FakeTransport(
+        [
+            response(
+                200,
+                json.dumps(
+                    {
+                        "login": "https://cloud.example.invalid/login",
+                        "poll": {
+                            "endpoint": "https://cloud.example.invalid/poll",
+                            "token": "poll-token",
+                        },
+                    }
+                ).encode(),
+            ),
+            response(
+                200,
+                json.dumps(
+                    {
+                        "server": "https://cloud.example.invalid",
+                        "loginName": "alice",
+                        "appPassword": "fixture-secret",
+                    }
+                ).encode(),
+            ),
+            principal_response(),
+            home_response(),
+        ]
+    )
+
+    login.authenticate(
+        PROFILE,
+        force=True,
+        transport=transport,
+        browser_open=lambda url: True,
+        output=lambda message: None,
+    )
+
+    assert revoked == [(PROFILE, transport)]
+    assert stored == {"login_name": "alice", "app_password": "fixture-secret"}
+
+
+def test_force_login_refuses_when_existing_credential_cannot_be_revoked(monkeypatch):
+    seed_credentials(
+        monkeypatch,
+        {"login_name": "old-alice", "app_password": "old-secret"},
+    )
+    monkeypatch.setattr(secrets, "probe", lambda profile: True)
+
+    def refuse_logout(profile, *, transport):
+        raise login.LoginError("revocation failed", exits.REVOCATION_FAILED)
+
+    monkeypatch.setattr(login, "logout", refuse_logout)
+    transport = FakeTransport([])
+
+    with pytest.raises(login.LoginError) as error:
+        login.authenticate(PROFILE, force=True, transport=transport, browser_open=lambda url: True)
+
+    assert error.value.code == exits.REVOCATION_FAILED
+    assert "refusing" in str(error.value)
+    assert "Security settings" in str(error.value)
+    assert transport.requests == []
+
+
 @pytest.mark.parametrize("backend", [secrets.PassBackend(), secrets.LibsecretBackend()])
 def test_secret_backends_send_values_on_stdin_not_in_argv(monkeypatch, backend):
     calls = []
@@ -382,3 +577,30 @@ def test_logout_removes_local_credential_when_server_revocation_fails(monkeypatc
     assert stored == {}
     assert "Security settings" in str(error.value)
     assert transport.requests[0]["method"] == "DELETE"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        json.dumps(
+            {
+                "ocs": {
+                    "meta": {"status": "failure", "statuscode": 997, "message": "failed"}
+                }
+            }
+        ).encode(),
+        b"not-json",
+    ],
+)
+def test_logout_requires_successful_ocs_revocation_envelope(monkeypatch, body):
+    stored = seed_credentials(
+        monkeypatch,
+        {"login_name": "alice", "app_password": "fixture-secret"},
+    )
+    transport = FakeTransport([response(200, body)])
+
+    with pytest.raises(login.LoginError) as error:
+        login.logout(PROFILE, transport=transport)
+
+    assert error.value.code == exits.REVOCATION_FAILED
+    assert stored == {}

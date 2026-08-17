@@ -81,11 +81,16 @@ def _store(profile: Any, payload: dict[str, Any]) -> None:
     try:
         secrets.store_credentials(profile, login_name, app_password)
     except secrets.SecretError as exc:
-        raise LoginError(
-            "consent succeeded but the credential could not be stored; the orphaned "
-            "application password must be revoked from the account Security settings",
-            exits.CREDENTIAL_STORE_FAILED,
-        ) from exc
+        raise _orphaned_credential("the credential store failed") from exc
+
+
+def _orphaned_credential(reason: str) -> LoginError:
+    return LoginError(
+        "consent succeeded; an application password was issued but could not be stored "
+        f"because {reason}. The orphaned application password must be revoked from the "
+        "account Security settings",
+        exits.CREDENTIAL_STORE_FAILED,
+    )
 
 
 def authenticate(
@@ -108,10 +113,23 @@ def authenticate(
             "the configured secret backend cannot round-trip a value",
             exits.PRECONDITION_FAILED,
         )
-    if not force and secrets.has_credentials(profile):
-        raise LoginError("a credential is already stored; run `ncl logout` first", exits.CONFLICT)
 
     transport = transport or UrllibTransport()
+    if secrets.has_credentials(profile):
+        if not force:
+            raise LoginError(
+                "a credential is already stored; run `ncl logout` first", exits.CONFLICT
+            )
+        # Refusing after failed revocation prevents --force from hiding a live orphaned token.
+        try:
+            logout(profile, transport=transport)
+        except LoginError as exc:
+            raise LoginError(
+                "the existing credential could not be revoked; refusing --force login; "
+                "revoke it from the account Security settings",
+                exits.REVOCATION_FAILED,
+            ) from exc
+
     start_url = absolute_url(profile, "/index.php/login/v2")
     response = _request(
         transport,
@@ -143,7 +161,7 @@ def authenticate(
 
     started = clock()
     deadline = min(timeout, 1200)
-    granted = False
+    issued = False
     interval = poll_interval
     try:
         while True:
@@ -182,25 +200,32 @@ def authenticate(
                     "the Login Flow v2 poll response was unexpected", exits.SERVER_ERROR
                 )
             payload = _json_response(response)
+            issued = "appPassword" in payload
             server = payload.get("server")
             if not isinstance(server, str) or not server:
+                if issued:
+                    raise _orphaned_credential("the Login Flow v2 response omitted server")
                 raise LoginError(
                     "the Login Flow v2 response omitted server", exits.MALFORMED_RESPONSE
                 )
             try:
                 absolute_url(profile, server)
             except SessionError as exc:
+                if issued:
+                    raise _orphaned_credential("the Login Flow v2 server URL was refused") from exc
                 raise LoginError("the Login Flow v2 server URL was refused", exc.code) from exc
-            granted = True
-            _store(profile, payload)
+            try:
+                _store(profile, payload)
+            except KeyboardInterrupt:
+                raise
+            except LoginError as exc:
+                if issued:
+                    raise _orphaned_credential("the credential could not be stored") from exc
+                raise
             break
     except KeyboardInterrupt as exc:
-        if granted:
-            raise LoginError(
-                "interrupted after consent was granted; an application password may exist "
-                "server-side, so check the account Security settings",
-                exits.CREDENTIAL_STORE_FAILED,
-            ) from exc
+        if issued:
+            raise _orphaned_credential("the login operation was interrupted") from exc
         raise LoginError(
             "interrupted before browser consent was granted", exits.LOGIN_TIMEOUT
         ) from exc
@@ -235,7 +260,16 @@ def logout(
             "/ocs/v2.php/core/apppassword",
             headers={"Accept": "application/json", "OCS-APIRequest": "true"},
         )
-        revoked = response.status in {200, 204}
+        if response.status == 200:
+            try:
+                value = response.json()
+            except SessionError:
+                value = None
+            if isinstance(value, dict):
+                ocs = value.get("ocs")
+                meta = ocs.get("meta") if isinstance(ocs, dict) else None
+                statuscode = meta.get("statuscode") if isinstance(meta, dict) else None
+                revoked = statuscode == 100
     except (SessionError, OSError, ValueError):
         revoked = False
 
