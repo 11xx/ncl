@@ -41,9 +41,9 @@ Three consequences shape the implementation:
 The credential lifecycle is serialized per profile. `ncl login`, forced
 replacement, and `ncl logout` hold an exclusive lock under
 `$XDG_RUNTIME_DIR/ncl/` from credential preflight through storage or removal
-and principal verification. A lock records its process ID; a lock owned by a
-process that no longer exists is cleared automatically, while a live lock is
-reported as a conflict.
+and principal verification. The per-profile lock file persists, while the
+kernel owns lock liveness through `flock`: process exit releases the lock
+without PID recording, stale-file recovery, or PID-reuse assumptions.
 
 Secret backends distinguish an absent entry from an unusable backend. `pass`
 reports absence with its explicit “not in the password store” result, while
@@ -52,10 +52,12 @@ agent, service, and other backend failures remain failures, so `ncl doctor`
 directs the caller to repair the backend rather than treating the credential
 as absent.
 
-The application password is registered at the authenticated request boundary,
-along with its Basic-auth representation. All command output passes through a
-single renderer that recursively redacts registered values, including values
-embedded in URLs, identity fields, error messages, and JSON payloads.
+The authenticated request boundary registers the application password, the
+`user:password` pair, its base64 encoding, and its Basic-auth form. Structured
+output is recursively redacted, and the CLI wraps its standard text streams so
+`argparse`, direct `print` calls, and library text writers pass through the same
+redaction. Raw file-descriptor and binary-buffer writes remain prohibited by
+project discipline rather than intercepted by the stream wrapper.
 
 The resulting credential does not expire, is revocable on its own from the
 account's security settings with a visible last-used timestamp, and carries no

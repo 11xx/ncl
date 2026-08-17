@@ -1,10 +1,12 @@
-"""The single output boundary for redacted command results and messages."""
+"""Credential redaction for structured values and command text streams."""
 
 from __future__ import annotations
 
+import base64
 import json
 import sys
 from collections.abc import Mapping
+from contextlib import contextmanager
 from typing import Any
 
 _MARKER = "[redacted]"
@@ -17,10 +19,53 @@ def register_secret(value: str) -> None:
         _SECRETS.add(value)
 
 
+def credential_representations(login_name: str, app_password: str) -> dict[str, str]:
+    """Derive values that grant or directly disclose the stored credential."""
+    user_password = f"{login_name}:{app_password}"
+    encoded = base64.b64encode(user_password.encode()).decode("ascii")
+    return {
+        "password": app_password,
+        "user_password": user_password,
+        "base64": encoded,
+        "basic": f"Basic {encoded}",
+    }
+
+
 def _redact_text(value: str) -> str:
     for secret in sorted(_SECRETS, key=len, reverse=True):
         value = value.replace(secret, _MARKER)
     return value
+
+
+class _RedactingTextStream:
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+
+    def write(self, value: str) -> int:
+        return self._stream.write(_redact_text(value))
+
+    def writelines(self, values: Any) -> None:
+        self._stream.writelines(_redact_text(value) for value in values)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+@contextmanager
+def redacted_standard_streams():
+    """Redact text written through stdout and stderr for one CLI invocation."""
+    stdout = sys.stdout
+    stderr = sys.stderr
+    sys.stdout = _RedactingTextStream(stdout)
+    sys.stderr = _RedactingTextStream(stderr)
+    try:
+        yield
+    finally:
+        sys.stdout = stdout
+        sys.stderr = stderr
 
 
 def _redact(value: Any) -> Any:

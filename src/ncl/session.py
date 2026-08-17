@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import urllib.error
 import urllib.parse
@@ -206,7 +205,6 @@ class Session:
         try:
             login_name = secrets.get(self.profile, "login_name")
             app_password = secrets.get(self.profile, "app_password")
-            render.register_secret(app_password)
         except secrets.SecretError as exc:
             raise SessionError(
                 "the selected profile's secret backend failed", exits.PRECONDITION_FAILED
@@ -222,9 +220,10 @@ class Session:
                 "the selected profile has no stored credential", exits.NO_CREDENTIAL
             )
 
-        auth_value = base64.b64encode(f"{login_name}:{app_password}".encode()).decode("ascii")
-        render.register_secret(f"Basic {auth_value}")
-        request_headers = {**dict(headers or {}), "Authorization": f"Basic {auth_value}"}
+        representations = render.credential_representations(login_name, app_password)
+        for representation in representations.values():
+            render.register_secret(representation)
+        request_headers = {**dict(headers or {}), "Authorization": representations["basic"]}
         request_data = data.encode("utf-8") if isinstance(data, str) else data
         current_method = method.upper()
         for redirect_count in range(max_redirects + 1):

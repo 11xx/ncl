@@ -121,7 +121,7 @@ def _run_whoami(args: argparse.Namespace) -> int:
     return exits.OK
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     json_output = bool(args.json)
@@ -177,6 +177,11 @@ def main(argv: list[str] | None = None) -> int:
         return _error(exc, json_output)
     except (OSError, ValueError) as exc:
         return _error(exc, json_output)
+
+
+def main(argv: list[str] | None = None) -> int:
+    with render.redacted_standard_streams():
+        return _main(argv)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import base64
-import hashlib
+import fcntl
+import html
+import io
 import json
 import os
 import subprocess
@@ -802,22 +804,110 @@ def test_secret_backend_reads_distinguish_absent_from_unusable(
         backend.get(PROFILE, "app_password")
 
 
-def test_login_lock_contention_is_reported_before_preflight(monkeypatch, tmp_path):
-    runtime = Path(os.environ["XDG_RUNTIME_DIR"])
-    lock_dir = runtime / "ncl"
-    lock_dir.mkdir(parents=True)
-    lock_path = lock_dir / f"profile-{hashlib.sha256(PROFILE.name.encode()).hexdigest()}.lock"
-    lock_path.write_text(f"{os.getpid()}\n9999999999\n")
+@pytest.mark.parametrize(
+    ("backend", "found_result"),
+    [
+        (
+            secrets.PassBackend(),
+            subprocess.CompletedProcess(["pass"], 0, "stored-secret\n", ""),
+        ),
+        (
+            secrets.LibsecretBackend(),
+            subprocess.CompletedProcess(["secret-tool"], 0, "stored-secret\n", ""),
+        ),
+    ],
+)
+def test_secret_backend_reads_return_found_value(monkeypatch, backend, found_result):
+    monkeypatch.setattr(secrets, "_run", lambda command, **kwargs: found_result)
+
+    assert backend.get(PROFILE, "app_password") == "stored-secret"
+
+
+_LOCK_WORKER = """
+import fcntl
+import os
+import sys
+from pathlib import Path
+
+from ncl import exits, login
+from ncl.config import Profile
+
+mode = sys.argv[1]
+if mode == "hold":
+    path = Path(sys.argv[2])
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    os.ftruncate(descriptor, 0)
+    os.write(descriptor, b"2147483647\\n0\\n")
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    print("holding", flush=True)
+    sys.stdin.read(1)
+    os.close(descriptor)
+    raise SystemExit(exits.OK)
+
+profile = Profile(
+    name=sys.argv[2],
+    origin="https://cloud.example.invalid",
+    secret_backend="pass",
+    calendars=(),
+    files_roots=(),
+)
+try:
+    with login._profile_lock(profile):
+        raise SystemExit(exits.OK)
+except login.LoginError as error:
+    raise SystemExit(error.code) from error
+"""
+
+
+def _attempt_profile_lock_in_subprocess() -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-c", _LOCK_WORKER, "attempt", PROFILE.name],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_kernel_lock_owner_cannot_be_bypassed_by_stale_file_contents():
+    lock_path = login._lock_path(PROFILE)
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _LOCK_WORKER, "hold", str(lock_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert holder.stdout is not None
+    assert holder.stdout.readline() == "holding\n"
+
+    try:
+        contender = _attempt_profile_lock_in_subprocess()
+    finally:
+        assert holder.stdin is not None
+        holder.stdin.write("x")
+        holder.stdin.flush()
+        holder_output, holder_error = holder.communicate(timeout=5)
+
+    assert holder.returncode == exits.OK, holder_output + holder_error
+    assert contender.returncode == exits.LOCKED, contender.stdout + contender.stderr
+
+
+def test_login_lock_contention_is_reported_before_preflight(monkeypatch):
+    descriptor = os.open(login._lock_path(PROFILE), os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
     monkeypatch.setattr(secrets, "probe", lambda profile: pytest.fail("preflight ran"))
 
-    with pytest.raises(login.LoginError) as error:
-        login.authenticate(PROFILE, browser_open=lambda url: True)
+    try:
+        with pytest.raises(login.LoginError) as error:
+            login.authenticate(PROFILE, browser_open=lambda url: True)
+    finally:
+        os.close(descriptor)
 
     assert error.value.code == exits.LOCKED
 
 
-def test_login_clears_dead_lock_and_reports_it(monkeypatch):
-    output = []
+def test_login_holds_profile_lock_through_principal_verification(monkeypatch):
     transport = FakeTransport(
         [
             response(
@@ -842,27 +932,31 @@ def test_login_clears_dead_lock_and_reports_it(monkeypatch):
                     }
                 ).encode(),
             ),
-            principal_response(),
-            home_response(),
         ]
     )
-    runtime = Path(os.environ["XDG_RUNTIME_DIR"])
-    lock_dir = runtime / "ncl"
-    lock_dir.mkdir(parents=True)
-    lock_path = lock_dir / f"profile-{hashlib.sha256(PROFILE.name.encode()).hexdigest()}.lock"
-    lock_path.write_text("2147483647\n0\n")
     seed_credentials(monkeypatch)
     monkeypatch.setattr(secrets, "probe", lambda profile: True)
+    attempts = []
+
+    def discover(profile, *, session):
+        attempts.append(_attempt_profile_lock_in_subprocess())
+        return identity.Identity(
+            principal_url="https://cloud.example.invalid/remote.php/dav/principals/users/alice/",
+            account_name="alice",
+            display_name="Alice",
+            calendar_home="https://cloud.example.invalid/remote.php/dav/calendars/alice/",
+        )
+
+    monkeypatch.setattr(identity, "discover", discover)
 
     login.authenticate(
         PROFILE,
         transport=transport,
         browser_open=lambda url: True,
-        output=output.append,
     )
 
-    assert output[0] == "A stale profile login lock was cleared."
-    assert not lock_path.exists()
+    assert len(attempts) == 1
+    assert attempts[0].returncode == exits.LOCKED, attempts[0].stdout + attempts[0].stderr
 
 
 def test_cli_replaces_untyped_exception_text_with_catalogued_message(capsys):
@@ -902,6 +996,50 @@ def _echo_home_response() -> Response:
     )
 
 
+def _display_name_response(value: str) -> Response:
+    return response(
+        207,
+        dav_response(
+            f"""
+    <d:propstat><d:prop>
+      <c:calendar-home-set><d:href>/remote.php/dav/calendars/alice/</d:href></c:calendar-home-set>
+      <d:displayname>{html.escape(value)}</d:displayname>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+"""
+        ),
+    )
+
+
+def test_whoami_redacts_every_registered_credential_representation(
+    monkeypatch, tmp_path, capsys
+):
+    config_path = write_config(tmp_path)
+    monkeypatch.setenv("NCL_CONFIG", str(config_path))
+    seed_credentials(
+        monkeypatch,
+        {"login_name": "alice", "app_password": SENTINEL},
+    )
+    monkeypatch.setattr(render, "_SECRETS", set())
+    encoded = base64.b64encode(f"alice:{SENTINEL}".encode()).decode("ascii")
+    required = {SENTINEL, f"alice:{SENTINEL}", encoded, f"Basic {encoded}"}
+    representations = tuple(render.credential_representations("alice", SENTINEL).values())
+
+    assert set(representations) >= required
+    for representation in representations:
+        monkeypatch.setattr(
+            session,
+            "UrllibTransport",
+            lambda value=representation: FakeTransport(
+                [principal_response(), _display_name_response(value)]
+            ),
+        )
+
+        assert cli.main(["whoami", "--json"]) == exits.OK
+        rendered = capsys.readouterr()
+        assert representation not in rendered.out + rendered.err
+        assert "[redacted]" in rendered.out
+
+
 @pytest.mark.parametrize("json_output", [False, True])
 def test_public_cli_auth_commands_redact_registered_credential(
     monkeypatch, tmp_path, capsys, json_output
@@ -912,7 +1050,7 @@ def test_public_cli_auth_commands_redact_registered_credential(
         monkeypatch,
         {"login_name": "alice", "app_password": SENTINEL},
     )
-    render.register_secret(SENTINEL)
+    monkeypatch.setattr(render, "_SECRETS", set())
     monkeypatch.setattr(secrets, "probe", lambda profile: True)
     monkeypatch.setattr(checks, "probe_pass", lambda: (True, "fixture pass"))
 
@@ -996,7 +1134,32 @@ def test_public_cli_auth_commands_redact_registered_credential(
     )
 
 
-def test_output_has_one_source_of_truth():
+def test_cli_help_passes_through_redacting_stream(monkeypatch):
+    writes = []
+    original_redact = render._redact_text
+
+    def track_write(value):
+        writes.append(value)
+        return original_redact(value)
+
+    def reject_emit(*args, **kwargs):
+        raise AssertionError("argparse help must not depend on render.emit")
+
+    output = io.StringIO()
+    monkeypatch.setattr(render, "_redact_text", track_write)
+    monkeypatch.setattr(render, "emit", reject_emit)
+    monkeypatch.setattr(sys, "stdout", output)
+
+    with pytest.raises(SystemExit) as error:
+        cli.main(["--help"])
+
+    assert error.value.code == exits.OK
+    assert any("usage:" in value for value in writes)
+    assert output.getvalue().startswith("usage:")
+
+
+def test_output_call_sites_keep_secondary_source_scan():
+    """Keep direct writers visible as a review signal, not the output enforcement."""
     source_root = Path(__file__).parents[1] / "src" / "ncl"
     violations = []
     for path in source_root.rglob("*.py"):

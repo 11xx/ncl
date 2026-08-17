@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import os
 import time
 import urllib.parse
 import webbrowser
 from collections.abc import Callable
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,6 @@ class LoginError(RuntimeError):
         super().__init__(message)
 
 
-_LOCK_STALE_SECONDS = 3600
 _HELD_LOCKS: set[Path] = set()
 
 
@@ -52,89 +52,40 @@ def _lock_path(profile: Any) -> Path:
     return directory / f"profile-{profile_id}.lock"
 
 
-def _lock_is_stale(path: Path) -> bool:
-    try:
-        content = path.read_text()
-        modified = path.stat().st_mtime
-    except FileNotFoundError:
-        return True
-    except OSError:
-        return False
-
-    lines = content.splitlines()
-    try:
-        pid = int(lines[0])
-    except (IndexError, ValueError):
-        return time.time() - modified > _LOCK_STALE_SECONDS
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        return False
-    except OSError:
-        return False
-    return False
-
-
 @contextmanager
 def _profile_lock(profile: Any):
     """Hold one profile's mutation lock across preflight and credential lifecycle."""
     path = _lock_path(profile)
     if path in _HELD_LOCKS:
-        yield False
+        yield
         return
 
-    stale_cleared = False
-    pid = os.getpid()
-    while True:
-        try:
-            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            if not _lock_is_stale(path):
-                raise LoginError(
-                    "another process is running a login or logout for this profile",
-                    exits.LOCKED,
-                ) from None
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                continue
-            except OSError as exc:
-                raise LoginError(
-                    "the profile login lock could not be cleared", exits.LOCKED
-                ) from exc
-            stale_cleared = True
-            continue
-        except OSError as exc:
-            raise LoginError(
-                "the profile login lock could not be acquired", exits.PRECONDITION_FAILED
-            ) from exc
-        try:
-            os.write(descriptor, f"{pid}\n{time.time():.6f}\n".encode("ascii"))
-        except OSError as exc:
-            with suppress(OSError):
-                path.unlink()
-            raise LoginError(
-                "the profile login lock could not be written", exits.PRECONDITION_FAILED
-            ) from exc
-        finally:
-            os.close(descriptor)
-        break
+    try:
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        raise LoginError(
+            "the profile login lock could not be opened", exits.PRECONDITION_FAILED
+        ) from exc
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        raise LoginError(
+            "another process is running a login or logout for this profile",
+            exits.LOCKED,
+        ) from None
+    except OSError as exc:
+        os.close(descriptor)
+        raise LoginError(
+            "the profile login lock could not be acquired", exits.PRECONDITION_FAILED
+        ) from exc
 
     _HELD_LOCKS.add(path)
     try:
-        yield stale_cleared
+        yield
     finally:
         _HELD_LOCKS.discard(path)
-        try:
-            content = path.read_text()
-            if content.splitlines() and content.splitlines()[0] == str(pid):
-                path.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
+        os.close(descriptor)
 
 
 def _json_response(response: Response) -> dict[str, Any]:
@@ -403,9 +354,7 @@ def authenticate(
     clock: Callable[[], float] = time.monotonic,
     output: Callable[[str], Any] = render.emit,
 ) -> identity.Identity:
-    with _profile_lock(profile) as stale_cleared:
-        if stale_cleared:
-            output("A stale profile login lock was cleared.")
+    with _profile_lock(profile):
         return _authenticate(
             profile,
             force=force,
