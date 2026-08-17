@@ -21,13 +21,114 @@ from .session import Session
 PRODID = "-//ai-agent-nextcloud//ncl//EN"
 
 
-def _stamp(moment: dt.datetime) -> None:
+def _stamp(moment: dt.datetime) -> dt.datetime:
+    """Require an unambiguous instant, and store it as UTC.
+
+    A fixed-offset datetime serializes as `TZID="UTC-03:00"`, which names a
+    time zone that no VTIMEZONE in the file defines and that is not an IANA
+    identifier. Nothing can resolve it on the way back, so the value reparses
+    as a naive local time and the event is invalid iCalendar even though its
+    wall-clock reading looks right.
+
+    Converting to UTC sidesteps the whole question: `Z` needs no VTIMEZONE and
+    every client renders it in the reader's own zone.
+    """
     if moment.tzinfo is None:
         raise EventError("event times must carry a timezone", exits.USAGE)
+    return moment.astimezone(dt.UTC)
 
 
 def _resource_href(calendar_href: str, uid: str) -> str:
     return f"{calendar_href.rstrip('/')}/{uid}.ics"
+
+
+#: RFC 5545 orders priority the way a race does: 1 is first. Callers think in
+#: "how much does this matter", so the mapping is stated once, here, rather
+#: than left for each of them to get backwards.
+PRIORITY_RANGE = range(1, 10)
+
+STATUSES = ("CONFIRMED", "TENTATIVE", "CANCELLED")
+
+CLASSES = ("PUBLIC", "PRIVATE", "CONFIDENTIAL")
+
+
+def _alarm(trigger: str) -> Any:
+    """A display reminder, offset from the event's start.
+
+    The trigger is an RFC 5545 duration and is negative for "before": -PT15M is
+    a quarter of an hour ahead of the start. A bare positive duration fires
+    *after* the event begins, which is legal and almost never meant, so it is
+    accepted only when written explicitly.
+    """
+    alarm = icalendar.Alarm()
+    alarm.add("action", "DISPLAY")
+    alarm.add("description", "Reminder")
+    try:
+        alarm.add("trigger", icalendar.prop.vDuration.from_ical(trigger))
+    except (ValueError, TypeError) as exc:
+        raise EventError(
+            f"{trigger!r} is not an RFC 5545 duration such as -PT15M or -P1D", exits.USAGE
+        ) from exc
+    return alarm
+
+
+def _optional_fields(
+    event: Any,
+    *,
+    description: str = "",
+    location: str = "",
+    priority: int | None = None,
+    categories: tuple[str, ...] = (),
+    status: str = "",
+    busy: bool | None = None,
+    url: str = "",
+    classification: str = "",
+    color: str = "",
+    related_to: tuple[str, ...] = (),
+    alarms: tuple[str, ...] = (),
+) -> None:
+    """Attach the properties that tell a client how much an event matters."""
+    if description:
+        event.add("description", description)
+    if location:
+        event.add("location", location)
+    if priority is not None:
+        if priority not in PRIORITY_RANGE:
+            raise EventError(
+                f"priority must be 1 (highest) to 9 (lowest); got {priority}", exits.USAGE
+            )
+        event.add("priority", priority)
+    if categories:
+        event.add("categories", list(categories))
+    if status:
+        if status.upper() not in STATUSES:
+            raise EventError(
+                f"status must be one of {', '.join(STATUSES)}; got {status!r}", exits.USAGE
+            )
+        event.add("status", status.upper())
+    if busy is not None:
+        # OPAQUE consumes free/busy time; TRANSPARENT leaves the slot bookable,
+        # which is what a reminder-shaped block wants.
+        event.add("transp", "OPAQUE" if busy else "TRANSPARENT")
+    if url:
+        event.add("url", url)
+    if classification:
+        if classification.upper() not in CLASSES:
+            raise EventError(
+                f"class must be one of {', '.join(CLASSES)}; got {classification!r}",
+                exits.USAGE,
+            )
+        event.add("class", classification.upper())
+    if color:
+        # RFC 7986 takes a CSS3 colour name; Nextcloud honours it per event.
+        event.add("color", color)
+    for uid in related_to:
+        # RELATED-TO is what ties a preparation block, a travel block, and the
+        # appointment they serve into one thing a client can follow, without
+        # inventing a convention this tool would then have to defend.
+        event.add("related-to", uid)
+    for trigger in alarms:
+        event.add_component(_alarm(trigger))
 
 
 def build_event(
@@ -38,6 +139,15 @@ def build_event(
     end: dt.datetime,
     description: str = "",
     location: str = "",
+    priority: int | None = None,
+    categories: tuple[str, ...] = (),
+    status: str = "",
+    busy: bool | None = None,
+    url: str = "",
+    classification: str = "",
+    color: str = "",
+    related_to: tuple[str, ...] = (),
+    alarms: tuple[str, ...] = (),
     now: dt.datetime | None = None,
     sequence: int = 0,
 ) -> str:
@@ -47,8 +157,8 @@ def build_event(
     refused rather than half-modelled, because writing a structure this tool
     does not understand is how an update silently destroys what it did not read.
     """
-    _stamp(start)
-    _stamp(end)
+    start = _stamp(start)
+    end = _stamp(end)
     if end <= start:
         raise EventError("the event ends before it starts", exits.USAGE)
 
@@ -62,10 +172,20 @@ def build_event(
     event.add("dtend", end)
     event.add("dtstamp", now or dt.datetime.now(dt.UTC))
     event.add("sequence", sequence)
-    if description:
-        event.add("description", description)
-    if location:
-        event.add("location", location)
+    _optional_fields(
+        event,
+        description=description,
+        location=location,
+        priority=priority,
+        categories=categories,
+        status=status,
+        busy=busy,
+        url=url,
+        classification=classification,
+        color=color,
+        related_to=related_to,
+        alarms=alarms,
+    )
     calendar.add_component(event)
     return calendar.to_ical().decode("utf-8")
 
@@ -102,13 +222,21 @@ def patch_event(raw: bytes, changes: dict[str, Any], *, now: dt.datetime | None 
             exits.UNSUPPORTED_STRUCTURE,
         )
 
-    for name, value in changes.items():
+    for name, requested in changes.items():
         key = name.upper()
-        if value is None:
+        if key == "VALARM":
+            # Reminders are subcomponents, so "change the alarms" means replace
+            # the set rather than set a property. An empty list removes them.
+            event.subcomponents = [
+                item for item in event.subcomponents if item.name != "VALARM"
+            ]
+            for trigger in requested or ():
+                event.add_component(_alarm(trigger))
+            continue
+        if requested is None:
             event.pop(key, None)
             continue
-        if key in {"DTSTART", "DTEND"}:
-            _stamp(value)
+        value = _stamp(requested) if key in {"DTSTART", "DTEND"} else requested
         event.pop(key, None)
         event.add(key, value)
 
@@ -137,6 +265,15 @@ def plan_create(
     end: dt.datetime,
     description: str = "",
     location: str = "",
+    priority: int | None = None,
+    categories: tuple[str, ...] = (),
+    status: str = "",
+    busy: bool | None = None,
+    url: str = "",
+    classification: str = "",
+    color: str = "",
+    related_to: tuple[str, ...] = (),
+    alarms: tuple[str, ...] = (),
 ) -> plans.Plan:
     if not profiles.in_scope(calendar_href, list(profile.calendars)):
         raise CalendarError(
@@ -151,6 +288,15 @@ def plan_create(
         end=end,
         description=description,
         location=location,
+        priority=priority,
+        categories=categories,
+        status=status,
+        busy=busy,
+        url=url,
+        classification=classification,
+        color=color,
+        related_to=related_to,
+        alarms=alarms,
     )
     return plans.write(
         profile=profile.name,
@@ -223,6 +369,26 @@ def plan_delete(profile: Any, *, session: Session, href: str) -> plans.Plan:
     )
 
 
+def _same_instant(stored: str, planned: str) -> bool:
+    """Compare two stamps as moments, not as text.
+
+    A server may store the instant it was given in a different but equivalent
+    encoding, and comparing the formatted strings would call that a mismatch —
+    reporting an uncertain outcome for a write that landed exactly as asked.
+    A stamp without a zone cannot be compared to one with a zone at all, so it
+    is a genuine mismatch rather than something to guess about.
+    """
+    if stored == planned:
+        return True
+    if not stored.endswith("Z") or not planned.endswith("Z"):
+        return False
+    fmt = "%Y%m%dT%H%M%SZ"
+    try:
+        return dt.datetime.strptime(stored, fmt) == dt.datetime.strptime(planned, fmt)
+    except ValueError:
+        return False
+
+
 def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]:
     """Execute a frozen plan, conditionally, and read the result back."""
     if plan.profile != profile.name:
@@ -284,7 +450,9 @@ def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]
     result["etag"] = stored.etag
     result["summary"] = stored.summary
     result["start"] = stored.start
-    result["verified"] = stored.summary == plan.summary and stored.start == plan.start
+    result["verified"] = stored.summary == plan.summary and _same_instant(
+        stored.start, plan.start
+    )
     if not result["verified"]:
         raise EventError(
             f"the server stored something different at {plan.href}: it reports summary "

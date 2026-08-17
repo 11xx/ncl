@@ -120,7 +120,12 @@ def _describe(raw: bytes, *, calendar_href: str, href: str, etag: str) -> EventR
     names = {item.name for item in parsed.walk() if item.name.startswith("V")}
     # VCALENDAR and VTIMEZONE are structural; anything else is a component this
     # release does not model well enough to rewrite safely.
-    extra = names - {"VCALENDAR", "VTIMEZONE"} - SUPPORTED
+    # VALARM rides along with its event: a patch reparses the whole resource
+    # and re-serializes the VEVENT with its subcomponents, so an alarm survives
+    # an unrelated edit untouched. Marking it unsupported would refuse to edit
+    # the majority of events any calendar client creates, for a risk that was
+    # measured and is not there.
+    extra = names - {"VCALENDAR", "VTIMEZONE", "VALARM"} - SUPPORTED
     unsupported.extend(sorted(extra))
     if len(vevents) > 1 and "RECURRENCE-ID" not in unsupported:
         unsupported.append("RECURRENCE-ID")

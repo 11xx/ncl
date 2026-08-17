@@ -98,18 +98,23 @@ def test_an_event_with_attendees_is_reported_unwritable():
     assert set(reference.unsupported) >= {"ORGANIZER", "ATTENDEE"}
 
 
-def test_an_alarm_marks_the_event_unwritable_rather_than_being_dropped():
-    assert "VALARM" in _ref().unsupported
+def test_an_alarm_does_not_block_editing_because_a_patch_preserves_it():
+    """An alarm rides along with its event rather than blocking edits.
+
+    Refusing here would decline to edit most events a calendar client creates.
+    The alarm survives because a patch re-serializes the whole VEVENT, which is
+    asserted rather than assumed.
+    """
+    assert _ref().writable is True
+    patched = mutate.patch_event(RICH, {"SUMMARY": "Renamed"})
+    assert "BEGIN:VALARM" in patched
+    assert "TRIGGER:-PT15M" in patched
+    assert "Renamed" in patched
 
 
 def test_patch_preserves_everything_it_was_not_asked_to_change():
     """The worst defect this tool could ship is a silent loss at exit 0."""
-    patched = mutate.patch_event(
-        RICH.replace(b"BEGIN:VALARM\n", b"").replace(b"ACTION:DISPLAY\n", b"")
-        .replace(b"TRIGGER:-PT15M\n", b"").replace(b"DESCRIPTION:Reminder\n", b"")
-        .replace(b"END:VALARM\n", b""),
-        {"SUMMARY": "Renamed"},
-    )
+    patched = mutate.patch_event(RICH, {"SUMMARY": "Renamed"})
     assert "Renamed" in patched
     for survivor in ("X-CUSTOM-FIELD:do-not-lose-me", "CATEGORIES:WORK", "VTIMEZONE",
                      "America/Sao_Paulo", "LOCATION:Somewhere"):
@@ -117,12 +122,7 @@ def test_patch_preserves_everything_it_was_not_asked_to_change():
 
 
 def test_patch_bumps_sequence_so_clients_see_a_newer_revision():
-    patched = mutate.patch_event(
-        RICH.replace(b"BEGIN:VALARM\n", b"").replace(b"ACTION:DISPLAY\n", b"")
-        .replace(b"TRIGGER:-PT15M\n", b"").replace(b"DESCRIPTION:Reminder\n", b"")
-        .replace(b"END:VALARM\n", b""),
-        {"SUMMARY": "Renamed"},
-    )
+    patched = mutate.patch_event(RICH, {"SUMMARY": "Renamed"})
     assert "SEQUENCE:4" in patched
 
 

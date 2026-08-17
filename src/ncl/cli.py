@@ -178,7 +178,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cal_create.add_argument("--description", default="")
     cal_create.add_argument("--location", default="")
+    cal_create.add_argument(
+        "--priority", type=int, help="1 is highest, 9 is lowest (RFC 5545 order)"
+    )
+    cal_create.add_argument(
+        "--category", action="append", default=[], dest="categories",
+        help="Tag the event; repeatable",
+    )
+    cal_create.add_argument(
+        "--status", choices=["confirmed", "tentative", "cancelled"],
+        help="How settled the event is",
+    )
+    cal_create.add_argument(
+        "--free", dest="busy", action="store_false", default=None,
+        help="Leave the slot bookable instead of consuming free/busy time",
+    )
+    cal_create.add_argument(
+        "--busy", dest="busy", action="store_true",
+        help="Consume free/busy time (the default a client assumes)",
+    )
 
+    cal_create.add_argument("--url", default="", help="A canonical link for the event")
+    cal_create.add_argument(
+        "--class", dest="classification",
+        choices=["public", "private", "confidential"], help="Visibility to others",
+    )
+    cal_create.add_argument("--color", default="", help="CSS3 colour name (RFC 7986)")
+    cal_create.add_argument(
+        "--related-to", action="append", default=[], dest="related_to",
+        help="UID this event belongs with; repeatable",
+    )
+    cal_create.add_argument(
+        "--alarm", action="append", default=[], dest="alarms",
+        help="Reminder offset, e.g. -PT15M or -P1D; repeatable",
+    )
     cal_update = cal_commands.add_parser(
         "update", help="Plan a change to one event; changes nothing yet"
     )
@@ -189,6 +222,26 @@ def build_parser() -> argparse.ArgumentParser:
     cal_update.add_argument("--to", dest="end", help="End instant, ISO 8601 with an offset")
     cal_update.add_argument("--description")
     cal_update.add_argument("--location")
+    cal_update.add_argument("--priority", type=int, help="1 is highest, 9 is lowest")
+    cal_update.add_argument(
+        "--category", action="append", dest="categories", help="Replace tags; repeatable"
+    )
+    cal_update.add_argument("--status", choices=["confirmed", "tentative", "cancelled"])
+    cal_update.add_argument("--free", dest="busy", action="store_false", default=None)
+    cal_update.add_argument("--busy", dest="busy", action="store_true")
+    cal_update.add_argument("--url", help="A canonical link for the event")
+    cal_update.add_argument(
+        "--class", dest="classification", choices=["public", "private", "confidential"]
+    )
+    cal_update.add_argument("--color", help="CSS3 colour name (RFC 7986)")
+    cal_update.add_argument(
+        "--related-to", action="append", dest="related_to",
+        help="Replace the UIDs this event belongs with; repeatable",
+    )
+    cal_update.add_argument(
+        "--alarm", action="append", dest="alarms",
+        help="Replace reminders, e.g. -PT15M; repeatable",
+    )
 
     cal_delete = cal_commands.add_parser("delete", help="Plan a deletion; changes nothing yet")
     _add_options(cal_delete)
@@ -372,6 +425,15 @@ def _run_cal(args: argparse.Namespace) -> int:
             end=_moment(args.end, "--to"),
             description=args.description,
             location=args.location,
+            priority=args.priority,
+            categories=tuple(args.categories),
+            status=args.status or "",
+            busy=args.busy,
+            url=args.url,
+            classification=args.classification or "",
+            color=args.color,
+            related_to=tuple(args.related_to),
+            alarms=tuple(args.alarms),
         )
         return _emit_plan(plan, args.json)
 
@@ -387,6 +449,24 @@ def _run_cal(args: argparse.Namespace) -> int:
             changes["DESCRIPTION"] = args.description
         if args.location is not None:
             changes["LOCATION"] = args.location
+        if args.priority is not None:
+            changes["PRIORITY"] = args.priority
+        if args.categories is not None:
+            changes["CATEGORIES"] = args.categories
+        if args.status is not None:
+            changes["STATUS"] = args.status.upper()
+        if args.busy is not None:
+            changes["TRANSP"] = "OPAQUE" if args.busy else "TRANSPARENT"
+        if args.url is not None:
+            changes["URL"] = args.url
+        if args.classification is not None:
+            changes["CLASS"] = args.classification.upper()
+        if args.color is not None:
+            changes["COLOR"] = args.color
+        if args.related_to is not None:
+            changes["RELATED-TO"] = args.related_to
+        if args.alarms is not None:
+            changes["VALARM"] = args.alarms
         if not changes:
             raise events.EventError("no changes were requested", exits.USAGE)
         plan = mutate.plan_update(profile, session=transport, href=args.href, changes=changes)
