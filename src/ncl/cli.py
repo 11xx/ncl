@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from typing import Any
 
-from . import checks, exits, guide, identity, login, profiles, render, secrets, session
+from . import caldav, checks, exits, guide, identity, login, profiles, render, secrets, session
 from .config import ConfigError
 
 
@@ -56,6 +56,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     whoami = commands.add_parser("whoami", help="show the authenticated principal")
     _add_options(whoami)
+
+    cal = commands.add_parser("cal", help="calendars and events")
+    cal_commands = cal.add_subparsers(dest="cal_command", required=True)
+    cal_list = cal_commands.add_parser("list", help="discover calendars by href")
+    _add_options(cal_list)
 
     return parser
 
@@ -121,6 +126,23 @@ def _run_whoami(args: argparse.Namespace) -> int:
     return exits.OK
 
 
+def _run_cal(args: argparse.Namespace) -> int:
+    profile = _selected_profile(args)
+    home = identity.discover(profile).calendar_home
+    calendars = caldav.list_calendars(
+        profile, session=session.Session(profile), calendar_home=home
+    )
+    if args.json:
+        _json({"calendars": [calendar.as_dict() for calendar in calendars]})
+    else:
+        for calendar in calendars:
+            access = "ro" if calendar.read_only else "rw"
+            scope = "allowed" if calendar.in_scope else "not-allowlisted"
+            render.emit(f"{access} {scope:15} {calendar.display_name}")
+            render.emit(f"      {calendar.href}")
+    return exits.OK
+
+
 def _main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -165,6 +187,8 @@ def _main(argv: list[str] | None = None) -> int:
             return exits.OK
         if args.command == "whoami":
             return _run_whoami(args)
+        if args.command == "cal":
+            return _run_cal(args)
         return exits.USAGE
     except ConfigError as exc:
         return _error(exc, json_output)
@@ -173,6 +197,7 @@ def _main(argv: list[str] | None = None) -> int:
         secrets.SecretError,
         session.SessionError,
         identity.IdentityError,
+        caldav.CalendarError,
     ) as exc:
         return _error(exc, json_output)
     except (OSError, ValueError) as exc:

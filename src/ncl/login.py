@@ -21,7 +21,6 @@ from .session import (
     Transport,
     UrllibTransport,
     absolute_url,
-    parse_server_url,
 )
 
 
@@ -109,21 +108,20 @@ def _same_origin_url(profile: Any, value: Any, label: str) -> str:
         raise LoginError(f"the Login Flow v2 {label} URL was refused", exc.code) from exc
 
 
-def _poll_url(endpoint: str, token: str) -> str:
+def _poll_body(token: str) -> bytes:
+    """Encode the poll token as the form body the endpoint requires.
+
+    The token is sent as `application/x-www-form-urlencoded` POST data, not as
+    a query parameter on a GET. A GET, or a POST without the body, is answered
+    `400` — which is indistinguishable from a real protocol error and was read
+    as one, so login failed before the user could reach the browser at all.
+    """
     try:
-        parsed = parse_server_url(endpoint)
-        query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-        query.append(("token", token))
-        encoded_query = urllib.parse.urlencode(query)
-    except SessionError as exc:
-        raise LoginError("the Login Flow v2 poll URL was malformed", exc.code) from exc
+        return urllib.parse.urlencode({"token": token}).encode("ascii")
     except (TypeError, UnicodeError, ValueError) as exc:
         raise LoginError(
-            "the Login Flow v2 poll URL was malformed", exits.MALFORMED_RESPONSE
+            "the Login Flow v2 poll token was malformed", exits.MALFORMED_RESPONSE
         ) from exc
-    return urllib.parse.urlunsplit(
-        (parsed.scheme, parsed.netloc, parsed.path, encoded_query, parsed.fragment)
-    )
 
 
 def _request(
@@ -256,9 +254,13 @@ def _authenticate(
             try:
                 response = _request(
                     transport,
-                    "GET",
-                    _poll_url(endpoint, token),
-                    headers={"Accept": "application/json"},
+                    "POST",
+                    endpoint,
+                    data=_poll_body(token),
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    },
                 )
             except LoginError as exc:
                 if exc.code == exits.UNREACHABLE:

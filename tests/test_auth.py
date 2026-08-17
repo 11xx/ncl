@@ -598,12 +598,19 @@ def test_login_polls_404_then_stores_once_and_confirms_identity(monkeypatch):
     assert len(store_calls) == 1
     assert [request["method"] for request in transport.requests] == [
         "POST",
-        "GET",
-        "GET",
+        "POST",
+        "POST",
         "PROPFIND",
         "PROPFIND",
     ]
-    assert "token=poll-token" in transport.requests[2]["url"]
+    # The token is form-encoded POST data, never a query parameter on a GET.
+    # The server answers a GET, or a POST without the body, with 400, which is
+    # indistinguishable from a real protocol error — so asserting the wire form
+    # here is what keeps login working against the actual endpoint.
+    for poll in transport.requests[1:3]:
+        assert poll["data"] == b"token=poll-token"
+        assert "token=" not in poll["url"]
+        assert poll["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
     assert output[0].startswith("Open this URL")
 
 

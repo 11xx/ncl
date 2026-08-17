@@ -5,6 +5,16 @@ instance over CalDAV, WebDAV, and OCS, so that reaching a calendar or a file
 never requires driving the web UI. Non-goals: no MCP server, no daemon, no
 browser automation, no prompt layer.
 
+## Status: alpha, and moving
+
+Active early development, no released users. Breaking changes are warranted
+whenever they produce a better design, and no backwards-compatibility code
+should remain in the tree: no deprecated aliases, no legacy branches, no
+migration shims for a config or command shape that has already changed. Rename
+it, move it, or delete it, and update every caller in the same change.
+
+Remove this section when that stops being true.
+
 ## Invariants
 
 - **The credential never becomes an argument.** It is read from the configured

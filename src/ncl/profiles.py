@@ -118,7 +118,14 @@ def in_scope(candidate_href: str, allowlist: list[str] | tuple[str, ...]) -> boo
             allowed = _canonical(allowed_href)
         except ValueError:
             continue
-        if candidate.authority != allowed.authority:
+        # An allowlist entry written as a path carries no authority, and is
+        # relative to the profile's own origin. Discovery returns absolute
+        # URLs, so requiring both to name an authority would deny every
+        # configured collection — silently, since a denial looks the same as a
+        # collection that was never allowed. An entry that *does* name an
+        # authority still has to match one, so this widens nothing: the
+        # candidate reached here through a same-origin check already.
+        if allowed.authority is not None and candidate.authority != allowed.authority:
             continue
         if candidate.segments[: len(allowed.segments)] == allowed.segments:
             return True
