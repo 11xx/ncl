@@ -2,31 +2,76 @@
 
 from __future__ import annotations
 
-GUIDE = """ncl — read and write explicitly allowlisted calendars and files on Nextcloud.
+GUIDE = """ncl — read and write explicitly allowlisted Nextcloud calendars.
 
-`ncl` is a deterministic command-line surface for an agent. It uses the
-configured protocol endpoints instead of driving a browser. It deliberately
-does not automate a browser and does not provide an MCP server.
+`ncl` is a deterministic command-line surface for an agent. It speaks CalDAV
+directly instead of driving a browser, and is deliberately neither an MCP
+server nor browser automation.
 
 THE ORDER
-  ncl doctor                    Check the local preconditions first.
-  ncl login                     Obtain and verify an application password.
-  ncl whoami                    Show the authenticated principal and calendar home.
-  ncl logout                    Revoke and remove the stored credential.
-  work                          Later slices will add the calendar and file commands.
+  ncl doctor                    Local preconditions. Run it first; it reports
+                                each failure in terms of the command that fixes
+                                it.
+  ncl login                     Browser consent, once. Prints a URL and waits.
+  ncl whoami                    Prove the credential, and see which account and
+                                calendar home it actually reached.
+  ncl logout                    Revoke server-side, then forget locally.
 
-Configuration lives outside the repository, and calendars and file roots are
-explicit non-empty allowlists; a resource outside one is refused rather than
-warned about. Login Flow v2 is the only authentication mechanism. The secret
-backend is probed before browser consent, and credentials are read only from
-that backend.
+FIND A CALENDAR BEFORE NAMING ONE
+  ncl cal list                  Every calendar under the calendar home: its
+                                href, whether it is writable, and whether the
+                                allowlist admits it.
 
-Every command takes `--json` for machine-readable output. Exit codes are the
-contract: they distinguish failures so the caller knows whether to configure,
-re-observe, reconcile, or stop. `ncl doctor --json` includes the meanings of
-all exit codes as well as the checks it ran.
+  Address a calendar by href. A display name is chosen by the user and is not
+  unique, so a command given one refuses when two calendars share it rather
+  than guessing between them.
 
-Use `ncl <command> --help` for the exact arguments accepted by that command.
+  Listing reports the allowlist decision instead of filtering by it — a listing
+  that hid everything unconfigured could not be used to configure anything.
+
+READ
+  ncl cal events <calendar> --from <iso> --to <iso>
+  ncl cal show <event-href>
+
+  The window is required, and times need an explicit UTC offset: a local time
+  is ambiguous across one DST transition each year and nonexistent across the
+  other. An event carrying structure this release will not rewrite — a
+  recurrence rule, attendees, an alarm — is listed with what makes it
+  unwritable. It can be read; it cannot be edited here.
+
+CHANGE NOTHING BY ACCIDENT
+  ncl cal create <calendar> --summary S --from <iso> --to <iso>
+  ncl cal update <event-href> --summary S
+  ncl cal delete <event-href>
+
+  None of these change anything. Each resolves its target, freezes exactly what
+  it would do, prints it, and exits 40 with a plan id. The server is untouched
+  until:
+
+  ncl apply <plan-id>           Execute that frozen plan, once.
+  ncl plan list|show|cancel     Inspect or discard what is pending.
+
+  Creation is conditional on nothing being there; update and deletion are
+  conditional on the ETag read while planning, so a change that landed in
+  between conflicts instead of being overwritten. After a write the resource is
+  read back and compared: a server that accepts a PUT and stores something else
+  is reported rather than assumed.
+
+  This boundary is not authorization. `ncl` cannot tell whether a plan id came
+  from whoever read the preview or from the agent that produced it. Where a
+  human's approval is genuinely required, stop after planning and wait to be
+  told to continue.
+
+WHAT IT REFUSES
+  Scope is an allowlist of hrefs in configuration. The server issues no scoped
+  credentials, so that allowlist is the only scope boundary that exists — a
+  request outside it is refused here or nowhere.
+
+  Every command takes `--json`. Exit codes are the contract and say what to do
+  next: configure, log in, re-read, reconcile, or stop. `ncl doctor --json`
+  ships their meanings alongside the checks it ran.
+
+Use `ncl <command> --help` for the exact arguments a command accepts.
 """
 
 
