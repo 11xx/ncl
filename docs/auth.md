@@ -38,6 +38,25 @@ Three consequences shape the implementation:
   addresses the wrong account or none, so the account is discovered from the
   authenticated principal instead.
 
+The credential lifecycle is serialized per profile. `ncl login`, forced
+replacement, and `ncl logout` hold an exclusive lock under
+`$XDG_RUNTIME_DIR/ncl/` from credential preflight through storage or removal
+and principal verification. A lock records its process ID; a lock owned by a
+process that no longer exists is cleared automatically, while a live lock is
+reported as a conflict.
+
+Secret backends distinguish an absent entry from an unusable backend. `pass`
+reports absence with its explicit “not in the password store” result, while
+Secret Service reports it with an empty successful lookup. Decryption,
+agent, service, and other backend failures remain failures, so `ncl doctor`
+directs the caller to repair the backend rather than treating the credential
+as absent.
+
+The application password is registered at the authenticated request boundary,
+along with its Basic-auth representation. All command output passes through a
+single renderer that recursively redacts registered values, including values
+embedded in URLs, identity fields, error messages, and JSON payloads.
+
 The resulting credential does not expire, is revocable on its own from the
 account's security settings with a visible last-used timestamp, and carries no
 client secret.

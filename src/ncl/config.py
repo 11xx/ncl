@@ -17,6 +17,7 @@ class ConfigError(RuntimeError):
     """A configuration problem with the exit code the caller should use."""
 
     def __init__(self, message: str, code: int = exits.PRECONDITION_FAILED) -> None:
+        self.message = message
         self.code = code
         self.exit_code = code
         super().__init__(message)

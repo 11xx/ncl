@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
+import os
 import subprocess
 import sys
 from datetime import UTC, datetime
 from email.utils import format_datetime
+from pathlib import Path
 
 import pytest
+from test_config import write_config
 
-from ncl import cli, exits, identity, login, secrets
+from ncl import checks, cli, exits, identity, login, render, secrets, session
 from ncl.config import Profile
 from ncl.session import Response, Session, SessionError
 
@@ -21,6 +25,12 @@ PROFILE = Profile(
     calendars=("/remote.php/dav/calendars/alice/",),
     files_roots=("/remote.php/dav/files/alice/work/",),
 )
+SENTINEL = "fixture-secret"
+
+
+@pytest.fixture(autouse=True)
+def runtime_dir(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "runtime"))
 
 
 class FakeTransport:
@@ -142,8 +152,9 @@ def test_session_refusal_paths_do_not_leak_secret(monkeypatch, status, headers, 
 
     assert error.value.code == code
     assert "fixture-secret" not in str(error.value)
-    assert "fixture-secret" not in capsys.readouterr().out
-    assert "fixture-secret" not in capsys.readouterr().err
+    rendered = capsys.readouterr()
+    assert "fixture-secret" not in rendered.out
+    assert "fixture-secret" not in rendered.err
 
 
 def test_session_parses_invalid_retry_after_without_echoing_server_text(monkeypatch):
@@ -530,6 +541,14 @@ def test_server_supplied_text_never_reaches_rendered_messages(monkeypatch, capsy
 def test_login_polls_404_then_stores_once_and_confirms_identity(monkeypatch):
     stored = seed_credentials(monkeypatch)
     monkeypatch.setattr(secrets, "probe", lambda profile: True)
+    store_calls = []
+    original_store = secrets.store_credentials
+
+    def record_store(profile, login_name, app_password):
+        store_calls.append((profile, login_name, app_password))
+        return original_store(profile, login_name, app_password)
+
+    monkeypatch.setattr(secrets, "store_credentials", record_store)
     transport = FakeTransport(
         [
             response(
@@ -574,6 +593,7 @@ def test_login_polls_404_then_stores_once_and_confirms_identity(monkeypatch):
         "login_name": "alice@example.invalid",
         "app_password": "fixture-secret",
     }
+    assert len(store_calls) == 1
     assert [request["method"] for request in transport.requests] == [
         "POST",
         "GET",
@@ -750,8 +770,249 @@ def test_secret_backends_send_values_on_stdin_not_in_argv(monkeypatch, backend):
     backend.set(PROFILE, "app_password", "fixture-secret")
 
     assert calls
-    assert "fixture-secret" not in calls[0][0]
+    assert "fixture-secret" not in " ".join(calls[0][0])
     assert calls[0][1] == "fixture-secret\n"
+
+
+@pytest.mark.parametrize(
+    ("backend", "missing_result", "failure_result"),
+    [
+        (
+            secrets.PassBackend(),
+            subprocess.CompletedProcess(
+                ["pass"], 1, "", "Error: ncl/home/app_password is not in the password store.\n"
+            ),
+            subprocess.CompletedProcess(["pass"], 1, "", "gpg: decryption failed\n"),
+        ),
+        (
+            secrets.LibsecretBackend(),
+            subprocess.CompletedProcess(["secret-tool"], 0, "", ""),
+            subprocess.CompletedProcess(["secret-tool"], 1, "", "secret service unavailable\n"),
+        ),
+    ],
+)
+def test_secret_backend_reads_distinguish_absent_from_unusable(
+    monkeypatch, backend, missing_result, failure_result
+):
+    monkeypatch.setattr(secrets, "_run", lambda command, **kwargs: missing_result)
+    assert backend.get(PROFILE, "app_password") is None
+
+    monkeypatch.setattr(secrets, "_run", lambda command, **kwargs: failure_result)
+    with pytest.raises(secrets.SecretError):
+        backend.get(PROFILE, "app_password")
+
+
+def test_login_lock_contention_is_reported_before_preflight(monkeypatch, tmp_path):
+    runtime = Path(os.environ["XDG_RUNTIME_DIR"])
+    lock_dir = runtime / "ncl"
+    lock_dir.mkdir(parents=True)
+    lock_path = lock_dir / f"profile-{hashlib.sha256(PROFILE.name.encode()).hexdigest()}.lock"
+    lock_path.write_text(f"{os.getpid()}\n9999999999\n")
+    monkeypatch.setattr(secrets, "probe", lambda profile: pytest.fail("preflight ran"))
+
+    with pytest.raises(login.LoginError) as error:
+        login.authenticate(PROFILE, browser_open=lambda url: True)
+
+    assert error.value.code == exits.LOCKED
+
+
+def test_login_clears_dead_lock_and_reports_it(monkeypatch):
+    output = []
+    transport = FakeTransport(
+        [
+            response(
+                200,
+                json.dumps(
+                    {
+                        "login": "https://cloud.example.invalid/login",
+                        "poll": {
+                            "endpoint": "https://cloud.example.invalid/poll",
+                            "token": "poll-token",
+                        },
+                    }
+                ).encode(),
+            ),
+            response(
+                200,
+                json.dumps(
+                    {
+                        "server": "https://cloud.example.invalid",
+                        "loginName": "alice",
+                        "appPassword": SENTINEL,
+                    }
+                ).encode(),
+            ),
+            principal_response(),
+            home_response(),
+        ]
+    )
+    runtime = Path(os.environ["XDG_RUNTIME_DIR"])
+    lock_dir = runtime / "ncl"
+    lock_dir.mkdir(parents=True)
+    lock_path = lock_dir / f"profile-{hashlib.sha256(PROFILE.name.encode()).hexdigest()}.lock"
+    lock_path.write_text("2147483647\n0\n")
+    seed_credentials(monkeypatch)
+    monkeypatch.setattr(secrets, "probe", lambda profile: True)
+
+    login.authenticate(
+        PROFILE,
+        transport=transport,
+        browser_open=lambda url: True,
+        output=output.append,
+    )
+
+    assert output[0] == "A stale profile login lock was cleared."
+    assert not lock_path.exists()
+
+
+def test_cli_replaces_untyped_exception_text_with_catalogued_message(capsys):
+    assert cli._error(ValueError(SENTINEL), False) == exits.ERROR
+    rendered = capsys.readouterr()
+    assert SENTINEL not in rendered.err
+    assert "Unexpected failure" in rendered.err
+
+
+def _echo_principal_response() -> Response:
+    return response(
+        207,
+        dav_response(
+            f"""
+    <d:propstat><d:prop><d:current-user-principal><d:href>
+      /remote.php/dav/principals/users/{SENTINEL}/
+    </d:href></d:current-user-principal></d:prop>
+    <d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+"""
+        ),
+        headers={"X-Echo": SENTINEL},
+    )
+
+
+def _echo_home_response() -> Response:
+    return response(
+        207,
+        dav_response(
+            f"""
+    <d:propstat><d:prop>
+      <c:calendar-home-set><d:href>/remote.php/dav/calendars/{SENTINEL}/</d:href></c:calendar-home-set>
+      <d:displayname>{SENTINEL}</d:displayname>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+"""
+        ),
+        headers={"X-Echo": SENTINEL},
+    )
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_public_cli_auth_commands_redact_registered_credential(
+    monkeypatch, tmp_path, capsys, json_output
+):
+    config_path = write_config(tmp_path)
+    monkeypatch.setenv("NCL_CONFIG", str(config_path))
+    stored = seed_credentials(
+        monkeypatch,
+        {"login_name": "alice", "app_password": SENTINEL},
+    )
+    render.register_secret(SENTINEL)
+    monkeypatch.setattr(secrets, "probe", lambda profile: True)
+    monkeypatch.setattr(checks, "probe_pass", lambda: (True, "fixture pass"))
+
+    def invoke(command, transport, *, has_credentials=True):
+        monkeypatch.setattr(session, "UrllibTransport", lambda: transport)
+        monkeypatch.setattr(login, "UrllibTransport", lambda: transport)
+        monkeypatch.setattr(secrets, "has_credentials", lambda profile: has_credentials)
+        args = [command]
+        if json_output:
+            args.append("--json")
+        cli.main(args)
+        rendered = capsys.readouterr()
+        assert SENTINEL not in rendered.out + rendered.err
+
+    invoke("whoami", FakeTransport([_echo_principal_response(), _echo_home_response()]))
+    invoke(
+        "doctor",
+        FakeTransport(
+            [
+                _echo_principal_response(),
+                _echo_home_response(),
+                response(207, headers={"X-Echo": SENTINEL}),
+                response(207, headers={"X-Echo": SENTINEL}),
+            ]
+        ),
+    )
+
+    stored.clear()
+    monkeypatch.setattr(
+        secrets,
+        "store_credentials",
+        lambda profile, login_name, app_password: stored.update(
+            login_name=login_name, app_password=app_password
+        ),
+    )
+    invoke(
+        "login",
+        FakeTransport(
+            [
+                response(
+                    200,
+                    json.dumps(
+                        {
+                            "login": "https://cloud.example.invalid/login",
+                            "poll": {
+                                "endpoint": "https://cloud.example.invalid/poll",
+                                "token": "poll-token",
+                            },
+                        }
+                    ).encode(),
+                ),
+                response(
+                    200,
+                    json.dumps(
+                        {
+                            "server": "https://cloud.example.invalid",
+                            "loginName": "alice",
+                            "appPassword": SENTINEL,
+                        }
+                    ).encode(),
+                ),
+                _echo_principal_response(),
+                _echo_home_response(),
+            ]
+        ),
+        has_credentials=False,
+    )
+
+    stored.update(login_name="alice", app_password=SENTINEL)
+    invoke(
+        "logout",
+        FakeTransport(
+            [
+                response(
+                    500,
+                    SENTINEL.encode(),
+                    headers={"X-Echo": SENTINEL, "Retry-After": SENTINEL},
+                )
+            ]
+        ),
+    )
+
+
+def test_output_has_one_source_of_truth():
+    source_root = Path(__file__).parents[1] / "src" / "ncl"
+    violations = []
+    for path in source_root.rglob("*.py"):
+        if path.name == "render.py":
+            continue
+        text = path.read_text()
+        patterns = (
+            r"\bprint\(",
+            r"sys\.stdout",
+            r"sys\.stderr",
+            r"(?:stdout|stderr)\.write\(",
+        )
+        for pattern in patterns:
+            if __import__("re").search(pattern, text):
+                violations.append(f"{path}: {pattern}")
+    assert not violations
 
 
 def test_logout_removes_local_credential_when_server_revocation_fails(monkeypatch):

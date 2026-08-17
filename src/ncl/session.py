@@ -13,13 +13,14 @@ from datetime import UTC
 from email.utils import parsedate_to_datetime
 from typing import Any, Protocol
 
-from . import exits, profiles, secrets
+from . import exits, profiles, render, secrets
 
 
 class SessionError(RuntimeError):
     """An authenticated request was refused or could not be completed."""
 
     def __init__(self, message: str, code: int) -> None:
+        self.message = message
         self.code = code
         super().__init__(message)
 
@@ -205,6 +206,7 @@ class Session:
         try:
             login_name = secrets.get(self.profile, "login_name")
             app_password = secrets.get(self.profile, "app_password")
+            render.register_secret(app_password)
         except secrets.SecretError as exc:
             raise SessionError(
                 "the selected profile's secret backend failed", exits.PRECONDITION_FAILED
@@ -221,6 +223,7 @@ class Session:
             )
 
         auth_value = base64.b64encode(f"{login_name}:{app_password}".encode()).decode("ascii")
+        render.register_secret(f"Basic {auth_value}")
         request_headers = {**dict(headers or {}), "Authorization": f"Basic {auth_value}"}
         request_data = data.encode("utf-8") if isinstance(data, str) else data
         current_method = method.upper()

@@ -21,6 +21,7 @@ class IdentityError(RuntimeError):
     """The authenticated principal response was not usable."""
 
     def __init__(self, message: str, code: int = exits.MALFORMED_RESPONSE) -> None:
+        self.message = message
         self.code = code
         super().__init__(message)
 
@@ -111,7 +112,7 @@ def _href(element: ET.Element, *, profile: Any) -> str:
 
         return absolute_url(profile, value)
     except SessionError as exc:
-        raise IdentityError(str(exc), exc.code) from exc
+        raise IdentityError(exc.message, exc.code) from exc
 
 
 def _principal_account(url: str) -> str:

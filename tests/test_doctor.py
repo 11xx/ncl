@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 
 import pytest
 from test_auth import FakeTransport, home_response, principal_response, response
@@ -125,10 +126,10 @@ def test_doctor_fails_when_secret_backend_cannot_read(monkeypatch, tmp_path):
     path = write_config(tmp_path)
     monkeypatch.setattr(checks, "probe_pass", lambda: (True, "fixture pass"))
 
-    def unreadable(profile, key):
-        raise secrets.SecretError("backend unavailable")
+    def unreadable(command, **kwargs):
+        return subprocess.CompletedProcess(command, 1, "", "gpg: decryption failed\n")
 
-    monkeypatch.setattr(secrets, "get", unreadable)
+    monkeypatch.setattr(secrets, "_run", unreadable)
 
     report = checks.run(path)
 
@@ -138,6 +139,7 @@ def test_doctor_fails_when_secret_backend_cannot_read(monkeypatch, tmp_path):
     assert statuses["principal:home"] == "skip"
     credential = next(check for check in report.checks if check.name == "credential:home")
     assert "no credential" not in credential.detail
+    assert "fix the backend" in credential.detail
 
 
 def test_doctor_json_contains_checks_and_full_exit_map(monkeypatch, tmp_path, capsys):

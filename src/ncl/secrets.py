@@ -16,6 +16,7 @@ class SecretError(RuntimeError):
     """A secret backend could not complete an operation."""
 
     def __init__(self, message: str, code: int = exits.PRECONDITION_FAILED) -> None:
+        self.message = message
         self.code = code
         super().__init__(message)
 
@@ -60,9 +61,15 @@ class PassBackend:
     def get(self, profile: Any, key: str) -> str | None:
         result = _run([self.executable, "show", self._path(profile, key)])
         if result.returncode != 0:
-            return None
+            if result.returncode == 1 and result.stderr.strip().endswith(
+                "is not in the password store."
+            ):
+                return None
+            raise SecretError("the pass backend could not read the credential")
         value = result.stdout.rstrip("\n")
-        return value or None
+        if not value:
+            raise SecretError("the pass backend returned an empty credential")
+        return value
 
     def set(self, profile: Any, key: str, value: str) -> None:
         if not isinstance(value, str) or not value:
@@ -114,7 +121,7 @@ class LibsecretBackend:
     def get(self, profile: Any, key: str) -> str | None:
         result = _run([self.executable, "lookup", *self._attributes(profile, key)])
         if result.returncode != 0:
-            return None
+            raise SecretError("the libsecret backend could not read the credential")
         value = result.stdout.rstrip("\n")
         return value or None
 

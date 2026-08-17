@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import argparse
-import json
-import sys
 from typing import Any
 
-from . import checks, exits, guide, identity, login, profiles, secrets, session
+from . import checks, exits, guide, identity, login, profiles, render, secrets, session
 from .config import ConfigError
 
 
@@ -63,15 +61,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _json(value: Any) -> None:
-    print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+    render.emit(value)
 
 
 def _error(exc: Exception, json_output: bool) -> int:
     code = getattr(exc, "code", exits.ERROR)
+    message = getattr(exc, "message", None)
+    if not isinstance(message, str) or not message:
+        message = exits.RESPONSE.get(code, "The command failed.")
     if json_output:
-        _json({"error": str(exc), "code": code, "response": exits.RESPONSE.get(code)})
+        _json({"error": message, "code": code, "response": exits.RESPONSE.get(code)})
     else:
-        print(f"ncl: {exc}", file=sys.stderr)
+        render.emit_error(f"ncl: {message}")
     return code
 
 
@@ -89,9 +90,9 @@ def _run_profile(args: argparse.Namespace) -> int:
         if args.json:
             _json(values)
         else:
-            print(f"default: {loaded.default_profile}")
+            render.emit(f"default: {loaded.default_profile}")
             for name in sorted(loaded.profiles):
-                print(name)
+                render.emit(name)
         return exits.OK
 
     selected = profiles.resolve(args.profile, loaded=loaded)
@@ -100,7 +101,7 @@ def _run_profile(args: argparse.Namespace) -> int:
         _json(value)
     else:
         for key, item in value["profile"].items():
-            print(f"{key}: {item}")
+            render.emit(f"{key}: {item}")
     return exits.OK
 
 
@@ -116,7 +117,7 @@ def _run_whoami(args: argparse.Namespace) -> int:
         _json(result.as_dict())
     else:
         for key, value in result.as_dict().items():
-            print(f"{key}: {value}")
+            render.emit(f"{key}: {value}")
     return exits.OK
 
 
@@ -130,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
             if json_output:
                 _json({"guide": guide.render()})
             else:
-                print(guide.render(), end="")
+                render.emit(guide.render(), end="")
             return exits.OK
         if args.command == "doctor":
             report = checks.run(profile_name=args.profile)
@@ -138,13 +139,13 @@ def main(argv: list[str] | None = None) -> int:
                 _json(report.as_dict())
             else:
                 for check in report.checks:
-                    print(f"{check.status:4} {check.name}: {check.detail}")
+                    render.emit(f"{check.status:4} {check.name}: {check.detail}")
             return report.exit_code
         if args.command == "profile":
             return _run_profile(args)
         if args.command == "login":
             profile = _selected_profile(args)
-            output = print if not args.json else lambda message: print(message, file=sys.stderr)
+            output = render.emit if not args.json else render.emit_error
             result = login.authenticate(
                 profile,
                 force=args.force,
@@ -160,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.json:
                 _json({"revoked": True, "local_deleted": True})
             else:
-                print("Application password revoked and removed locally.")
+                render.emit("Application password revoked and removed locally.")
             return exits.OK
         if args.command == "whoami":
             return _run_whoami(args)

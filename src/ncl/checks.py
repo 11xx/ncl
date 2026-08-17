@@ -79,6 +79,11 @@ def _skip(name: str, detail: str) -> Check:
     return _check(name, "skip", detail)
 
 
+def _safe_error_detail(exc: Exception) -> str:
+    message = getattr(exc, "message", None)
+    return message if isinstance(message, str) and message else "the check failed"
+
+
 def _run_authenticated(profile: Any, checks: list[Check], *, transport: Any = None) -> None:
     from . import identity
     from . import secrets as secret_store
@@ -88,7 +93,7 @@ def _run_authenticated(profile: Any, checks: list[Check], *, transport: Any = No
         login_name = secret_store.get(profile, "login_name")
         app_password = secret_store.get(profile, "app_password")
     except secret_store.SecretError:
-        detail = "the secret backend could not read the credential"
+        detail = "the secret backend could not read the credential; fix the backend"
         checks.extend(
             (
                 _check(f"credential:{profile.name}", "fail", detail),
@@ -129,12 +134,13 @@ def _run_authenticated(profile: Any, checks: list[Check], *, transport: Any = No
     try:
         result = identity.discover(profile, session=session)
     except (SessionError, identity.IdentityError) as exc:
-        checks.append(_check(f"credential:{profile.name}", "fail", str(exc)))
+        detail = _safe_error_detail(exc)
+        checks.append(_check(f"credential:{profile.name}", "fail", detail))
         checks.append(
             _check(
                 f"principal:{profile.name}",
                 "fail",
-                str(exc),
+                detail,
             )
         )
         checks.append(_skip(f"calendar-home:{profile.name}", "principal discovery failed"))
@@ -163,7 +169,7 @@ def _run_authenticated(profile: Any, checks: list[Check], *, transport: Any = No
             try:
                 exists = _resource_exists(session, entry)
             except (SessionError, identity.IdentityError) as exc:
-                checks.append(_check(name, "fail", str(exc)))
+                checks.append(_check(name, "fail", _safe_error_detail(exc)))
             else:
                 checks.append(
                     _check(name, "pass", "resource exists")
@@ -184,7 +190,7 @@ def run(
     try:
         loaded = config.load(resolved)
     except config.ConfigError as exc:
-        checks.append(_check("config", "fail", str(exc)))
+        checks.append(_check("config", "fail", _safe_error_detail(exc)))
         checks.extend(
             (
                 _skip("default-profile", "configuration did not load"),

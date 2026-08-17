@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 import time
 import urllib.parse
 import webbrowser
 from collections.abc import Callable
+from contextlib import contextmanager, suppress
+from pathlib import Path
 from typing import Any
 
-from . import exits, identity, secrets
+from . import exits, identity, render, secrets
 from .session import (
     Response,
     Session,
@@ -24,8 +28,113 @@ class LoginError(RuntimeError):
     """A Login Flow v2 operation ended with a caller-actionable result."""
 
     def __init__(self, message: str, code: int) -> None:
+        self.message = message
         self.code = code
         super().__init__(message)
+
+
+_LOCK_STALE_SECONDS = 3600
+_HELD_LOCKS: set[Path] = set()
+
+
+def _lock_path(profile: Any) -> Path:
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime:
+        raise LoginError("XDG_RUNTIME_DIR is not configured", exits.PRECONDITION_FAILED)
+    directory = Path(runtime) / "ncl"
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as exc:
+        raise LoginError(
+            "the login lock directory is not usable", exits.PRECONDITION_FAILED
+        ) from exc
+    profile_id = hashlib.sha256(str(profile.name).encode("utf-8")).hexdigest()
+    return directory / f"profile-{profile_id}.lock"
+
+
+def _lock_is_stale(path: Path) -> bool:
+    try:
+        content = path.read_text()
+        modified = path.stat().st_mtime
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+    lines = content.splitlines()
+    try:
+        pid = int(lines[0])
+    except (IndexError, ValueError):
+        return time.time() - modified > _LOCK_STALE_SECONDS
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    except OSError:
+        return False
+    return False
+
+
+@contextmanager
+def _profile_lock(profile: Any):
+    """Hold one profile's mutation lock across preflight and credential lifecycle."""
+    path = _lock_path(profile)
+    if path in _HELD_LOCKS:
+        yield False
+        return
+
+    stale_cleared = False
+    pid = os.getpid()
+    while True:
+        try:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if not _lock_is_stale(path):
+                raise LoginError(
+                    "another process is running a login or logout for this profile",
+                    exits.LOCKED,
+                ) from None
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise LoginError(
+                    "the profile login lock could not be cleared", exits.LOCKED
+                ) from exc
+            stale_cleared = True
+            continue
+        except OSError as exc:
+            raise LoginError(
+                "the profile login lock could not be acquired", exits.PRECONDITION_FAILED
+            ) from exc
+        try:
+            os.write(descriptor, f"{pid}\n{time.time():.6f}\n".encode("ascii"))
+        except OSError as exc:
+            with suppress(OSError):
+                path.unlink()
+            raise LoginError(
+                "the profile login lock could not be written", exits.PRECONDITION_FAILED
+            ) from exc
+        finally:
+            os.close(descriptor)
+        break
+
+    _HELD_LOCKS.add(path)
+    try:
+        yield stale_cleared
+    finally:
+        _HELD_LOCKS.discard(path)
+        try:
+            content = path.read_text()
+            if content.splitlines() and content.splitlines()[0] == str(pid):
+                path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
 
 def _json_response(response: Response) -> dict[str, Any]:
@@ -34,7 +143,7 @@ def _json_response(response: Response) -> dict[str, Any]:
     try:
         value = response.json()
     except SessionError as exc:
-        raise LoginError(str(exc), exc.code) from exc
+        raise LoginError(exc.message, exc.code) from exc
     if not isinstance(value, dict):
         raise LoginError("the Login Flow v2 response was malformed", exits.MALFORMED_RESPONSE)
     return value
@@ -109,7 +218,7 @@ def _orphaned_credential(reason: str) -> LoginError:
     )
 
 
-def authenticate(
+def _authenticate(
     profile: Any,
     *,
     force: bool = False,
@@ -120,7 +229,7 @@ def authenticate(
     browser_open: Callable[[str], Any] | None = None,
     sleep: Callable[[float], Any] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
-    output: Callable[[str], Any] = print,
+    output: Callable[[str], Any] = render.emit,
 ) -> identity.Identity:
     """Complete Login Flow v2 and prove the stored credential with DAV."""
     browser_open = browser_open or webbrowser.open
@@ -281,7 +390,37 @@ def authenticate(
     return result
 
 
-def logout(
+def authenticate(
+    profile: Any,
+    *,
+    force: bool = False,
+    timeout: float = 1200,
+    poll_interval: float = 1,
+    max_poll_interval: float = 5,
+    transport: Transport | None = None,
+    browser_open: Callable[[str], Any] | None = None,
+    sleep: Callable[[float], Any] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    output: Callable[[str], Any] = render.emit,
+) -> identity.Identity:
+    with _profile_lock(profile) as stale_cleared:
+        if stale_cleared:
+            output("A stale profile login lock was cleared.")
+        return _authenticate(
+            profile,
+            force=force,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            max_poll_interval=max_poll_interval,
+            transport=transport,
+            browser_open=browser_open,
+            sleep=sleep,
+            clock=clock,
+            output=output,
+        )
+
+
+def _logout(
     profile: Any,
     *,
     transport: Transport | None = None,
@@ -329,3 +468,12 @@ def logout(
             exits.REVOCATION_FAILED,
         )
     return True
+
+
+def logout(
+    profile: Any,
+    *,
+    transport: Transport | None = None,
+) -> bool:
+    with _profile_lock(profile):
+        return _logout(profile, transport=transport)
