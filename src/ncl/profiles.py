@@ -18,6 +18,27 @@ class _CanonicalHref:
     segments: tuple[str, ...]
 
 
+def origin_parts(value: str) -> tuple[str, str, int]:
+    """Return an origin's scheme, host, and effective port."""
+    parsed = urlsplit(value)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("href URL must contain an HTTP(S) origin")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("href must not contain user information")
+    try:
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("href has an invalid port") from exc
+    if not host:
+        raise ValueError("href URL must contain a host")
+    if port is None:
+        port = 443 if parsed.scheme.lower() == "https" else 80
+    if not 1 <= port <= 65535:
+        raise ValueError("href port must be between 1 and 65535")
+    return parsed.scheme.lower(), host.lower(), port
+
+
 def _decode_segment(segment: str) -> str:
     index = 0
     while index < len(segment):
@@ -41,16 +62,7 @@ def _authority(parsed) -> tuple[str, str, int | None] | None:
         raise ValueError("href must use either a path or a complete URL")
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("href must not contain user information")
-    try:
-        host = parsed.hostname
-        port = parsed.port
-    except ValueError as exc:
-        raise ValueError("href has an invalid port") from exc
-    if not host:
-        raise ValueError("href URL must contain a host")
-    if port is not None and not 1 <= port <= 65535:
-        raise ValueError("href port must be between 1 and 65535")
-    return (parsed.scheme.lower(), host.lower(), port)
+    return origin_parts(parsed.geturl())
 
 
 def _canonical(value: str) -> _CanonicalHref:
@@ -80,6 +92,10 @@ def _canonical(value: str) -> _CanonicalHref:
         if segment == ".":
             continue
         segments.append(segment)
+    if not segments:
+        raise ValueError(
+            "href must name at least one path segment; a root entry would allow the entire account"
+        )
     return _CanonicalHref(authority=authority, segments=tuple(segments))
 
 

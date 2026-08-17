@@ -52,3 +52,14 @@ def test_secret_backend_defaults_to_pass(tmp_path):
     loaded = config.load(write_config(tmp_path, content))
 
     assert loaded.profiles["home"].secret_backend == "pass"
+
+
+@pytest.mark.parametrize("entry", ["/", "/.", "https://cloud.example.invalid/"])
+def test_root_allowlist_entries_are_rejected(tmp_path, entry):
+    content = VALID.replace(
+        'calendars = ["/remote.php/dav/calendars/alice/"]',
+        f'calendars = ["{entry}"]',
+    )
+
+    with pytest.raises(config.ConfigError, match="entire account"):
+        config.load(write_config(tmp_path, content))

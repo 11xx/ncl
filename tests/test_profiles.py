@@ -61,9 +61,24 @@ def test_scope_ignores_trailing_slash_difference():
     assert in_scope("/files/user/work", ["/files/user/work/"])
 
 
+def test_scope_normalizes_default_ports_without_matching_other_ports():
+    assert in_scope(
+        "https://cloud.example/files/home/report.txt",
+        ["https://cloud.example:443/files/home"],
+    )
+    assert not in_scope(
+        "https://cloud.example:444/files/home/report.txt",
+        ["https://cloud.example:443/files/home"],
+    )
+
+
 def test_scope_normalizes_unicode_to_nfc():
     assert in_scope("/files/alice/cafe\u0301", ["/files/alice/caf\u00e9"])
 
 
 def test_empty_allowlist_admits_nothing():
     assert not in_scope("/files/alice/work", [])
+
+
+def test_root_allowlist_entry_admits_nothing():
+    assert not in_scope("/anything/at/all", ["/"])
