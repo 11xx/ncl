@@ -1,10 +1,51 @@
 # Authenticating against Nextcloud
 
+`ncl` authenticates with an application password obtained through Login Flow v2.
+That is the only mechanism it implements.
+
 Every fact here is traceable to the server's own source. Nextcloud's client
 documentation is thin on the parts that decide a client's shape, and the parts
 it omits are the ones that break implementations quietly.
 
-## Bearer tokens reach the DAV endpoints
+## Login Flow v2
+
+The flow is designed for exactly this case: a native client that can open a
+browser but cannot safely hold a long-term secret of its own.
+
+1. `POST /index.php/login/v2` returns a `login` URL for the user to visit and a
+   `poll` object holding a token and an endpoint. The token is valid for twenty
+   minutes.
+2. The client shows the login URL and opens it. The user authenticates in their
+   own browser, with two-factor authentication if their account requires it,
+   and grants access.
+3. The client polls the endpoint with the token. **A 404 means consent has not
+   happened yet**, not that anything is missing — polling continues.
+4. A single 200 returns `{server, loginName, appPassword}`. It is returned
+   exactly once and cannot be requested again.
+
+Three consequences shape the implementation:
+
+- **The credential arrives once, so ordering is load-bearing.** The secret
+  store must be proven to round-trip *before* consent is requested. Discovering
+  an unusable store afterwards costs the user a second trip through the browser
+  and leaves a live application password on the server that nobody knows to
+  revoke.
+- **The URLs come from the server and must be checked.** A `login` or poll
+  endpoint whose origin differs from the configured one is refused rather than
+  followed.
+- **`loginName` is not the account UID.** Nextcloud permits logging in with a
+  UID, an email address, or other identifiers. A DAV path built from it
+  addresses the wrong account or none, so the account is discovered from the
+  authenticated principal instead.
+
+The resulting credential does not expire, is revocable on its own from the
+account's security settings with a visible last-used timestamp, and carries no
+client secret.
+
+## Bearer tokens do reach the DAV endpoints
+
+Worth recording because it is widely believed otherwise, and because it is the
+fact that makes the OAuth question a real decision rather than a foregone one.
 
 `apps/dav/lib/Server.php` builds the server behind `/remote.php/dav` and
 registers a `BearerAuth` backend on the auth plugin *before* the basic-auth
@@ -12,93 +53,52 @@ backend. `BearerAuth::validateBearerToken` delegates to
 `IUserSession::tryTokenLogin`, which resolves any token in the authentication
 token store — the same store the OAuth2 app writes its access tokens into.
 
-So an OAuth2 access token authenticates CalDAV and WebDAV, not merely the OCS
-APIs. Reports of `Bearer` failing against `remote.php/dav` describe either
-older servers or malformed `Authorization` headers, and should not be taken as
-a reason to reach for basic auth.
+The ordering misleads in one direction: a request whose bearer token does not
+resolve falls through to the next backend, and the eventual refusal is phrased
+in terms of basic auth. **A 401 mentioning `Authorization: Basic` is not
+evidence that the server ignored the bearer header** — it is evidence that the
+token was rejected. Reports that OAuth cannot reach WebDAV or CalDAV are that
+misreading.
 
-The ordering matters in one direction only: a request carrying a bearer token
-that does not resolve falls through to the next backend, and the eventual
-refusal is phrased in terms of basic auth. A 401 mentioning `Authorization:
-Basic` is therefore not evidence that the server ignored the bearer header — it
-is evidence that the token was rejected.
+## Why OAuth2 is not used
 
-## The authorization-code flow, as this server implements it
+It is feasible, as above. It was rejected because it buys nothing here and
+costs several things. All of this is read from `apps/oauth2`.
 
-Two grant types exist and no others: `authorization_code` and `refresh_token`.
-Anything else is refused before the request is examined.
+- **No scopes.** The admin manual states it plainly: every token has full
+  access to the complete account, read and write. An OAuth access token and an
+  application password therefore carry identical authority, which removes the
+  usual reason to prefer OAuth.
+- **No PKCE, confidential clients only.** The authorize endpoint accepts no
+  `code_challenge`, so a command-line client must store a client secret. For a
+  native application that is a weakening of the OAuth model, not a
+  strengthening of the credential.
+- **The redirect URI is fixed.** The authorize endpoint ignores the
+  `redirect_uri` a client sends and uses the one registered against the client.
+  The `http://localhost:*` wildcard applies only when an administrator has
+  enabled the non-default `oauth2.enable_oc_clients` setting. A loopback
+  listener therefore cannot choose an ephemeral port.
+- **Access tokens last 3600 seconds**, hardcoded in the token controller.
+- **Refresh tokens rotate, and replay is throttled.** Redeeming one invalidates
+  it and issues a replacement in the same response; presenting a spent token is
+  throttled under `refresh_token_already_redeemed` as a brute-force signal.
+  That combination has a permanent-lockout failure mode. A crash between
+  redeeming and persisting the replacement costs the credential outright, and
+  two concurrent invocations redeeming the same token lock the tool out of its
+  own account unless every refresh is serialized by a cross-process lock.
+- **It requires an administrator-registered client**, which is setup the user
+  must perform and can later delete out from under the tool.
 
-- Authorize: `/index.php/apps/oauth2/authorize`, taking `client_id`,
-  `state`, `response_type`, and `redirect_uri`.
-- Token: `/index.php/apps/oauth2/api/v1/token`.
+Revisit if Nextcloud ships genuinely scoped tokens, or if an administrator
+requires a centrally registered client and disables Login Flow.
 
-**There is no PKCE.** The authorize endpoint accepts no `code_challenge`, so
-the code cannot be bound to the requesting client by proof of possession. The
-server supports confidential clients only, which means a client secret is
-mandatory and has to live wherever the tool keeps secrets. A native CLI holding
-a client secret is a known compromise of the OAuth model; here it is not
-optional, so the secret is treated exactly like the tokens it obtains.
+## Scope, and what a credential is actually worth
 
-**Access tokens live 3600 seconds.** The value is not negotiable and not
-advertised per client; the token controller hardcodes both the stored expiry
-and the `expires_in` it returns.
+Because the server enforces no scopes, every credential it issues carries full
+account access. The tool's own allowlist is therefore the only scope boundary
+that exists in the system: the server will not decline a request for a
+collection outside the configured scope, so only the client will.
 
-**Refresh tokens rotate, and replay is punished.** Redeeming a refresh token
-invalidates it and issues a new one in the same response. Presenting a spent
-token is not merely refused: the controller throttles it under
-`refresh_token_already_redeemed`, which is brute-force protection and slows
-subsequent attempts from the same source.
-
-Two consequences the implementation must honour, because the failure is silent
-and self-inflicted:
-
-- The new refresh token has to be durably stored *before* the access token is
-  used for anything, and a crash between redeeming and storing costs the
-  credential permanently — recovery means another browser consent.
-- Refresh has to be serialized across processes. A tool a harness may invoke
-  several times concurrently will otherwise have two invocations redeem the
-  same refresh token, and the loser both fails and trips the throttle. A
-  cross-process lock around the refresh is a correctness requirement, not a
-  tuning detail.
-
-## The redirect URI is fixed, so the callback port is too
-
-The authorize endpoint does not honour the `redirect_uri` a client sends. It
-redirects to the URI stored against the registered client and ignores the
-parameter — with one exception: if the administrator has enabled the
-`oauth2.enable_oc_clients` system setting, which is off by default, *and* the
-client was registered with the literal value `http://localhost:*`, then the
-provided URI is used instead.
-
-A command-line client therefore cannot pick an ephemeral port and tell the
-server about it. Either the loopback listener binds the exact port registered
-with the client, or the server has to be configured for the wildcard form. The
-first is the tool's default because it requires nothing of the server, and it
-makes the port a configured value whose availability is a precondition worth
-checking rather than a detail discovered at the worst moment — half way through
-a consent the user has already granted.
-
-## Scope, and what a token is actually worth
-
-Nextcloud's OAuth2 has no scopes. The admin manual states it plainly: every
-token has full access to the complete account, including read and write access
-to stored files. An access token, a refresh token, and an application password
-therefore all carry identical authority, and the only real differences are
-lifetime and how each is revoked.
-
-This is why the tool's own allowlist is a security boundary rather than a
-convenience. The server will not decline a request for a collection outside the
-configured scope; only the client will.
-
-## Application passwords, and why the code still supports them
-
-Login Flow v2 obtains a per-device application password through the same
-browser consent the OAuth flow uses: `POST /index.php/login/v2` returns a login
-URL and a poll token, the user grants in the browser, and a single successful
-poll returns the password exactly once. The credential does not expire, needs
-no client registration, and is revocable individually.
-
-It remains supported because it survives conditions the OAuth flow does not: a
-server whose OAuth2 client registration has been removed, an unattended run
-whose refresh token was invalidated, and any host where storing a client secret
-is not acceptable. It is a fallback rather than the default.
+That is why the allowlist is compared on canonical discovered hrefs — decoded
+per path segment and normalized — rather than on display names or string
+prefixes.
