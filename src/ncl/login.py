@@ -50,11 +50,19 @@ def _same_origin_url(profile: Any, value: Any, label: str) -> str:
 
 
 def _poll_url(endpoint: str, token: str) -> str:
-    parsed = parse_server_url(endpoint)
-    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-    query.append(("token", token))
+    try:
+        parsed = parse_server_url(endpoint)
+        query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        query.append(("token", token))
+        encoded_query = urllib.parse.urlencode(query)
+    except SessionError as exc:
+        raise LoginError("the Login Flow v2 poll URL was malformed", exc.code) from exc
+    except (TypeError, UnicodeError, ValueError) as exc:
+        raise LoginError(
+            "the Login Flow v2 poll URL was malformed", exits.MALFORMED_RESPONSE
+        ) from exc
     return urllib.parse.urlunsplit(
-        (parsed.scheme, parsed.netloc, parsed.path, urllib.parse.urlencode(query), parsed.fragment)
+        (parsed.scheme, parsed.netloc, parsed.path, encoded_query, parsed.fragment)
     )
 
 
@@ -211,9 +219,9 @@ def authenticate(
                 raise LoginError(
                     "the Login Flow v2 poll response was unexpected", exits.SERVER_ERROR
                 )
-            payload = _json_response(response)
-            issued = "appPassword" in payload
+            issued = response.status == 200
             try:
+                payload = _json_response(response)
                 server = payload.get("server")
                 if not isinstance(server, str) or not server:
                     if issued:
@@ -239,7 +247,9 @@ def authenticate(
                     raise
             except KeyboardInterrupt:
                 raise
-            except LoginError:
+            except LoginError as exc:
+                if issued and exc.code != exits.CREDENTIAL_STORE_FAILED:
+                    raise _orphaned_credential("the credential could not be stored") from exc
                 raise
             except Exception as exc:
                 if issued:

@@ -69,7 +69,8 @@ def parse_server_url(value: str) -> urllib.parse.SplitResult:
     try:
         parsed = urllib.parse.urlsplit(value)
         _ = parsed.username, parsed.password, parsed.hostname, parsed.port
-    except (TypeError, ValueError) as exc:
+        value.encode("utf-8")
+    except (TypeError, UnicodeError, ValueError) as exc:
         raise SessionError("the server URL is malformed", exits.MALFORMED_RESPONSE) from exc
     return parsed
 
@@ -141,7 +142,8 @@ def _retry_after_detail(value: str | None) -> str:
         return "Retry-After was unparseable"
     candidate = value.strip()
     if candidate.isascii() and candidate.isdigit():
-        if len(candidate) > 4300:
+        # Six digits already allow an eleven-day delay; longer values are not useful hints.
+        if len(candidate) > 6:
             return "Retry-After was unparseable"
         return f"retry delay: {int(candidate)} seconds"
     try:

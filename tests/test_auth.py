@@ -4,6 +4,7 @@ import argparse
 import base64
 import json
 import subprocess
+import sys
 from datetime import UTC, datetime
 from email.utils import format_datetime
 
@@ -167,11 +168,16 @@ def test_session_bounds_retry_after_before_integer_conversion(monkeypatch, statu
         monkeypatch,
         {"login_name": "alice", "app_password": "fixture-secret"},
     )
-    server_text = "9" * 4301
-    transport = FakeTransport([response(status, headers={"Retry-After": server_text})])
+    old_limit = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(640)
+    try:
+        server_text = "9" * 650
+        transport = FakeTransport([response(status, headers={"Retry-After": server_text})])
 
-    with pytest.raises(SessionError) as error:
-        Session(PROFILE, transport=transport).request("GET", "/remote.php/dav/")
+        with pytest.raises(SessionError) as error:
+            Session(PROFILE, transport=transport).request("GET", "/remote.php/dav/")
+    finally:
+        sys.set_int_max_str_digits(old_limit)
 
     assert error.value.code == code
     assert "unparseable" in str(error.value)
@@ -392,6 +398,75 @@ def test_login_reports_issued_credential_when_post_consent_validation_fails(
     assert "Security settings" in str(error.value)
     assert expected_fragment in str(error.value)
     assert "fixture-secret" not in str(error.value)
+
+
+def test_login_treats_unparseable_http_200_as_issued_credential(monkeypatch, capsys):
+    stored = seed_credentials(monkeypatch)
+    monkeypatch.setattr(secrets, "probe", lambda profile: True)
+    monkeypatch.setattr(secrets, "has_credentials", lambda profile: False)
+    transport = FakeTransport(
+        [
+            response(
+                200,
+                json.dumps(
+                    {
+                        "login": "https://cloud.example.invalid/login",
+                        "poll": {
+                            "endpoint": "https://cloud.example.invalid/poll",
+                            "token": "poll-token",
+                        },
+                    }
+                ).encode(),
+            ),
+            response(200, b'{"server":"https://cloud.example.invalid",'),
+        ]
+    )
+
+    with pytest.raises(login.LoginError) as error:
+        login.authenticate(PROFILE, transport=transport, browser_open=lambda url: True)
+
+    assert error.value.code == exits.CREDENTIAL_STORE_FAILED
+    assert stored == {}
+    assert cli._error(error.value, True) == exits.CREDENTIAL_STORE_FAILED
+    rendered = capsys.readouterr()
+    assert "orphaned" in rendered.out
+    assert "Security settings" in rendered.out
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "token", "server_text"),
+    [
+        ("https://cloud.example.invalid/poll", "\ud800", "\ud800"),
+        ("https://cloud.example.invalid/poll?state=\ud800", "poll-token", "\ud800"),
+    ],
+)
+def test_login_refuses_unencodable_poll_request_values(
+    monkeypatch, capsys, endpoint, token, server_text
+):
+    seed_credentials(monkeypatch)
+    monkeypatch.setattr(secrets, "probe", lambda profile: True)
+    monkeypatch.setattr(secrets, "has_credentials", lambda profile: False)
+    transport = FakeTransport(
+        [
+            response(
+                200,
+                json.dumps(
+                    {
+                        "login": "https://cloud.example.invalid/login",
+                        "poll": {"endpoint": endpoint, "token": token},
+                    }
+                ).encode(),
+            )
+        ]
+    )
+
+    with pytest.raises(login.LoginError) as error:
+        login.authenticate(PROFILE, transport=transport, browser_open=lambda url: True)
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+    assert cli._error(error.value, True) == exits.MALFORMED_RESPONSE
+    rendered = capsys.readouterr()
+    assert server_text not in rendered.out + rendered.err
 
 
 def test_server_supplied_text_never_reaches_rendered_messages(monkeypatch, capsys):
