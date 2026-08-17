@@ -30,7 +30,9 @@ MULTISTATUS = b"""<?xml version="1.0"?>
       <d:current-user-privilege-set>
         <d:privilege><d:read/></d:privilege><d:privilege><d:write/></d:privilege>
       </d:current-user-privilege-set>
-      <c:supported-calendar-component-set><c:comp name="VEVENT"/></c:supported-calendar-component-set>
+      <c:supported-calendar-component-set>
+        <c:comp name="VEVENT"/>
+      </c:supported-calendar-component-set>
     </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
   </d:response>
   <d:response>
