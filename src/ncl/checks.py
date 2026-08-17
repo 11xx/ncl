@@ -1,18 +1,26 @@
-"""Precondition checks that do not contact a Nextcloud server."""
+"""Local and authenticated precondition checks for a configured profile."""
 
 from __future__ import annotations
 
-import contextlib
-import secrets
-import shutil
-import socket
-import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from . import config, exits, profiles
+
+
+def _resource_exists(session: Any, href: str) -> bool:
+    response = session.request(
+        "PROPFIND",
+        href,
+        headers={"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
+        data=(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>'
+        ),
+    )
+    return response.status in {200, 207}
 
 
 @dataclass(frozen=True)
@@ -45,73 +53,17 @@ class Report:
 
 
 def probe_pass() -> tuple[bool, str]:
-    """Check that pass is installed and has an initialized password store."""
-    if shutil.which("pass") is None:
-        return False, "pass binary is not installed"
-    store = Path("~/.password-store").expanduser()
-    gpg_id = store / ".gpg-id"
-    if not store.is_dir() or not gpg_id.is_file():
-        return False, f"{store} is not an initialized password store"
-    return True, "pass and the password store are available"
+    """Check that pass can store, retrieve, and clear a value."""
+    from . import secrets as secret_store
 
-
-def _secret_tool_call(
-    command: list[str], *, input_text: str | None = None
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        command,
-        input=input_text,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=5,
-    )
+    return secret_store.probe_backend("pass")
 
 
 def probe_libsecret() -> tuple[bool, str]:
-    """Verify Secret Service by storing, looking up, and clearing a probe."""
-    tool = shutil.which("secret-tool")
-    if tool is None:
-        return False, "secret-tool binary is not installed"
+    """Verify that Secret Service can store, retrieve, and clear a value."""
+    from . import secrets as secret_store
 
-    attribute = secrets.token_hex(16)
-    value = secrets.token_hex(24)
-    command = [tool, "ncl-doctor", attribute]
-    stored = False
-    try:
-        result = _secret_tool_call(
-            [tool, "store", "--label=ncl doctor probe", *command[1:]],
-            input_text=f"{value}\n",
-        )
-        if result.returncode != 0:
-            return False, "secret-tool could not store a probe value"
-        stored = True
-
-        result = _secret_tool_call([tool, "lookup", *command[1:]])
-        if result.returncode != 0 or result.stdout.rstrip("\n") != value:
-            return False, "secret-tool could not look up the stored probe value"
-        result = _secret_tool_call([tool, "clear", *command[1:]])
-        if result.returncode != 0:
-            return False, "secret-tool could not clear the probe value"
-        stored = False
-        return True, "Secret Service stored, returned, and cleared a probe value"
-    except (OSError, subprocess.TimeoutExpired):
-        return False, "secret-tool did not complete the probe"
-    finally:
-        if stored:
-            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
-                _secret_tool_call([tool, "clear", *command[1:]])
-
-
-def probe_callback_port(port: int) -> tuple[bool, str]:
-    """Check that the configured OAuth callback port is bindable on loopback."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            listener.bind(("127.0.0.1", port))
-    except OSError as exc:
-        return False, f"loopback callback port {port} is not bindable: {exc}"
-    return True, f"loopback callback port {port} is bindable"
+    return secret_store.probe_backend("libsecret")
 
 
 def _check(name: str, status: str, detail: str) -> Check:
@@ -127,8 +79,87 @@ def _skip(name: str, detail: str) -> Check:
     return _check(name, "skip", detail)
 
 
-def run(path: str | Path | None = None, profile_name: str | None = None) -> Report:
-    """Run every local precondition that can be evaluated without a server."""
+def _run_authenticated(profile: Any, checks: list[Check], *, transport: Any = None) -> None:
+    from . import identity
+    from . import secrets as secret_store
+    from .session import Session, SessionError
+
+    try:
+        login_name = secret_store.get(profile, "login_name")
+        app_password = secret_store.get(profile, "app_password")
+    except secret_store.SecretError:
+        login_name = app_password = None
+    if not login_name or not app_password:
+        detail = "no credential is stored; run `ncl login`"
+        checks.extend(
+            (
+                _skip(f"credential:{profile.name}", detail),
+                _skip(f"principal:{profile.name}", detail),
+                _skip(f"calendar-home:{profile.name}", detail),
+            )
+        )
+        for field, entries in (
+            ("calendars", profile.calendars),
+            ("files_roots", profile.files_roots),
+        ):
+            for index, _entry in enumerate(entries):
+                checks.append(_skip(f"remote:{profile.name}:{field}:{index}", detail))
+        return
+
+    session = Session(profile, transport=transport)
+    try:
+        result = identity.discover(profile, session=session)
+    except (SessionError, identity.IdentityError) as exc:
+        checks.append(_check(f"credential:{profile.name}", "fail", str(exc)))
+        checks.append(
+            _check(
+                f"principal:{profile.name}",
+                "fail",
+                str(exc),
+            )
+        )
+        checks.append(_skip(f"calendar-home:{profile.name}", "principal discovery failed"))
+        for field, entries in (
+            ("calendars", profile.calendars),
+            ("files_roots", profile.files_roots),
+        ):
+            for index, _entry in enumerate(entries):
+                checks.append(
+                    _skip(
+                        f"remote:{profile.name}:{field}:{index}",
+                        "principal discovery failed",
+                    )
+        )
+        return
+
+    checks.append(_check(f"credential:{profile.name}", "pass", "stored credential was accepted"))
+    checks.append(_check(f"principal:{profile.name}", "pass", f"resolved {result.account_name!r}"))
+    checks.append(_check(f"calendar-home:{profile.name}", "pass", result.calendar_home))
+    for field, entries in (("calendars", profile.calendars), ("files_roots", profile.files_roots)):
+        for index, entry in enumerate(entries):
+            name = f"remote:{profile.name}:{field}:{index}"
+            if field == "calendars" and not identity.in_calendar_home(entry, result.calendar_home):
+                checks.append(_check(name, "fail", "allowlist entry is outside the calendar home"))
+                continue
+            try:
+                exists = _resource_exists(session, entry)
+            except (SessionError, identity.IdentityError) as exc:
+                checks.append(_check(name, "fail", str(exc)))
+            else:
+                checks.append(
+                    _check(name, "pass", "resource exists")
+                    if exists
+                    else _check(name, "fail", "resource was not found")
+                )
+
+
+def run(
+    path: str | Path | None = None,
+    profile_name: str | None = None,
+    *,
+    transport: Any = None,
+) -> Report:
+    """Run local checks and authenticated checks when a credential is present."""
     resolved = config.config_path(path)
     checks: list[Check] = []
     try:
@@ -140,7 +171,6 @@ def run(path: str | Path | None = None, profile_name: str | None = None) -> Repo
                 _skip("default-profile", "configuration did not load"),
                 _skip("origins", "configuration did not load"),
                 _skip("secret-backends", "configuration did not load"),
-                _skip("callback-ports", "configuration did not load"),
                 _skip("allowlists", "configuration did not load"),
             )
         )
@@ -195,22 +225,6 @@ def run(path: str | Path | None = None, profile_name: str | None = None) -> Repo
             )
             checks.append(_run_probe(f"secret-backend:{profile.name}:libsecret", probe_libsecret))
 
-        if profile.auth == "oauth":
-            assert profile.callback_port is not None
-            checks.append(
-                _run_probe(
-                    f"callback-port:{profile.name}",
-                    lambda port=profile.callback_port: probe_callback_port(port),
-                )
-            )
-        else:
-            checks.append(
-                _skip(
-                    f"callback-port:{profile.name}",
-                    "not required by app-password authentication",
-                )
-            )
-
         for field, entries in (
             ("calendars", profile.calendars),
             ("files_roots", profile.files_roots),
@@ -227,5 +241,7 @@ def run(path: str | Path | None = None, profile_name: str | None = None) -> Repo
             else:
                 noun = "entry" if len(entries) == 1 else "entries"
                 checks.append(_check(name, "pass", f"{len(entries)} {noun} canonicalize"))
+
+        _run_authenticated(profile, checks, transport=transport)
 
     return Report(tuple(checks))

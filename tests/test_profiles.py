@@ -13,14 +13,12 @@ def test_resolve_uses_default_or_explicit_profile(tmp_path):
             "profiles": {
                 "home": {
                     "origin": "https://cloud.example.invalid",
-                    "auth": "app-password",
                     "secret_backend": "pass",
                     "calendars": ["/calendars/alice"],
                     "files_roots": ["/files/alice"],
                 },
                 "other": {
                     "origin": "https://cloud.example.invalid",
-                    "auth": "app-password",
                     "secret_backend": "pass",
                     "calendars": ["/calendars/alice"],
                     "files_roots": ["/files/alice"],

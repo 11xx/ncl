@@ -10,13 +10,16 @@ does not automate a browser and does not provide an MCP server.
 
 THE ORDER
   ncl doctor                    Check the local preconditions first.
-  authenticate once             The later login slice will obtain credentials.
+  ncl login                     Obtain and verify an application password.
+  ncl whoami                    Show the authenticated principal and calendar home.
+  ncl logout                    Revoke and remove the stored credential.
   work                          Later slices will add the calendar and file commands.
 
-This slice is incomplete: `ncl doctor` and `ncl profile list|show` are the
-available commands. Configuration lives outside the repository, and calendars
-and file roots are explicit non-empty allowlists; a resource outside one is
-refused rather than warned about.
+Configuration lives outside the repository, and calendars and file roots are
+explicit non-empty allowlists; a resource outside one is refused rather than
+warned about. Login Flow v2 is the only authentication mechanism. The secret
+backend is probed before browser consent, and credentials are read only from
+that backend.
 
 Every command takes `--json` for machine-readable output. Exit codes are the
 contract: they distinguish failures so the caller knows whether to configure,

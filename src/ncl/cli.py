@@ -7,7 +7,7 @@ import json
 import sys
 from typing import Any
 
-from . import checks, exits, guide, profiles
+from . import checks, exits, guide, identity, login, profiles, secrets, session
 from .config import ConfigError
 
 
@@ -35,6 +35,26 @@ def build_parser() -> argparse.ArgumentParser:
     _add_options(list_profiles)
     show_profile = profile_commands.add_parser("show", help="show one profile")
     _add_options(show_profile)
+
+    login_command = commands.add_parser("login", help="obtain an application password")
+    _add_options(login_command)
+    login_command.add_argument(
+        "--force",
+        action="store_true",
+        help="replace an existing stored credential after browser consent",
+    )
+    login_command.add_argument(
+        "--timeout",
+        type=float,
+        default=1200,
+        help="seconds to wait for browser consent (default: 1200)",
+    )
+
+    logout_command = commands.add_parser("logout", help="revoke and remove the credential")
+    _add_options(logout_command)
+
+    whoami = commands.add_parser("whoami", help="show the authenticated principal")
+    _add_options(whoami)
 
     return parser
 
@@ -81,6 +101,22 @@ def _run_profile(args: argparse.Namespace) -> int:
     return exits.OK
 
 
+def _selected_profile(args: argparse.Namespace):
+    loaded = profiles.config.load()
+    return profiles.resolve(args.profile, loaded=loaded)
+
+
+def _run_whoami(args: argparse.Namespace) -> int:
+    profile = _selected_profile(args)
+    result = identity.discover(profile)
+    if args.json:
+        _json(result.as_dict())
+    else:
+        for key, value in result.as_dict().items():
+            print(f"{key}: {value}")
+    return exits.OK
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -103,8 +139,37 @@ def main(argv: list[str] | None = None) -> int:
             return report.exit_code
         if args.command == "profile":
             return _run_profile(args)
+        if args.command == "login":
+            profile = _selected_profile(args)
+            output = print if not args.json else lambda message: print(message, file=sys.stderr)
+            result = login.authenticate(
+                profile,
+                force=args.force,
+                timeout=args.timeout,
+                output=output,
+            )
+            if args.json:
+                _json(result.as_dict())
+            return exits.OK
+        if args.command == "logout":
+            profile = _selected_profile(args)
+            login.logout(profile)
+            if args.json:
+                _json({"revoked": True, "local_deleted": True})
+            else:
+                print("Application password revoked and removed locally.")
+            return exits.OK
+        if args.command == "whoami":
+            return _run_whoami(args)
         return exits.USAGE
     except ConfigError as exc:
+        return _error(exc, json_output)
+    except (
+        login.LoginError,
+        secrets.SecretError,
+        session.SessionError,
+        identity.IdentityError,
+    ) as exc:
         return _error(exc, json_output)
     except (OSError, ValueError) as exc:
         return _error(exc, json_output)

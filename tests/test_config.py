@@ -9,10 +9,7 @@ default_profile = "home"
 
 [profiles.home]
 origin = "https://cloud.example.invalid"
-auth = "oauth"
 secret_backend = "pass"
-callback_port = 41417
-client_id = "client-home"
 calendars = ["/remote.php/dav/calendars/alice/"]
 files_roots = ["/remote.php/dav/files/alice/work/"]
 """
@@ -28,7 +25,7 @@ def test_valid_config_loads(tmp_path):
     loaded = config.load(write_config(tmp_path))
 
     assert loaded.default_profile == "home"
-    assert loaded.profiles["home"].client_id == "client-home"
+    assert loaded.profiles["home"].secret_backend == "pass"
     assert loaded.profiles["home"].calendars == ("/remote.php/dav/calendars/alice/",)
 
 
@@ -49,15 +46,9 @@ def test_bad_origin_is_rejected_with_reason(tmp_path):
         config.load(path)
 
 
-def test_oauth_requires_client_id(tmp_path):
-    path = write_config(tmp_path, VALID.replace('client_id = "client-home"\n', ""))
+def test_secret_backend_defaults_to_pass(tmp_path):
+    content = VALID.replace('secret_backend = "pass"\n', "")
 
-    with pytest.raises(config.ConfigError, match="client_id"):
-        config.load(path)
+    loaded = config.load(write_config(tmp_path, content))
 
-
-def test_callback_port_must_be_in_range(tmp_path):
-    path = write_config(tmp_path, VALID.replace("callback_port = 41417", "callback_port = 1023"))
-
-    with pytest.raises(config.ConfigError, match="between 1024 and 65535"):
-        config.load(path)
+    assert loaded.profiles["home"].secret_backend == "pass"

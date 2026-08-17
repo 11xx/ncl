@@ -16,6 +16,11 @@ NOT_CONFIGURED = 11
 NO_CREDENTIAL = 12
 CREDENTIAL_REJECTED = 13
 CONSENT_REQUIRED = 14
+CONSENT_DENIED = 15
+TOKEN_EXPIRED = 16
+LOGIN_TIMEOUT = 17
+CREDENTIAL_STORE_FAILED = 18
+REVOCATION_FAILED = 19
 
 UNREACHABLE = 20
 SERVER_ERROR = 21
@@ -55,6 +60,17 @@ RESPONSE = {
         "The server rejected the stored credential. Re-authenticate with `ncl login`."
     ),
     CONSENT_REQUIRED: "Browser consent is required. Run `ncl login`.",
+    CONSENT_DENIED: "The browser consent was denied. Run `ncl login` when ready.",
+    TOKEN_EXPIRED: "The browser consent token expired. Run `ncl login` again.",
+    LOGIN_TIMEOUT: "The browser consent timed out while waiting for a decision.",
+    CREDENTIAL_STORE_FAILED: (
+        "The credential store failed after consent. Revoke the orphaned application "
+        "password from the account Security settings, then run `ncl login`."
+    ),
+    REVOCATION_FAILED: (
+        "The application password could not be revoked. Revoke it from the account "
+        "Security settings; the local credential was removed."
+    ),
     UNREACHABLE: (
         "The configured origin did not answer. Check the route and origin before retrying."
     ),

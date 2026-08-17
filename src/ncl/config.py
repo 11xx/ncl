@@ -28,10 +28,7 @@ class Profile:
 
     name: str
     origin: str
-    auth: str
     secret_backend: str
-    callback_port: int | None
-    client_id: str | None
     calendars: tuple[str, ...]
     files_roots: tuple[str, ...]
 
@@ -144,22 +141,14 @@ def _validate_profile(name: str, raw: Any) -> Profile:
     table = _table(raw, context)
     allowed = {
         "origin",
-        "auth",
         "secret_backend",
-        "callback_port",
-        "client_id",
         "calendars",
         "files_roots",
     }
     _keys(table, allowed, context)
 
     origin = validate_origin(_required(table, "origin", context), f"{context}.origin")
-    auth = _string(_required(table, "auth", context), f"{context}.auth")
-    if auth not in {"oauth", "app-password"}:
-        raise _error(f"{context}.auth", "must be 'oauth' or 'app-password'")
-    backend = _string(
-        _required(table, "secret_backend", context), f"{context}.secret_backend"
-    )
+    backend = _string(table.get("secret_backend", "pass"), f"{context}.secret_backend")
     if backend not in {"pass", "libsecret"}:
         raise _error(f"{context}.secret_backend", "must be 'pass' or 'libsecret'")
 
@@ -168,29 +157,10 @@ def _validate_profile(name: str, raw: Any) -> Profile:
         _required(table, "files_roots", context), f"{context}.files_roots"
     )
 
-    client_id: str | None = None
-    callback_port: int | None = None
-    if auth == "oauth":
-        client_id = _string(
-            _required(table, "client_id", context), f"{context}.client_id"
-        )
-        if "callback_port" not in table:
-            raise _error(f"{context}.callback_port", "is required when auth is 'oauth'")
-        callback_port = table["callback_port"]
-        if isinstance(callback_port, bool) or not isinstance(callback_port, int):
-            raise _error(f"{context}.callback_port", "must be an integer")
-        if not 1024 <= callback_port <= 65535:
-            raise _error(f"{context}.callback_port", "must be between 1024 and 65535")
-    elif "client_id" in table or "callback_port" in table:
-        raise _error(context, "client_id and callback_port are only valid for auth = 'oauth'")
-
     return Profile(
         name=name,
         origin=origin,
-        auth=auth,
         secret_backend=backend,
-        callback_port=callback_port,
-        client_id=client_id,
         calendars=calendars,
         files_roots=files_roots,
     )
