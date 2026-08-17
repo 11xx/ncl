@@ -61,6 +61,23 @@ and self-inflicted:
   cross-process lock around the refresh is a correctness requirement, not a
   tuning detail.
 
+## The redirect URI is fixed, so the callback port is too
+
+The authorize endpoint does not honour the `redirect_uri` a client sends. It
+redirects to the URI stored against the registered client and ignores the
+parameter — with one exception: if the administrator has enabled the
+`oauth2.enable_oc_clients` system setting, which is off by default, *and* the
+client was registered with the literal value `http://localhost:*`, then the
+provided URI is used instead.
+
+A command-line client therefore cannot pick an ephemeral port and tell the
+server about it. Either the loopback listener binds the exact port registered
+with the client, or the server has to be configured for the wildcard form. The
+first is the tool's default because it requires nothing of the server, and it
+makes the port a configured value whose availability is a precondition worth
+checking rather than a detail discovered at the worst moment — half way through
+a consent the user has already granted.
+
 ## Scope, and what a token is actually worth
 
 Nextcloud's OAuth2 has no scopes. The admin manual states it plainly: every
