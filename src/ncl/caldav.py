@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import exits, profiles
-from .identity import CALDAV, DAV, IdentityError, _element_name, _status_code
+from .identity import CALDAV, DAV, _element_name, _status_code
 from .session import Session, SessionError, absolute_url
 
 #: Nextcloud's own namespace, which is where the calendar colour lives.
