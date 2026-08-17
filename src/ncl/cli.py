@@ -41,7 +41,10 @@ def build_parser() -> argparse.ArgumentParser:
     login_command.add_argument(
         "--force",
         action="store_true",
-        help="replace an existing stored credential after browser consent",
+        help=(
+            "revoke an existing stored credential before browser consent; cancelling "
+            "leaves the profile without a credential"
+        ),
     )
     login_command.add_argument(
         "--timeout",

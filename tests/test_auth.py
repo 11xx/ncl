@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import subprocess
@@ -8,7 +9,7 @@ from email.utils import format_datetime
 
 import pytest
 
-from ncl import exits, identity, login, secrets
+from ncl import cli, exits, identity, login, secrets
 from ncl.config import Profile
 from ncl.session import Response, Session, SessionError
 
@@ -149,7 +150,7 @@ def test_session_parses_invalid_retry_after_without_echoing_server_text(monkeypa
         monkeypatch,
         {"login_name": "alice", "app_password": "fixture-secret"},
     )
-    server_text = "fixture-secret"
+    server_text = "²"
     transport = FakeTransport([response(429, headers={"Retry-After": server_text})])
 
     with pytest.raises(SessionError) as error:
@@ -157,6 +158,38 @@ def test_session_parses_invalid_retry_after_without_echoing_server_text(monkeypa
 
     assert error.value.code == exits.THROTTLED
     assert "unparseable" in str(error.value)
+    assert server_text not in str(error.value)
+
+
+@pytest.mark.parametrize("status, code", [(429, exits.THROTTLED), (503, exits.SERVER_ERROR)])
+def test_session_bounds_retry_after_before_integer_conversion(monkeypatch, status, code):
+    seed_credentials(
+        monkeypatch,
+        {"login_name": "alice", "app_password": "fixture-secret"},
+    )
+    server_text = "9" * 4301
+    transport = FakeTransport([response(status, headers={"Retry-After": server_text})])
+
+    with pytest.raises(SessionError) as error:
+        Session(PROFILE, transport=transport).request("GET", "/remote.php/dav/")
+
+    assert error.value.code == code
+    assert "unparseable" in str(error.value)
+    assert server_text not in str(error.value)
+
+
+@pytest.mark.parametrize("server_text", ["https://foo℀bar/x", "https://[malformed"])
+def test_session_refuses_malformed_server_location_without_echoing_text(monkeypatch, server_text):
+    seed_credentials(
+        monkeypatch,
+        {"login_name": "alice", "app_password": "fixture-secret"},
+    )
+    transport = FakeTransport([response(302, headers={"Location": server_text})])
+
+    with pytest.raises(SessionError) as error:
+        Session(PROFILE, transport=transport).request("GET", "/remote.php/dav/")
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
     assert server_text not in str(error.value)
 
 
@@ -311,6 +344,14 @@ def test_login_rejects_off_origin_urls_before_opening_browser(monkeypatch):
         ),
         (
             {
+                "server": "https://[malformed",
+                "loginName": "alice",
+                "appPassword": "fixture-secret",
+            },
+            "server URL was refused",
+        ),
+        (
+            {
                 "server": "https://cloud.example.invalid",
                 "appPassword": "fixture-secret",
             },
@@ -351,6 +392,64 @@ def test_login_reports_issued_credential_when_post_consent_validation_fails(
     assert "Security settings" in str(error.value)
     assert expected_fragment in str(error.value)
     assert "fixture-secret" not in str(error.value)
+
+
+def test_server_supplied_text_never_reaches_rendered_messages(monkeypatch, capsys):
+    location_text = "https://foo℀bar/x"
+    retry_text = "²"
+    seed_credentials(
+        monkeypatch,
+        {"login_name": "alice", "app_password": "fixture-secret"},
+    )
+    location_transport = FakeTransport([response(302, headers={"Location": location_text})])
+    with pytest.raises(SessionError) as session_error:
+        Session(PROFILE, transport=location_transport).request("GET", "/remote.php/dav/")
+
+    retry_transport = FakeTransport([response(429, headers={"Retry-After": retry_text})])
+    with pytest.raises(SessionError) as retry_error:
+        Session(PROFILE, transport=retry_transport).request("GET", "/remote.php/dav/")
+
+    monkeypatch.setattr(secrets, "probe", lambda profile: True)
+    monkeypatch.setattr(secrets, "has_credentials", lambda profile: False)
+    login_transport = FakeTransport(
+        [
+            response(
+                200,
+                json.dumps(
+                    {
+                        "login": "https://cloud.example.invalid/login",
+                        "poll": {
+                            "endpoint": "https://cloud.example.invalid/poll",
+                            "token": "poll-token",
+                        },
+                    }
+                ).encode(),
+            ),
+            response(
+                200,
+                json.dumps(
+                    {
+                        "server": location_text,
+                        "loginName": "alice",
+                        "appPassword": "fixture-secret",
+                    }
+                ).encode(),
+            ),
+        ]
+    )
+    with pytest.raises(login.LoginError) as login_error:
+        login.authenticate(PROFILE, transport=login_transport, browser_open=lambda url: True)
+
+    assert login_error.value.code == exits.CREDENTIAL_STORE_FAILED
+    for error, server_text in (
+        (session_error.value, location_text),
+        (retry_error.value, retry_text),
+        (login_error.value, location_text),
+    ):
+        for json_output in (False, True):
+            assert cli._error(error, json_output) == error.code
+            rendered = capsys.readouterr()
+            assert server_text not in rendered.out + rendered.err
 
 
 def test_login_polls_404_then_stores_once_and_confirms_identity(monkeypatch):
@@ -483,6 +582,7 @@ def test_force_login_revokes_existing_credential_before_starting_flow(monkeypatc
         revoked.append((profile, transport))
 
     monkeypatch.setattr(login, "logout", record_logout)
+    output = []
     transport = FakeTransport(
         [
             response(
@@ -517,11 +617,27 @@ def test_force_login_revokes_existing_credential_before_starting_flow(monkeypatc
         force=True,
         transport=transport,
         browser_open=lambda url: True,
-        output=lambda message: None,
+        output=output.append,
     )
 
     assert revoked == [(PROFILE, transport)]
     assert stored == {"login_name": "alice", "app_password": "fixture-secret"}
+    assert any("revoked before browser consent" in message for message in output)
+    assert any("without a credential" in message for message in output)
+
+
+def test_force_login_help_describes_preconsent_revocation():
+    parser = cli.build_parser()
+    login_parser = next(
+        action.choices["login"]
+        for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+
+    help_text = " ".join(login_parser.format_help().split())
+
+    assert "before browser consent" in help_text
+    assert "without a credential" in help_text
 
 
 def test_force_login_refuses_when_existing_credential_cannot_be_revoked(monkeypatch):

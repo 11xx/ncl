@@ -9,7 +9,15 @@ from collections.abc import Callable
 from typing import Any
 
 from . import exits, identity, secrets
-from .session import Response, Session, SessionError, Transport, UrllibTransport, absolute_url
+from .session import (
+    Response,
+    Session,
+    SessionError,
+    Transport,
+    UrllibTransport,
+    absolute_url,
+    parse_server_url,
+)
 
 
 class LoginError(RuntimeError):
@@ -42,7 +50,7 @@ def _same_origin_url(profile: Any, value: Any, label: str) -> str:
 
 
 def _poll_url(endpoint: str, token: str) -> str:
-    parsed = urllib.parse.urlsplit(endpoint)
+    parsed = parse_server_url(endpoint)
     query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
     query.append(("token", token))
     return urllib.parse.urlunsplit(
@@ -129,6 +137,10 @@ def authenticate(
                 "revoke it from the account Security settings",
                 exits.REVOCATION_FAILED,
             ) from exc
+        output(
+            "The existing credential was revoked before browser consent; cancelling "
+            "now will leave the profile without a credential."
+        )
 
     start_url = absolute_url(profile, "/index.php/login/v2")
     response = _request(
@@ -201,27 +213,41 @@ def authenticate(
                 )
             payload = _json_response(response)
             issued = "appPassword" in payload
-            server = payload.get("server")
-            if not isinstance(server, str) or not server:
-                if issued:
-                    raise _orphaned_credential("the Login Flow v2 response omitted server")
-                raise LoginError(
-                    "the Login Flow v2 response omitted server", exits.MALFORMED_RESPONSE
-                )
             try:
-                absolute_url(profile, server)
-            except SessionError as exc:
-                if issued:
-                    raise _orphaned_credential("the Login Flow v2 server URL was refused") from exc
-                raise LoginError("the Login Flow v2 server URL was refused", exc.code) from exc
-            try:
-                _store(profile, payload)
+                server = payload.get("server")
+                if not isinstance(server, str) or not server:
+                    if issued:
+                        raise _orphaned_credential("the Login Flow v2 response omitted server")
+                    raise LoginError(
+                        "the Login Flow v2 response omitted server", exits.MALFORMED_RESPONSE
+                    )
+                try:
+                    absolute_url(profile, server)
+                except SessionError as exc:
+                    if issued:
+                        raise _orphaned_credential(
+                            "the Login Flow v2 server URL was refused"
+                        ) from exc
+                    raise LoginError(
+                        "the Login Flow v2 server URL was refused", exc.code
+                    ) from exc
+                try:
+                    _store(profile, payload)
+                except LoginError as exc:
+                    if issued:
+                        raise _orphaned_credential("the credential could not be stored") from exc
+                    raise
             except KeyboardInterrupt:
                 raise
-            except LoginError as exc:
+            except LoginError:
+                raise
+            except Exception as exc:
                 if issued:
                     raise _orphaned_credential("the credential could not be stored") from exc
-                raise
+                raise LoginError(
+                    "the Login Flow v2 response could not be validated",
+                    exits.MALFORMED_RESPONSE,
+                ) from exc
             break
     except KeyboardInterrupt as exc:
         if issued:

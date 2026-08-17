@@ -64,6 +64,24 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def parse_server_url(value: str) -> urllib.parse.SplitResult:
+    """Parse a URL supplied by the server without exposing parser failures."""
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        _ = parsed.username, parsed.password, parsed.hostname, parsed.port
+    except (TypeError, ValueError) as exc:
+        raise SessionError("the server URL is malformed", exits.MALFORMED_RESPONSE) from exc
+    return parsed
+
+
+def _resolve_server_url(base: str, reference: str) -> tuple[str, urllib.parse.SplitResult]:
+    try:
+        resolved = urllib.parse.urljoin(base, reference)
+    except (TypeError, ValueError) as exc:
+        raise SessionError("the server URL is malformed", exits.MALFORMED_RESPONSE) from exc
+    return resolved, parse_server_url(resolved)
+
+
 class UrllibTransport:
     """A transport that returns redirects instead of following them."""
 
@@ -109,9 +127,10 @@ class UrllibTransport:
 
 
 def _origin_parts(url: str) -> tuple[str, str, int | None]:
+    parse_server_url(url)
     try:
         return profiles.origin_parts(url)
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         raise SessionError("the server URL is malformed", exits.MALFORMED_RESPONSE) from exc
 
 
@@ -121,18 +140,20 @@ def _retry_after_detail(value: str | None) -> str:
     if not isinstance(value, str):
         return "Retry-After was unparseable"
     candidate = value.strip()
-    if candidate.isdigit():
+    if candidate.isascii() and candidate.isdigit():
+        if len(candidate) > 4300:
+            return "Retry-After was unparseable"
         return f"retry delay: {int(candidate)} seconds"
     try:
         parsed = parsedate_to_datetime(candidate)
-    except (TypeError, ValueError, OverflowError):
+        if parsed is None:
+            return "Retry-After was unparseable"
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        parsed = parsed.astimezone(UTC)
+        return f"retry delay until {parsed.isoformat()}"
+    except (AttributeError, TypeError, ValueError, OverflowError):
         return "Retry-After was unparseable"
-    if parsed is None:
-        return "Retry-After was unparseable"
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    parsed = parsed.astimezone(UTC)
-    return f"retry delay until {parsed.isoformat()}"
 
 
 def same_origin(origin: str, url: str) -> bool:
@@ -145,8 +166,7 @@ def same_origin(origin: str, url: str) -> bool:
 
 def absolute_url(profile: Any, url_or_path: str) -> str:
     """Resolve a path and reject a URL outside the configured origin."""
-    url = urllib.parse.urljoin(profile.origin.rstrip("/") + "/", url_or_path)
-    parsed = urllib.parse.urlsplit(url)
+    url, parsed = _resolve_server_url(profile.origin.rstrip("/") + "/", url_or_path)
     if parsed.username is not None or parsed.password is not None:
         raise SessionError("the request URL contains user information", exits.MALFORMED_RESPONSE)
     if not same_origin(profile.origin, url):
@@ -229,7 +249,7 @@ class Session:
                 )
             location = response.header("Location")
             if response.status in {301, 302, 303, 307, 308} and location:
-                target = urllib.parse.urljoin(url, location)
+                target, _ = _resolve_server_url(url, location)
                 if not same_origin(self.profile.origin, target):
                     raise SessionError(
                         "cross-origin redirect refused; credentials were not resent",
