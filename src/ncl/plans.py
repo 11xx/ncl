@@ -252,7 +252,7 @@ def _store(plan: Plan) -> None:
             os.fsync(handle.fileno())
         os.chmod(temporary, 0o600)
         os.replace(temporary, path)
-    except OSError as exc:
+    except (OSError, TypeError, ValueError) as exc:
         with suppress(OSError):
             temporary.unlink()
         raise PlanError("the plan could not be stored", exits.PRECONDITION_FAILED) from exc

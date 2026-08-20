@@ -261,7 +261,9 @@ def stat_resource(
         target,
         headers={"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
         data=_PROPFIND,
+        max_redirects=0,
     )
+    _refuse_redirect(response, action="metadata read", href=target)
     if response.status == 404:
         if missing_ok:
             return None
@@ -289,7 +291,10 @@ def stat_resource(
 def read_file(profile: Any, *, session: Session, href: str) -> tuple[FileRef, bytes]:
     """Read one scoped file and retain its response metadata."""
     target = _scoped(profile, href)
-    response = session.request("GET", target, headers={"Accept": "*/*"})
+    response = session.request(
+        "GET", target, headers={"Accept": "*/*"}, max_redirects=0
+    )
+    _refuse_redirect(response, action="read", href=target)
     if response.status == 404:
         raise FileError(f"no file exists at {target}", exits.TARGET_NOT_FOUND)
     if response.status != 200:
@@ -381,10 +386,9 @@ def plan_write(
             "a collection cannot be replaced with file content",
             exits.UNSUPPORTED_STRUCTURE,
         )
-    if existing is not None and not existing.etag:
-        raise FileError(
-            "the server returned no ETag for this file, so it cannot be replaced conditionally"
-        )
+    existing_etag = ""
+    if existing is not None:
+        existing_etag = _strong_etag(existing.etag, "a file replacement")
     return plans.write_bundle(
         profile=profile.name,
         summary=_segments(target)[-1],
@@ -392,7 +396,7 @@ def plan_write(
             plans.freeze_step(
                 action="files.write",
                 href=target,
-                etag=existing.etag if existing is not None else "",
+                etag=existing_etag,
                 summary=_segments(target)[-1],
                 payload=content,
                 content_type=_content_type(content_type),
@@ -413,10 +417,7 @@ def plan_delete(profile: Any, *, session: Session, href: str) -> plans.Plan:
     assert existing is not None
     if existing.collection:
         raise FileError("collection deletion is not supported", exits.UNSUPPORTED_STRUCTURE)
-    if not existing.etag:
-        raise FileError(
-            "the server returned no ETag for this file, so it cannot be deleted conditionally"
-        )
+    existing_etag = _strong_etag(existing.etag, "a file deletion")
     return plans.write_bundle(
         profile=profile.name,
         summary=existing.name,
@@ -424,7 +425,7 @@ def plan_delete(profile: Any, *, session: Session, href: str) -> plans.Plan:
             plans.freeze_step(
                 action="files.delete",
                 href=target,
-                etag=existing.etag,
+                etag=existing_etag,
                 summary=existing.name,
                 details={"size": existing.size},
             ),

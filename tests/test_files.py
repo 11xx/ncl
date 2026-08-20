@@ -247,6 +247,27 @@ def test_write_planning_freezes_an_if_none_match_creation():
     assert plan.steps[0].details["exists"] is False
 
 
+@pytest.mark.parametrize("bad_etag", ["", "*", 'W/"v1"', "v1"])
+def test_file_replacement_and_deletion_require_strong_quoted_etags(bad_etag):
+    body = multistatus(entry(SCRIPT, etag=bad_etag))
+    with pytest.raises(files.FileError) as write_error:
+        files.plan_write(
+            PROFILE,
+            session=FakeSession(response(207, body)),
+            href=SCRIPT,
+            content=b"replacement",
+        )
+    assert write_error.value.code == exits.MALFORMED_RESPONSE
+
+    with pytest.raises(files.FileError) as delete_error:
+        files.plan_delete(
+            PROFILE,
+            session=FakeSession(response(207, body)),
+            href=SCRIPT,
+        )
+    assert delete_error.value.code == exits.MALFORMED_RESPONSE
+
+
 def test_apply_conditionally_writes_and_verifies_exact_readback():
     plan = files.plan_write(
         PROFILE,
@@ -300,6 +321,98 @@ def test_delete_is_conditional_and_verified_missing():
     assert transport.requests[0]["headers"] == {"If-Match": '"v1"'}
     assert result["verified"] == "deleted"
 
+
+def test_file_reconciliation_classifies_exact_missing_old_and_changed_states():
+    create = files.plan_write(
+        PROFILE,
+        session=FakeSession(response(404)),
+        href=SCRIPT,
+        content=b"new",
+    )
+    assert files.reconcile(
+        PROFILE,
+        session=FakeSession(response(404)),
+        step=create.steps[0],
+    ) == {"state": "pending"}
+    assert files.reconcile(
+        PROFILE,
+        session=FakeSession(response(200, b"new", {"ETag": '"v2"'})),
+        step=create.steps[0],
+    ) == {"state": "verified"}
+    assert files.reconcile(
+        PROFILE,
+        session=FakeSession(response(200, b"different", {"ETag": '"v2"'})),
+        step=create.steps[0],
+    ) == {"state": "uncertain"}
+
+    existing_body = multistatus(entry(SCRIPT, etag='"old"'))
+    update = files.plan_write(
+        PROFILE,
+        session=FakeSession(response(207, existing_body)),
+        href=SCRIPT,
+        content=b"new",
+    )
+    assert files.reconcile(
+        PROFILE,
+        session=FakeSession(response(200, b"old", {"ETag": '"old"'})),
+        step=update.steps[0],
+    ) == {"state": "pending"}
+    assert files.reconcile(
+        PROFILE,
+        session=FakeSession(response(200, b"changed", {"ETag": '"changed"'})),
+        step=update.steps[0],
+    ) == {"state": "uncertain"}
+
+    delete = files.plan_delete(
+        PROFILE,
+        session=FakeSession(response(207, existing_body)),
+        href=SCRIPT,
+    )
+    assert files.reconcile(
+        PROFILE,
+        session=FakeSession(response(404)),
+        step=delete.steps[0],
+    ) == {"state": "verified"}
+    assert files.reconcile(
+        PROFILE,
+        session=FakeSession(response(200, b"old", {"ETag": '"old"'})),
+        step=delete.steps[0],
+    ) == {"state": "pending"}
+    assert files.reconcile(
+        PROFILE,
+        session=FakeSession(response(200, b"changed", {"ETag": '"changed"'})),
+        step=delete.steps[0],
+    ) == {"state": "uncertain"}
+
+
+def test_cli_reconcile_emits_json_and_consumes_a_fully_verified_plan(monkeypatch, capsys):
+    plan = files.plan_write(
+        PROFILE,
+        session=FakeSession(response(404)),
+        href=SCRIPT,
+        content=b"new",
+    )
+    with plans.claim(plan.plan_id):
+        plans.update_progress(
+            plan,
+            0,
+            state="uncertain",
+            exit_code=exits.OUTCOME_UNCERTAIN,
+        )
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    monkeypatch.setattr(
+        cli.session,
+        "Session",
+        lambda profile: FakeSession(response(200, b"new", {"ETag": '"v2"'})),
+    )
+
+    assert cli.main(["plan", "reconcile", plan.plan_id, "--json"]) == exits.OK
+    result = json.loads(capsys.readouterr().out)
+    assert result["state"] == "verified"
+    assert result["complete"] is True
+    with pytest.raises(plans.PlanError) as error:
+        plans.read(plan.plan_id)
+    assert error.value.code == exits.TARGET_NOT_FOUND
 
 def test_collection_deletion_is_refused_during_planning():
     body = multistatus(entry("/remote.php/dav/files/alice/Violentmonkey/", collection=True))
