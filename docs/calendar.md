@@ -46,8 +46,20 @@ tool never parses prose back into structured fields and never fetches a URL.
 Duplicate, nested, reversed, or unpaired delimiters are refused before a plan
 is created, because replacement would otherwise be ambiguous.
 
-Create and update remain plan/apply operations. Applying a calendar plan uses
-the frozen ETag where applicable, reads the resource back, and verifies the
-summary, start, structured URL/status, and—when requested—the projected
-description. A client that does not render these fields may still not show
-them; the projection only improves plain-text interoperability.
+Create and update remain plan/apply operations. Updates and deletions require a
+strong quoted ETag observed while planning. Applying a calendar write reads the
+exact resource back and compares semantic iCalendar content: identity, the
+DATE-versus-DATE-TIME boundary type, start and exclusive all-day end values,
+unknown properties, nested components, URL, status, and—when requested—the
+projected description must remain as planned. Only server-managed `DTSTAMP` and
+`LAST-MODIFIED` values may be refreshed. A client that does not render these
+fields may still not show them; the projection only improves plain-text
+interoperability.
+
+A calendar deletion is established only when the exact href returns 404 after
+the DELETE. Redirects, a persistent resource, and malformed or unexpected
+readback are outcome-uncertain; the plan remains pending so the caller can
+reconcile instead of blindly retrying. `cal update --from` and `--to` accept
+`YYYY-MM-DD` when both boundaries are explicitly supplied to convert an event
+between all-day and timed forms; mixed boundary types and non-exclusive
+all-day ends are refused before a plan is written.

@@ -8,6 +8,7 @@ one resource can hold a recurring master plus overrides that all share it.
 from __future__ import annotations
 
 import datetime as dt
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Any
@@ -109,16 +110,95 @@ def _component_text(component: Any, name: str) -> str:
     return str(value) if value is not None else ""
 
 
+def _value_kind(value: Any) -> str | None:
+    if isinstance(value, dt.datetime):
+        return "DATE-TIME"
+    if isinstance(value, dt.date):
+        return "DATE"
+    return None
+
+
+def _event_bounds(
+    component: Any, *, href: str, code: int = exits.MALFORMED_RESPONSE
+) -> tuple[Any, Any | None]:
+    """Validate the identity and time shape of one stored VEVENT."""
+    location = f" at {href}" if href else ""
+    uid = component.get("UID")
+    if uid is None or not str(uid).strip():
+        raise EventError(f"the event{location} has no UID", code)
+
+    stamp = component.get("DTSTAMP")
+    stamp_value = getattr(stamp, "dt", None)
+    if not isinstance(stamp_value, dt.datetime):
+        raise EventError(f"the event{location} has no valid DTSTAMP", code)
+
+    start_prop = component.get("DTSTART")
+    start_value = getattr(start_prop, "dt", None) if start_prop is not None else None
+    start_kind = _value_kind(start_value)
+    if start_kind is None:
+        raise EventError(f"the event{location} has no valid DTSTART", code)
+
+    end_prop = component.get("DTEND")
+    if end_prop is None:
+        end_prop = component.get("DUE")
+    end_value = getattr(end_prop, "dt", None) if end_prop is not None else None
+    if end_prop is not None and _value_kind(end_value) is None:
+        raise EventError(f"the event{location} has an invalid end value", code)
+
+    if end_value is None and component.get("DURATION") is not None:
+        duration = getattr(component.get("DURATION"), "dt", None)
+        if not isinstance(duration, dt.timedelta):
+            raise EventError(f"the event{location} has an invalid DURATION", code)
+        try:
+            end_value = start_value + duration
+        except TypeError as exc:
+            raise EventError(f"the event{location} has an invalid DURATION", code) from exc
+
+    if end_value is not None:
+        if _value_kind(end_value) != start_kind:
+            raise EventError(
+                f"the event{location} mixes DATE and DATE-TIME boundary values", code
+            )
+        try:
+            if end_value <= start_value:
+                suffix = " (all-day DTEND is exclusive)" if start_kind == "DATE" else ""
+                raise EventError(
+                    f"the event{location} does not end after it starts{suffix}", code
+                )
+        except TypeError as exc:
+            raise EventError(
+                f"the event{location} has incomparable time boundaries", code
+            ) from exc
+
+    return start_value, end_value
+
+
+_STRONG_ETAG = re.compile(r'^"[\x21\x23-\x7e\x80-\xff]*"$')
+
+
+def strong_etag(value: str) -> str:
+    """Return a strong quoted entity tag suitable for an ``If-Match`` header."""
+    candidate = value.strip() if isinstance(value, str) else ""
+    if not _STRONG_ETAG.fullmatch(candidate):
+        raise EventError(
+            "the server returned an unusable ETag; only a strong quoted ETag can be used "
+            "for a conditional calendar mutation",
+            exits.MALFORMED_RESPONSE,
+        )
+    return candidate
+
+
 def _describe(raw: bytes, *, calendar_href: str, href: str, etag: str) -> EventRef:
     try:
         parsed = icalendar.Calendar.from_ical(raw)
-    except (ValueError, IndexError) as exc:
+    except (ValueError, IndexError, TypeError) as exc:
         raise EventError(f"the event at {href} was not valid iCalendar") from exc
 
     vevents = [item for item in parsed.walk() if item.name == "VEVENT"]
     component = vevents[0] if vevents else None
     if component is None:
         raise EventError(f"the resource at {href} holds no VEVENT")
+    bounds = [_event_bounds(event, href=href) for event in vevents]
 
     unsupported = [name for name in UNSUPPORTED_PROPERTIES if name in component]
     names = {item.name for item in parsed.walk() if item.name.startswith("V")}
@@ -134,18 +214,7 @@ def _describe(raw: bytes, *, calendar_href: str, href: str, etag: str) -> EventR
     if len(vevents) > 1 and "RECURRENCE-ID" not in unsupported:
         unsupported.append("RECURRENCE-ID")
 
-    start_prop = component.get("DTSTART")
-    end_prop = component.get("DTEND") or component.get("DUE")
-    start_value = getattr(start_prop, "dt", None)
-    end_value = getattr(end_prop, "dt", None)
-    if end_value is None and start_value is not None:
-        # RFC 5545 lets an event state DURATION instead of DTEND, and clients
-        # commonly do. Reading only DTEND reported those events as having no
-        # end at all, which reads as missing data rather than as another
-        # spelling of the same fact.
-        duration = getattr(component.get("DURATION"), "dt", None)
-        if duration is not None:
-            end_value = start_value + duration
+    start_value, end_value = bounds[0]
 
     return EventRef(
         calendar_href=calendar_href,
@@ -158,7 +227,10 @@ def _describe(raw: bytes, *, calendar_href: str, href: str, etag: str) -> EventR
         start=_utc(start_value) if start_value is not None else "",
         end=_utc(end_value) if end_value is not None else "",
         all_day=isinstance(start_value, dt.date) and not isinstance(start_value, dt.datetime),
-        recurring="RRULE" in component or "RDATE" in component,
+        recurring=any(
+            "RRULE" in event or "RDATE" in event or "RECURRENCE-ID" in event
+            for event in vevents
+        ),
         writable=not unsupported,
         unsupported=tuple(dict.fromkeys(unsupported)),
     )
@@ -201,6 +273,11 @@ def query(
         root = ET.fromstring(response.body)
     except ET.ParseError as exc:
         raise EventError("the calendar query response was not valid XML") from exc
+    if _element_name(root) != (DAV, "multistatus"):
+        raise EventError(
+            "the calendar query response was not a Multi-Status response",
+            exits.MALFORMED_RESPONSE,
+        )
 
     events: list[EventRef] = []
     for entry in root:
@@ -209,7 +286,7 @@ def query(
         href_element = next((i for i in entry if _element_name(i) == (DAV, "href")), None)
         raw_href = (href_element.text or "").strip() if href_element is not None else ""
         if not raw_href:
-            continue
+            raise EventError("the calendar query response omitted an event href")
         etag = ""
         data = b""
         for propstat in entry:
@@ -230,8 +307,12 @@ def query(
                     etag = (element.text or "").strip()
                 elif name == (CALDAV, "calendar-data"):
                     data = (element.text or "").encode("utf-8")
-        if not data:
-            continue
+        if not data.strip():
+            raise EventError(
+                f"the calendar query response for {raw_href} contained no successful "
+                "calendar-data",
+                exits.MALFORMED_RESPONSE,
+            )
         events.append(
             _describe(
                 data,

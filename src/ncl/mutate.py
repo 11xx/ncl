@@ -16,7 +16,7 @@ import icalendar
 from . import events, exits, plans, profiles
 from .caldav import CalendarError
 from .events import EventError
-from .session import Session
+from .session import Session, SessionError
 
 PRODID = "-//ai-agent-nextcloud//ncl//EN"
 
@@ -38,6 +38,14 @@ def _stamp(moment: dt.datetime) -> dt.datetime:
     return moment.astimezone(dt.UTC)
 
 
+def _boundary(value: dt.datetime | dt.date, label: str) -> dt.datetime | dt.date:
+    if isinstance(value, dt.datetime):
+        return _stamp(value)
+    if isinstance(value, dt.date):
+        return value
+    raise EventError(f"{label} must be a timezone-aware instant or an all-day date", exits.USAGE)
+
+
 def _resource_href(calendar_href: str, uid: str) -> str:
     return f"{calendar_href.rstrip('/')}/{uid}.ics"
 
@@ -54,6 +62,19 @@ CLASSES = ("PUBLIC", "PRIVATE", "CONFIDENTIAL")
 PORTABLE_START = "--- ncl portable fields ---"
 PORTABLE_END = "--- end ncl portable fields ---"
 _PORTABLE_PROPERTIES = ("LOCATION", "URL", "STATUS", "CATEGORIES", "PRIORITY", "TRANSP", "CLASS")
+
+# CalDAV servers may refresh these timestamps while storing a resource. Their
+# presence is still validated by ``events._describe``; only a server-side value
+# rewrite is outside the semantic comparison. Every other property and nested
+# component remains part of the readback invariant.
+_SERVER_MANAGED_PROPERTIES = frozenset({"DTSTAMP", "LAST-MODIFIED"})
+
+
+def _validate_priority(value: Any) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value not in PRIORITY_RANGE:
+        raise EventError(
+            f"priority must be 1 (highest) to 9 (lowest); got {value}", exits.USAGE
+        )
 
 
 def _alarm(trigger: str) -> Any:
@@ -179,6 +200,57 @@ def _set_description(event: Any, description: str) -> None:
     event.add("description", description)
 
 
+def _semantic_value(value: Any) -> tuple[Any, ...]:
+    typed = getattr(value, "dt", None)
+    if isinstance(typed, dt.datetime):
+        if typed.tzinfo is None:
+            return ("datetime", "floating", typed.isoformat())
+        return ("datetime", "instant", typed.astimezone(dt.UTC).isoformat())
+    if isinstance(typed, dt.date):
+        return ("date", typed.isoformat())
+    if isinstance(typed, dt.timedelta):
+        return ("duration", typed.total_seconds())
+    categories = getattr(value, "cats", None)
+    if categories is not None:
+        return ("categories", tuple(str(item) for item in categories))
+    return ("text", str(value))
+
+
+def _semantic_parameter(value: Any) -> Any:
+    if isinstance(value, (list, tuple)):
+        return tuple(sorted(_semantic_parameter(item) for item in value))
+    return str(value)
+
+
+def _semantic_component(component: Any) -> tuple[Any, ...]:
+    properties = []
+    for name, value in component.property_items():
+        upper_name = name.upper()
+        if upper_name in _SERVER_MANAGED_PROPERTIES:
+            continue
+        params = getattr(value, "params", {})
+        parameters = tuple(
+            sorted((key.upper(), _semantic_parameter(item)) for key, item in params.items())
+        )
+        properties.append((upper_name, parameters, _semantic_value(value)))
+    children = sorted(
+        (_semantic_component(child) for child in component.subcomponents), key=repr
+    )
+    return (
+        component.name.upper(),
+        tuple(sorted(properties, key=repr)),
+        tuple(children),
+    )
+
+
+def _semantic_calendar(raw: bytes) -> tuple[Any, ...]:
+    try:
+        calendar = icalendar.Calendar.from_ical(raw)
+    except (ValueError, IndexError, TypeError) as exc:
+        raise EventError("the stored event is not valid iCalendar") from exc
+    return _semantic_component(calendar)
+
+
 def _optional_fields(
     event: Any,
     *,
@@ -200,10 +272,7 @@ def _optional_fields(
     if location:
         event.add("location", location)
     if priority is not None:
-        if priority not in PRIORITY_RANGE:
-            raise EventError(
-                f"priority must be 1 (highest) to 9 (lowest); got {priority}", exits.USAGE
-            )
+        _validate_priority(priority)
         event.add("priority", priority)
     if categories:
         event.add("categories", list(categories))
@@ -316,8 +385,16 @@ def patch_event(
     """
     try:
         calendar = icalendar.Calendar.from_ical(raw)
-    except (ValueError, IndexError) as exc:
+    except (ValueError, IndexError, TypeError) as exc:
         raise EventError("the stored event is not valid iCalendar") from exc
+
+    reference = events._describe(raw, calendar_href="", href="", etag="")
+    if not reference.writable:
+        unsupported = ", ".join(reference.unsupported)
+        raise EventError(
+            f"this event carries {unsupported}, which this release refuses to modify",
+            exits.UNSUPPORTED_STRUCTURE,
+        )
 
     targets = [item for item in calendar.walk() if item.name == "VEVENT"]
     if not targets:
@@ -329,14 +406,13 @@ def patch_event(
             exits.UNSUPPORTED_STRUCTURE,
         )
     event = targets[0]
-
-    present = [name for name in events.UNSUPPORTED_PROPERTIES if name in event]
-    if present:
-        raise EventError(
-            f"this event carries {', '.join(present)}, which this release refuses to "
-            "modify because doing so can send scheduling messages or rewrite a series",
-            exits.UNSUPPORTED_STRUCTURE,
-        )
+    original_start = getattr(event.get("DTSTART"), "dt", None)
+    original_kind = events._value_kind(original_start)
+    boundary_changes = {
+        name.upper()
+        for name, requested in changes.items()
+        if name.upper() in {"DTSTART", "DTEND"} and requested is not None
+    }
 
     for name, requested in changes.items():
         key = name.upper()
@@ -349,10 +425,12 @@ def patch_event(
             for trigger in requested or ():
                 event.add_component(_alarm(trigger))
             continue
+        if key == "PRIORITY" and requested is not None:
+            _validate_priority(requested)
         if requested is None:
             event.pop(key, None)
             continue
-        value = _stamp(requested) if key in {"DTSTART", "DTEND"} else requested
+        value = _boundary(requested, key) if key in {"DTSTART", "DTEND"} else requested
         event.pop(key, None)
         event.add(key, value)
 
@@ -360,9 +438,15 @@ def patch_event(
         _set_description(event, _portable_description(_description(event), event))
 
     start = getattr(event.get("DTSTART"), "dt", None)
-    end = getattr(event.get("DTEND"), "dt", None)
-    if isinstance(start, dt.datetime) and isinstance(end, dt.datetime) and end <= start:
-        raise EventError("the event would end before it starts", exits.USAGE)
+    if (
+        events._value_kind(start) != original_kind
+        and not {"DTSTART", "DTEND"}.issubset(boundary_changes)
+    ):
+        raise EventError(
+            "converting between all-day and timed events requires both DTSTART and DTEND",
+            exits.USAGE,
+        )
+    events._event_bounds(event, href="", code=exits.USAGE)
 
     event.pop("DTSTAMP", None)
     event.add("dtstamp", now or dt.datetime.now(dt.UTC))
@@ -436,6 +520,7 @@ def plan_create(
             "uid": uid,
             "start": events._utc(start),
             "end": events._utc(end),
+            "all_day": planned.all_day,
             "url": planned.url,
             "status": planned.status,
             "portable_description": portable_description,
@@ -451,25 +536,35 @@ def plan_update(
     changes: dict[str, Any],
     portable_description: bool = False,
 ) -> plans.Plan:
+    for name, value in changes.items():
+        if name.upper() == "PRIORITY" and value is not None:
+            _validate_priority(value)
     reference, raw = events.fetch(profile, session=session, href=href)
+    if not reference.writable:
+        unsupported = ", ".join(reference.unsupported)
+        raise EventError(
+            f"this event carries {unsupported}, which this release refuses to modify",
+            exits.UNSUPPORTED_STRUCTURE,
+        )
     if not reference.etag:
         raise EventError(
             "the server returned no ETag for this event, so an update cannot be made "
             "conditional and could overwrite a concurrent change",
             exits.MALFORMED_RESPONSE,
         )
+    etag = events.strong_etag(reference.etag)
     payload = patch_event(raw, changes, portable_description=portable_description)
     updated = events._describe(
         payload.encode("utf-8"),
         calendar_href=reference.calendar_href,
         href=reference.href,
-        etag=reference.etag,
+        etag=etag,
     )
     return plans.write(
         profile=profile.name,
         action="cal.update",
         href=reference.href,
-        etag=reference.etag,
+        etag=etag,
         summary=updated.summary,
         payload=payload.encode("utf-8"),
         content_type="text/calendar; charset=utf-8",
@@ -478,6 +573,7 @@ def plan_update(
             "uid": reference.uid,
             "start": updated.start,
             "end": updated.end,
+            "all_day": updated.all_day,
             "url": updated.url,
             "status": updated.status,
             "portable_description": portable_description,
@@ -493,11 +589,12 @@ def plan_delete(profile: Any, *, session: Session, href: str) -> plans.Plan:
             "conditional",
             exits.MALFORMED_RESPONSE,
         )
+    etag = events.strong_etag(reference.etag)
     return plans.write(
         profile=profile.name,
         action="cal.delete",
         href=reference.href,
-        etag=reference.etag,
+        etag=etag,
         summary=reference.summary,
         details={
             "calendar_href": reference.calendar_href,
@@ -531,12 +628,64 @@ def _same_instant(stored: str, planned: str) -> bool:
 def _description_from_raw(raw: bytes) -> str:
     try:
         calendar = icalendar.Calendar.from_ical(raw)
-    except (ValueError, IndexError) as exc:
+    except (ValueError, IndexError, TypeError) as exc:
         raise EventError("the stored event is not valid iCalendar") from exc
     targets = [item for item in calendar.walk() if item.name == "VEVENT"]
     if not targets:
         raise EventError("the stored resource holds no VEVENT")
     return _description(targets[0])
+
+
+def _response_url(response: Any) -> str:
+    return getattr(response, "url", "") or ""
+
+
+def _response_location(response: Any) -> str:
+    header = getattr(response, "header", None)
+    if not callable(header):
+        return ""
+    return header("Location") or ""
+
+
+def _refuse_redirect(response: Any, *, action: str, href: str) -> None:
+    if 300 <= response.status < 400 or _response_location(response):
+        raise EventError(
+            f"the server redirected calendar {action} at {href}; the mutation target "
+            "must remain exact",
+            exits.MALFORMED_RESPONSE,
+        )
+    response_url = _response_url(response)
+    if response_url and response_url != href:
+        raise EventError(
+            f"the server answered calendar {action} for a different href",
+            exits.MALFORMED_RESPONSE,
+        )
+
+
+def _verify_deleted(session: Session, href: str) -> None:
+    try:
+        response = session.request(
+            "GET",
+            href,
+            headers={"Accept": "text/calendar"},
+            max_redirects=0,
+        )
+    except (EventError, SessionError) as exc:
+        raise EventError(
+            f"the absence of {href} could not be verified after deletion",
+            exits.OUTCOME_UNCERTAIN,
+        ) from exc
+    if _response_url(response) and _response_url(response) != href:
+        raise EventError(
+            f"the post-delete readback addressed a different href than {href}",
+            exits.OUTCOME_UNCERTAIN,
+        )
+    if response.status == 404:
+        return
+    raise EventError(
+        f"the server returned status {response.status} while verifying that {href} was deleted",
+        exits.OUTCOME_UNCERTAIN,
+    )
 
 
 def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]:
@@ -552,7 +701,13 @@ def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]
         )
 
     if plan.action == "cal.delete":
-        response = session.request("DELETE", plan.href, headers={"If-Match": plan.etag})
+        response = session.request(
+            "DELETE",
+            plan.href,
+            headers={"If-Match": plan.etag},
+            max_redirects=0,
+        )
+        _refuse_redirect(response, action="deletion", href=plan.href)
     elif plan.action == "cal.create":
         # The href derives from a freshly minted UID, so anything already there
         # is a different event: refuse rather than overwrite it.
@@ -594,16 +749,25 @@ def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]
         "uid": plan.details.get("uid", ""),
     }
     if plan.action == "cal.delete":
+        _verify_deleted(session, plan.href)
         result["verified"] = "deleted"
         plans.consume(plan.plan_id)
         return result
 
     # A server may accept a PUT and still rewrite or drop part of it, so the
     # mutation is not established until the stored resource says what was asked.
-    stored, stored_raw = events.fetch(profile, session=session, href=plan.href)
+    try:
+        stored, stored_raw = events.fetch(profile, session=session, href=plan.href)
+    except (EventError, SessionError) as exc:
+        raise EventError(
+            f"the server accepted {plan.action}, but its readback could not be verified",
+            exits.OUTCOME_UNCERTAIN,
+        ) from exc
     result["etag"] = stored.etag
     result["summary"] = stored.summary
     result["start"] = stored.start
+    result["end"] = stored.end
+    result["all_day"] = stored.all_day
     result["url"] = stored.url
     result["status"] = stored.status
     mismatches: list[str] = []
@@ -611,9 +775,15 @@ def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]
         mismatches.append(f"summary {stored.summary!r} != {plan.summary!r}")
     if not _same_instant(stored.start, str(plan.details.get("start", ""))):
         mismatches.append(f"start {stored.start!r} != {plan.details.get('start', '')!r}")
+    if not _same_instant(stored.end, str(plan.details.get("end", ""))):
+        mismatches.append(f"end {stored.end!r} != {plan.details.get('end', '')!r}")
+    if "all_day" in plan.details and stored.all_day != plan.details["all_day"]:
+        mismatches.append(f"all_day {stored.all_day!r} != {plan.details['all_day']!r}")
     for field in ("url", "status"):
         if field in plan.details and getattr(stored, field) != plan.details[field]:
             mismatches.append(f"{field} {getattr(stored, field)!r} != {plan.details[field]!r}")
+    if _semantic_calendar(stored_raw) != _semantic_calendar(plans.payload_bytes(plan)):
+        mismatches.append("semantic iCalendar content differs from the planned resource")
     if plan.details.get("portable_description"):
         expected_description = _description_from_raw(plans.payload_bytes(plan))
         if _description_from_raw(stored_raw) != expected_description:
