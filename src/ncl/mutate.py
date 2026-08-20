@@ -504,8 +504,24 @@ def plan_update(
     session: Session,
     href: str,
     changes: dict[str, Any],
+    target: str,
+    recurrence_id: str = "",
     portable_description: bool = False,
 ) -> plans.Plan:
+    if target != "resource":
+        from . import recurrence
+
+        return recurrence.plan_update(
+            profile,
+            session=session,
+            href=href,
+            target=target,
+            changes=changes,
+            recurrence_id=recurrence_id,
+            portable_description=portable_description,
+        )
+    if recurrence_id:
+        raise EventError("--recurrence-id belongs only to a recurrence target", exits.USAGE)
     for name, value in changes.items():
         if name.upper() == "PRIORITY" and value is not None:
             _validate_priority(value)
@@ -549,6 +565,7 @@ def plan_update(
                     "all_day": updated.all_day,
                     "url": updated.url,
                     "status": updated.status,
+                    "recurrence_target": target,
                     "portable_description": portable_description,
                 },
             ),
@@ -556,7 +573,26 @@ def plan_update(
     )
 
 
-def plan_delete(profile: Any, *, session: Session, href: str) -> plans.Plan:
+def plan_delete(
+    profile: Any,
+    *,
+    session: Session,
+    href: str,
+    target: str,
+    recurrence_id: str = "",
+) -> plans.Plan:
+    if target != "resource":
+        from . import recurrence
+
+        return recurrence.plan_delete(
+            profile,
+            session=session,
+            href=href,
+            target=target,
+            recurrence_id=recurrence_id,
+        )
+    if recurrence_id:
+        raise EventError("--recurrence-id belongs only to a recurrence target", exits.USAGE)
     reference, _ = events.fetch(profile, session=session, href=href)
     if not reference.etag:
         raise EventError(
@@ -579,6 +615,7 @@ def plan_delete(profile: Any, *, session: Session, href: str) -> plans.Plan:
                     "uid": reference.uid,
                     "start": reference.start,
                     "end": reference.end,
+                    "recurrence_target": target,
                 },
             ),
         ),

@@ -11,6 +11,52 @@ client hides it. The structured value is therefore the dependable canonical
 value, and the display difference is a client-presentation limitation rather
 than a reason to rewrite the event automatically.
 
+## Recurrence identities and targets
+
+`cal occurrences <calendar> --from <iso> --to <iso>` performs one bounded
+CalDAV time-range report and expands supported recurrence sets locally. Each
+result includes the resource href and ETag, UID, master-or-override source,
+the original `RECURRENCE-ID` in a reusable wire form, original start, effective
+start and end, and cancellation state. Moved overrides are selected by their
+original identity, not by their effective start. UTC DATE-TIME, `TZID=Zone`
+DATE-TIME, and `VALUE=DATE` identities remain distinct and reusable.
+
+The expansion combines `DTSTART`, one `RRULE`, repeatable DATE or DATE-TIME
+`RDATE`, and repeatable `EXDATE`. It de-duplicates equivalent identities and
+never silently truncates a result. `EXRULE`, period-valued `RDATE`, multiple
+`RRULE` properties, incompatible value kinds or timezones, malformed master or
+override structures, and an expansion over the fixed safety ceiling are
+refused before a plan is created.
+
+Every calendar update and deletion names `--target resource`, `series`,
+`occurrence`, or `this-and-future`. Occurrence and future-split targets also
+require the exact `--recurrence-id` emitted by occurrence discovery. The
+ordinary resource target retains the safe non-recurring single-VEVENT subset;
+generic event references continue to report recurrence as unwritable.
+
+Series updates change only the master’s modeled non-rekeying fields and leave
+all override component bytes in the frozen resource. Occurrence updates edit
+an existing override in place or clone the master into a new exception after
+removing recurrence-set properties. The UID and original identity remain
+exact. Occurrence deletion creates or updates `STATUS:CANCELLED` on that
+exception; it does not rewrite `EXDATE`.
+
+This-and-future creates a new-UID future resource rather than using
+`RANGE=THISANDFUTURE`. The recurrence set is partitioned only when the
+generated identities prove the old and new sets equivalent; `COUNT` is split
+by generated position, finite rule partitions are checked against their
+generated identities, and only simple unbounded daily/weekly rules retain
+their semantics. Complex or otherwise unprovable rule partitions are refused.
+DTSTART/DTEND shifts requested by the caller are refused.
+Future overrides are remapped to the new UID while retaining their original
+identities and explicit properties. The plan creates the future resource with
+`If-None-Match: *` before conditionally updating or deleting the old resource;
+the preview warns that a partial failure may temporarily duplicate future
+occurrences. The generic plan resume, uncertainty, and reconciliation lifecycle
+handles the resulting ordered steps.
+
+Organizer and attendee structures remain refused throughout this slice.
+
 ## Reminders
 
 An update with neither alarm option preserves every existing `VALARM`. Repeating

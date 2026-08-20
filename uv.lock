@@ -40,6 +40,7 @@ version = "2026.8.17"
 source = { editable = "." }
 dependencies = [
     { name = "icalendar" },
+    { name = "python-dateutil" },
 ]
 
 [package.dev-dependencies]
@@ -49,7 +50,10 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "icalendar", specifier = ">=6" }]
+requires-dist = [
+    { name = "icalendar", specifier = ">=6" },
+    { name = "python-dateutil", specifier = ">=2.9" },
+]
 
 [package.metadata.requires-dev]
 dev = [

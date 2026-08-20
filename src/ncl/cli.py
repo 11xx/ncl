@@ -21,6 +21,7 @@ from . import (
     mutate,
     plans,
     profiles,
+    recurrence,
     render,
     secrets,
     session,
@@ -168,7 +169,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Calendars and events",
         description=(
             "Calendars and events. A calendar is addressed by href, never by display name."
-        ),)
+        ),
+    )
     cal_commands = cal.add_subparsers(
         dest="cal_command", required=True, metavar="<command>", parser_class=_Parser
     )
@@ -185,6 +187,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--from", dest="start", required=True, help="Start instant, ISO 8601 with an offset"
     )
     cal_events.add_argument(
+        "--to", dest="end", required=True, help="End instant, ISO 8601 with an offset"
+    )
+
+    cal_occurrences = cal_commands.add_parser(
+        "occurrences",
+        help="Discover recurrence instances over a required window",
+    )
+    _add_options(cal_occurrences)
+    cal_occurrences.add_argument("calendar", help="Calendar href, or an unambiguous display name")
+    cal_occurrences.add_argument(
+        "--from", dest="start", required=True, help="Start instant, ISO 8601 with an offset"
+    )
+    cal_occurrences.add_argument(
         "--to", dest="end", required=True, help="End instant, ISO 8601 with an offset"
     )
 
@@ -249,6 +264,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_options(cal_update)
     cal_update.add_argument("href", help="Event resource href")
+    cal_update.add_argument(
+        "--target",
+        choices=["resource", "series", "occurrence", "this-and-future"],
+        required=True,
+        help="Explicitly select the ordinary resource, series, occurrence, or future split",
+    )
+    cal_update.add_argument(
+        "--recurrence-id",
+        help="Exact occurrence identity from `cal occurrences`",
+    )
     cal_update.add_argument("--summary")
     cal_update.add_argument(
         "--from",
@@ -298,6 +323,16 @@ def build_parser() -> argparse.ArgumentParser:
     cal_delete = cal_commands.add_parser("delete", help="Plan a deletion; changes nothing yet")
     _add_options(cal_delete)
     cal_delete.add_argument("href", help="Event resource href")
+    cal_delete.add_argument(
+        "--target",
+        choices=["resource", "series", "occurrence", "this-and-future"],
+        required=True,
+        help="Explicitly select the ordinary resource, series, occurrence, or future split",
+    )
+    cal_delete.add_argument(
+        "--recurrence-id",
+        help="Exact occurrence identity from `cal occurrences`",
+    )
 
     cal_appointment = cal_commands.add_parser(
         "appointment",
@@ -715,6 +750,8 @@ def _emit_plan(plan: Any, json_output: bool) -> int:
                 f"{step.summary or step.href} ({len(plans.payload_bytes(step))} bytes)"
             )
             render.emit(f"       href    {step.href}")
+            if step.details.get("warning"):
+                render.emit(f"       warning {step.details['warning']}")
         render.emit(f"  apply   ncl apply {plan.plan_id}")
         render.emit("  nothing has been changed on the server yet.")
     return exits.CONFIRMATION_REQUIRED
@@ -764,6 +801,27 @@ def _run_cal(args: argparse.Namespace) -> int:
                 render.emit(f"      {event.href}")
         return exits.OK
 
+    if args.cal_command == "occurrences":
+        href = _resolved_calendar(profile, transport, args.calendar)
+        found = recurrence.occurrences(
+            profile,
+            session=transport,
+            calendar_href=href,
+            start=_moment(args.start, "--from"),
+            end=_moment(args.end, "--to"),
+        )
+        if args.json:
+            _json({"occurrences": [item.as_dict() for item in found]})
+        else:
+            for item in found:
+                cancelled = " [CANCELLED]" if item.cancelled else ""
+                render.emit(
+                    f"{item.effective_start} .. {item.effective_end}  "
+                    f"{item.recurrence_id}{cancelled}"
+                )
+                render.emit(f"      {item.href}")
+        return exits.OK
+
     if args.cal_command == "show":
         reference, raw = events.fetch(profile, session=transport, href=args.href)
         if args.json:
@@ -797,6 +855,9 @@ def _run_cal(args: argparse.Namespace) -> int:
         return _emit_plan(plan, args.json)
 
     if args.cal_command == "update":
+        target = getattr(args, "target", None)
+        if not target:
+            raise events.EventError("cal update requires an explicit --target", exits.USAGE)
         changes: dict[str, Any] = {}
         if args.summary is not None:
             changes["SUMMARY"] = args.summary
@@ -835,12 +896,23 @@ def _run_cal(args: argparse.Namespace) -> int:
             session=transport,
             href=args.href,
             changes=changes,
+            target=target,
+            recurrence_id=getattr(args, "recurrence_id", "") or "",
             portable_description=args.portable_description,
         )
         return _emit_plan(plan, args.json)
 
     if args.cal_command == "delete":
-        plan = mutate.plan_delete(profile, session=transport, href=args.href)
+        target = getattr(args, "target", None)
+        if not target:
+            raise events.EventError("cal delete requires an explicit --target", exits.USAGE)
+        plan = mutate.plan_delete(
+            profile,
+            session=transport,
+            href=args.href,
+            target=target,
+            recurrence_id=getattr(args, "recurrence_id", "") or "",
+        )
         return _emit_plan(plan, args.json)
 
     if args.cal_command == "appointment":

@@ -24,10 +24,10 @@ from .session import Session
 #: parts it has no opinion about.
 SUPPORTED = {"VEVENT"}
 
-#: Properties whose presence means an event is beyond what writes may touch.
-#: Recurrence needs RECURRENCE-ID semantics to identify the right component,
-#: and scheduling properties make an edit send invitations or cancellations —
-#: an external side effect rather than a local change.
+#: Properties whose presence means an ordinary event write is beyond what this
+#: module may touch. Recurrence has a target-specific writer in
+#: :mod:`ncl.recurrence`; an ordinary reference still names every recurrence
+#: property so callers do not mistake an EXDATE-only series for a simple event.
 UNSUPPORTED_PROPERTIES = (
     "RRULE",
     "RDATE",
@@ -207,7 +207,9 @@ def _describe(raw: bytes, *, calendar_href: str, href: str, etag: str) -> EventR
         raise EventError(f"the resource at {href} holds no VEVENT")
     bounds = [_event_bounds(event, href=href) for event in vevents]
 
-    unsupported = [name for name in UNSUPPORTED_PROPERTIES if name in component]
+    unsupported = [
+        name for name in UNSUPPORTED_PROPERTIES if any(name in event for event in vevents)
+    ]
     names = {item.name for item in parsed.walk() if item.name.startswith("V")}
     # VCALENDAR and VTIMEZONE are structural; anything else is a component this
     # release does not model well enough to rewrite safely.
@@ -235,11 +237,7 @@ def _describe(raw: bytes, *, calendar_href: str, href: str, etag: str) -> EventR
         end=_utc(end_value) if end_value is not None else "",
         all_day=isinstance(start_value, dt.date) and not isinstance(start_value, dt.datetime),
         recurring=any(
-            "RRULE" in event
-            or "RDATE" in event
-            or "EXDATE" in event
-            or "EXRULE" in event
-            or "RECURRENCE-ID" in event
+            any(name in event for name in ("RRULE", "RDATE", "EXDATE", "EXRULE", "RECURRENCE-ID"))
             for event in vevents
         ),
         writable=not unsupported,
@@ -247,15 +245,15 @@ def _describe(raw: bytes, *, calendar_href: str, href: str, etag: str) -> EventR
     )
 
 
-def query(
+def query_raw(
     profile: Any,
     *,
     session: Session,
     calendar_href: str,
     start: dt.datetime,
     end: dt.datetime,
-) -> list[EventRef]:
-    """List events overlapping an explicit window.
+) -> list[tuple[str, str, bytes]]:
+    """Return exact resources from one bounded calendar time-range report.
 
     The window is required rather than defaulted. An unbounded query against a
     calendar of any age returns everything, which is slow, large, and almost
@@ -290,7 +288,7 @@ def query(
             exits.MALFORMED_RESPONSE,
         )
 
-    events: list[EventRef] = []
+    resources: list[tuple[str, str, bytes]] = []
     for entry in root:
         if _element_name(entry) != (DAV, "response"):
             continue
@@ -324,16 +322,36 @@ def query(
                 "calendar-data",
                 exits.MALFORMED_RESPONSE,
             )
-        events.append(
-            _describe(
-                data,
-                calendar_href=_canonical(profile, calendar_href),
-                href=_canonical(profile, raw_href),
-                etag=etag,
-            )
+        resources.append((_canonical(profile, raw_href), etag, data))
+    return resources
+
+
+def query(
+    profile: Any,
+    *,
+    session: Session,
+    calendar_href: str,
+    start: dt.datetime,
+    end: dt.datetime,
+) -> list[EventRef]:
+    """List events overlapping an explicit window."""
+    found = [
+        _describe(
+            raw,
+            calendar_href=_canonical(profile, calendar_href),
+            href=href,
+            etag=etag,
         )
-    events.sort(key=lambda event: (event.start, event.href))
-    return events
+        for href, etag, raw in query_raw(
+            profile,
+            session=session,
+            calendar_href=calendar_href,
+            start=start,
+            end=end,
+        )
+    ]
+    found.sort(key=lambda event: (event.start, event.href))
+    return found
 
 
 def fetch(profile: Any, *, session: Session, href: str) -> tuple[EventRef, bytes]:
