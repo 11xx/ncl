@@ -28,7 +28,8 @@ FIND A CALENDAR BEFORE NAMING ONE
 
   Address a calendar by href. A display name is chosen by the user and is not
   unique, so a command given one refuses when two calendars share it rather
-  than guessing between them.
+  than guessing between them. A short href target matches only an exact final
+  path segment: `work` never selects `subwork`.
 
   Listing reports the allowlist decision instead of filtering by it — a listing
   that hid everything unconfigured could not be used to configure anything.
@@ -71,10 +72,21 @@ CHANGE NOTHING BY ACCIDENT
   ncl plan list|show|cancel     Inspect or discard what is pending.
 
   Creation is conditional on nothing being there; replacement and deletion are
-  conditional on the ETag read while planning, so a change that landed in
-  between conflicts instead of being overwritten. After a write the resource is
-  read back and compared: calendar fields or file bytes that differ from the
-  frozen plan are reported rather than assumed. Collection deletion is refused.
+  conditional on the strong ETag read while planning, so a change that landed
+  in between conflicts instead of being overwritten. Applying claims the plan
+  before loading it: a simultaneous claimant is locked out, and a plan consumed
+  by another caller is not dispatched from an older observation.
+
+  After a calendar write the exact resource is read back and compared using
+  semantic iCalendar content. Unknown properties, nested components, boundary
+  values, URL, status, and any opted-in portable description must survive as
+  planned; only server-managed DTSTAMP and LAST-MODIFIED values may be
+  refreshed. Exact event reads and calendar PUT/DELETE requests refuse
+  redirects before following them. A redirect before a mutation reaches a
+  second target is malformed. A calendar deletion is established only when
+  the exact href returns 404 after DELETE. A redirect, persistent resource, or
+  malformed post-write readback leaves the plan pending and returns the
+  outcome-uncertain code. Collection deletion is refused.
 
   This boundary is not authorization. `ncl` cannot tell whether a plan id came
   from whoever read the preview or from the agent that produced it. Where a
@@ -102,7 +114,9 @@ WHAT IT REFUSES
 
   Every command takes `--json`. Exit codes are the contract and say what to do
   next: configure, log in, re-read, reconcile, or stop. `ncl doctor --json`
-  ships their meanings alongside the checks it ran.
+  ships the chosen exit code and remediation alongside the checks it ran.
+  Remote credential, server, and malformed-response failures retain their
+  actionable codes instead of becoming a generic local failure.
 
 Use `ncl <command> --help` for the exact arguments a command accepts.
 """

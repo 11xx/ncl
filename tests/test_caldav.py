@@ -138,6 +138,30 @@ def test_resolve_by_href_suffix_and_by_unique_display_name():
     assert caldav.resolve(calendars, "Hidden").href.endswith("/hidden/")
 
 
+def test_resolve_short_name_uses_the_exact_final_path_segment():
+    calendars = [
+        caldav.Calendar(
+            href=HOME + "work/",
+            display_name="Work",
+            components=("VEVENT",),
+            read_only=False,
+            in_scope=True,
+        ),
+        caldav.Calendar(
+            href=HOME + "subwork/",
+            display_name="Subwork",
+            components=("VEVENT",),
+            read_only=False,
+            in_scope=True,
+        ),
+    ]
+
+    assert caldav.resolve(calendars, "work").href.endswith("/work/")
+    with pytest.raises(caldav.CalendarError) as error:
+        caldav.resolve([calendars[1]], "work")
+    assert error.value.code == exits.TARGET_NOT_FOUND
+
+
 def test_resolve_refuses_an_ambiguous_display_name():
     """Two calendars named 'Work' must not resolve to whichever came first."""
     calendars, _ = _listing()

@@ -177,7 +177,8 @@ def claim(plan_id: str):
     lock is a separate file held with flock, so the kernel releases it if the
     applying process dies rather than leaving a plan permanently unusable.
     """
-    path = _directory() / f"{plan_id}.lock"
+    plan_path = _path(plan_id)
+    path = plan_path.parent / f"{plan_id}.lock"
     try:
         descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     except OSError as exc:
@@ -190,9 +191,9 @@ def claim(plan_id: str):
     try:
         yield
     finally:
-        os.close(descriptor)
         with suppress(OSError):
             path.unlink()
+        os.close(descriptor)
 
 
 def check_fresh(plan: Plan, *, now: float | None = None) -> None:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import exits, profiles
 from .identity import CALDAV, DAV, _element_name, _status_code
@@ -201,8 +202,42 @@ def resolve(calendars: list[Calendar], target: str) -> Calendar:
     guessing between them would silently act on the wrong one.
     """
     for calendar in calendars:
-        if calendar.href == target or calendar.href.rstrip("/").endswith(target.rstrip("/")):
+        if calendar.href == target:
             return calendar
+
+    if target.startswith("/") or "://" in target:
+        try:
+            target_authority, target_segments = profiles.canonicalize_href(target)
+        except ValueError:
+            target_authority, target_segments = None, None
+        if target_segments is not None:
+            for calendar in calendars:
+                try:
+                    calendar_authority, calendar_segments = profiles.canonicalize_href(
+                        calendar.href
+                    )
+                except ValueError:
+                    continue
+                if target_authority is not None and calendar_authority != target_authority:
+                    continue
+                if calendar_segments == target_segments:
+                    return calendar
+
+    short_target = target.rstrip("/")
+    if "/" not in short_target and "://" not in short_target:
+        by_segment = [
+            calendar
+            for calendar in calendars
+            if urlsplit(calendar.href).path.rstrip("/").rsplit("/", 1)[-1] == short_target
+        ]
+        if len(by_segment) == 1:
+            return by_segment[0]
+        if len(by_segment) > 1:
+            hrefs = ", ".join(sorted(calendar.href for calendar in by_segment))
+            raise CalendarError(
+                f"{len(by_segment)} calendars end in {target!r}; name one by href: {hrefs}",
+                exits.AMBIGUOUS_TARGET,
+            )
     named = [calendar for calendar in calendars if calendar.display_name == target]
     if len(named) == 1:
         return named[0]

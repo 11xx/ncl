@@ -8,6 +8,7 @@ import icalendar
 import pytest
 
 from ncl import cli, events, exits, mutate, plans
+from ncl import session as http_session
 from ncl.caldav import CalendarError
 from ncl.config import Profile
 
@@ -99,6 +100,80 @@ def test_an_event_with_attendees_is_reported_unwritable():
     reference = _ref(WITH_ATTENDEE)
     assert reference.writable is False
     assert set(reference.unsupported) >= {"ORGANIZER", "ATTENDEE"}
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        RICH.replace(b"UID:keep-me@example\n", b""),
+        RICH.replace(b"DTSTAMP:20260817T120000Z\n", b""),
+        RICH.replace(b"DTSTART;TZID=America/Sao_Paulo:20260901T110000\n", b""),
+        RICH.replace(
+            b"DTEND;TZID=America/Sao_Paulo:20260901T120000",
+            b"DTEND;TZID=America/Sao_Paulo:20260831T120000",
+        ),
+    ],
+)
+def test_malformed_stored_events_are_refused_before_exposure(raw):
+    with pytest.raises(events.EventError) as error:
+        _ref(raw)
+    assert error.value.code == exits.MALFORMED_RESPONSE
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        RICH.replace(
+            b"DTEND;TZID=America/Sao_Paulo:20260901T120000",
+            b"DUE;TZID=America/Sao_Paulo:20260901T120000",
+        ),
+        RICH.replace(
+            b"DTEND;TZID=America/Sao_Paulo:20260901T120000",
+            b"DTEND;TZID=America/Sao_Paulo:20260901T120000\nDURATION:PT1H",
+        ),
+    ],
+    ids=["VTODO-DUE", "DTEND-and-DURATION"],
+)
+def test_vevent_rejects_vtodo_due_and_exclusive_end_conflicts(raw):
+    with pytest.raises(events.EventError) as error:
+        _ref(raw)
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+
+
+def test_mixed_date_and_date_time_boundaries_are_malformed():
+    raw = RICH.replace(
+        b"DTSTART;TZID=America/Sao_Paulo:20260901T110000",
+        b"DTSTART;VALUE=DATE:20260901",
+    )
+
+    with pytest.raises(events.EventError, match="DATE and DATE-TIME"):
+        _ref(raw)
+
+
+def test_all_day_end_is_exclusive():
+    raw = RICH.replace(
+        b"DTSTART;TZID=America/Sao_Paulo:20260901T110000",
+        b"DTSTART;VALUE=DATE:20260901",
+    ).replace(
+        b"DTEND;TZID=America/Sao_Paulo:20260901T120000",
+        b"DTEND;VALUE=DATE:20260902",
+    )
+
+    reference = _ref(raw)
+
+    assert reference.all_day is True
+    assert reference.start == "20260901"
+    assert reference.end == "20260902"
+
+
+def test_recurrence_override_is_marked_recurring():
+    raw = RICH.replace(
+        b"DTSTAMP:20260817T120000Z",
+        b"DTSTAMP:20260817T120000Z\nRECURRENCE-ID:20260901T110000Z",
+    )
+
+    assert _ref(raw).recurring is True
 
 
 @pytest.mark.parametrize("status", ["CONFIRMED", "TENTATIVE", "CANCELLED"])
@@ -402,13 +477,25 @@ def test_alarm_replacement_replaces_all_existing_alarms():
 
 
 class _EventResponse:
-    def __init__(self, body: bytes, *, status: int = 200, etag: str = '"v1"'):
+    def __init__(
+        self,
+        body: bytes,
+        *,
+        status: int = 200,
+        etag: str = '"v1"',
+        headers: dict[str, str] | None = None,
+        url: str = "",
+    ):
         self.body = body
         self.status = status
         self.etag = etag
+        self.headers = headers or {}
+        self.url = url
 
     def header(self, name: str) -> str:
-        return self.etag if name == "ETag" else ""
+        if name == "ETag":
+            return self.etag
+        return self.headers.get(name, "")
 
 
 class _EventSession:
@@ -428,6 +515,74 @@ class _SequenceEventSession:
     def request(self, method, url, *, headers=None, data=None, **kwargs):
         self.requests.append({"method": method, "url": url, "headers": headers, "data": data})
         return self.responses.pop(0)
+
+
+class _HttpTransport:
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.requests: list[dict] = []
+
+    def request(self, method, url, *, headers=None, data=None, timeout=None):
+        self.requests.append({"method": method, "url": url, "data": data})
+        return self.responses.pop(0)
+
+
+def _http_response(status, *, body=b"", headers=None):
+    return http_session.Response(
+        status=status,
+        headers=headers or {},
+        body=body,
+        url="",
+    )
+
+
+def test_report_requires_a_multistatus_root():
+    session = _SequenceEventSession(_EventResponse(b"<root/>", status=207))
+
+    with pytest.raises(events.EventError) as error:
+        events.query(
+            PROFILE,
+            session=session,
+            calendar_href=CAL,
+            start=dt.datetime(2026, 9, 1, tzinfo=dt.UTC),
+            end=dt.datetime(2026, 9, 2, tzinfo=dt.UTC),
+        )
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+
+
+def test_empty_valid_report_multistatus_has_no_events():
+    body = b'<d:multistatus xmlns:d="DAV:" />'
+
+    assert (
+        events.query(
+            PROFILE,
+            session=_SequenceEventSession(_EventResponse(body, status=207)),
+            calendar_href=CAL,
+            start=dt.datetime(2026, 9, 1, tzinfo=dt.UTC),
+            end=dt.datetime(2026, 9, 2, tzinfo=dt.UTC),
+        )
+        == []
+    )
+
+
+def test_report_entry_without_successful_calendar_data_is_malformed():
+    body = (
+        b'<d:multistatus xmlns:d="DAV:">'
+        b"<d:response><d:href>/remote.php/dav/calendars/alice/work/one.ics</d:href>"
+        b"</d:response></d:multistatus>"
+    )
+
+    with pytest.raises(events.EventError) as error:
+        events.query(
+            PROFILE,
+            session=_SequenceEventSession(_EventResponse(body, status=207)),
+            calendar_href=CAL,
+            start=dt.datetime(2026, 9, 1, tzinfo=dt.UTC),
+            end=dt.datetime(2026, 9, 2, tzinfo=dt.UTC),
+        )
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
 
 
 @pytest.mark.parametrize(
@@ -506,6 +661,29 @@ def test_create_plan_and_apply_verify_url_status_and_portable_description():
         plans.read(plan.plan_id)
 
 
+def test_create_readback_verifies_the_planned_end():
+    plan = mutate.plan_create(
+        PROFILE,
+        calendar_href=CAL,
+        summary="Created",
+        start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+        end=dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
+    )
+    altered = plans.payload_bytes(plan).replace(
+        b"DTEND:20260901T120000Z", b"DTEND:20260901T130000Z"
+    )
+    transport = _SequenceEventSession(
+        _EventResponse(b"", status=201),
+        _EventResponse(altered, etag='"v2"'),
+    )
+
+    with pytest.raises(events.EventError) as error:
+        mutate.apply(PROFILE, session=transport, plan=plan)
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+    assert plans.read(plan.plan_id).plan_id == plan.plan_id
+
+
 def test_update_plan_and_apply_verify_changed_structured_fields_and_projection():
     initial = mutate.build_event(
         uid="update@example",
@@ -535,6 +713,414 @@ def test_update_plan_and_apply_verify_changed_structured_fields_and_projection()
     assert result["status"] == "CANCELLED"
     assert result["portable_description_verified"] is True
     assert result["verified"] is True
+
+
+@pytest.mark.parametrize("etag", ["*", 'W/"v1"', "v1"])
+def test_update_and_delete_planning_reject_non_strong_etags(etag):
+    class TaggedSession(_EventSession):
+        def request(self, method, url, *, headers=None, data=None, **kwargs):
+            return _EventResponse(RICH, etag=etag)
+
+    with pytest.raises(events.EventError) as update_error:
+        mutate.plan_update(
+            PROFILE,
+            session=TaggedSession(RICH),
+            href=CAL + "keep-me.ics",
+            changes={"SUMMARY": "No"},
+        )
+    assert update_error.value.code == exits.MALFORMED_RESPONSE
+
+    with pytest.raises(events.EventError) as delete_error:
+        mutate.plan_delete(
+            PROFILE,
+            session=TaggedSession(RICH),
+            href=CAL + "keep-me.ics",
+        )
+    assert delete_error.value.code == exits.MALFORMED_RESPONSE
+    assert plans.listing() == []
+
+
+def test_update_refuses_a_vevent_with_an_extra_vtodo_before_writing_a_plan():
+    raw = RICH.replace(
+        b"END:VCALENDAR",
+        b"BEGIN:VTODO\nUID:task@example\nEND:VTODO\nEND:VCALENDAR",
+    )
+
+    with pytest.raises(events.EventError) as error:
+        mutate.plan_update(
+            PROFILE,
+            session=_EventSession(raw),
+            href=CAL + "keep-me.ics",
+            changes={"SUMMARY": "No"},
+        )
+
+    assert error.value.code == exits.UNSUPPORTED_STRUCTURE
+    assert plans.listing() == []
+
+
+def _without_component(raw: bytes, name: str) -> bytes:
+    text = raw.decode("utf-8")
+    start = text.index(f"BEGIN:{name}")
+    end_marker = f"END:{name}"
+    end = text.index(end_marker, start) + len(end_marker)
+    return (text[:start] + text[end:]).encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    "alter",
+    [
+        lambda raw: raw.replace(b"X-CUSTOM-FIELD:do-not-lose-me", b""),
+        lambda raw: _without_component(raw, "VALARM"),
+        lambda raw: _without_component(raw, "VTIMEZONE"),
+        lambda raw: raw.replace(b"20260901T120000", b"20260901T130000"),
+    ],
+)
+def test_calendar_readback_keeps_unknown_nested_and_end_content(alter):
+    plan = mutate.plan_update(
+        PROFILE,
+        session=_EventSession(RICH),
+        href=CAL + "keep-me.ics",
+        changes={"SUMMARY": "Renamed"},
+    )
+    altered = alter(plans.payload_bytes(plan))
+    transport = _SequenceEventSession(
+        _EventResponse(b"", status=204),
+        _EventResponse(altered, etag='"v2"'),
+    )
+
+    with pytest.raises(events.EventError) as error:
+        mutate.apply(PROFILE, session=transport, plan=plan)
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+    assert plans.read(plan.plan_id).plan_id == plan.plan_id
+
+
+def test_calendar_readback_compares_semantic_content_not_property_order():
+    plan = mutate.plan_update(
+        PROFILE,
+        session=_EventSession(RICH),
+        href=CAL + "keep-me.ics",
+        changes={"SUMMARY": "Renamed"},
+    )
+    lines = plans.payload_bytes(plan).decode("utf-8").splitlines(keepends=True)
+    summary_index = next(index for index, line in enumerate(lines) if line.startswith("SUMMARY:"))
+    custom_index = next(
+        index for index, line in enumerate(lines) if line.startswith("X-CUSTOM-FIELD:")
+    )
+    lines[summary_index], lines[custom_index] = lines[custom_index], lines[summary_index]
+    transport = _SequenceEventSession(
+        _EventResponse(b"", status=204),
+        _EventResponse("".join(lines).encode("utf-8"), etag='"v2"'),
+    )
+
+    result = mutate.apply(PROFILE, session=transport, plan=plan)
+
+    assert result["verified"] is True
+    with pytest.raises(plans.PlanError):
+        plans.read(plan.plan_id)
+
+
+def _categorised_event() -> bytes:
+    return mutate.build_event(
+        uid="categories@example",
+        summary="Categories",
+        start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+        end=dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
+        categories=("A", "B"),
+    ).encode()
+
+
+def test_calendar_readback_ignores_category_member_order():
+    plan = mutate.plan_update(
+        PROFILE,
+        session=_EventSession(_categorised_event()),
+        href=CAL + "categories.ics",
+        changes={"SUMMARY": "Renamed"},
+    )
+    stored = plans.payload_bytes(plan).replace(b"CATEGORIES:A,B", b"CATEGORIES:B,A")
+    transport = _SequenceEventSession(
+        _EventResponse(b"", status=204),
+        _EventResponse(stored, etag='"v2"'),
+    )
+
+    result = mutate.apply(PROFILE, session=transport, plan=plan)
+
+    assert result["verified"] is True
+    with pytest.raises(plans.PlanError):
+        plans.read(plan.plan_id)
+
+
+def test_calendar_readback_refuses_a_missing_category_member():
+    plan = mutate.plan_update(
+        PROFILE,
+        session=_EventSession(_categorised_event()),
+        href=CAL + "categories.ics",
+        changes={"SUMMARY": "Renamed"},
+    )
+    stored = plans.payload_bytes(plan).replace(b"CATEGORIES:A,B", b"CATEGORIES:A")
+    transport = _SequenceEventSession(
+        _EventResponse(b"", status=204),
+        _EventResponse(stored, etag='"v2"'),
+    )
+
+    with pytest.raises(events.EventError) as error:
+        mutate.apply(PROFILE, session=transport, plan=plan)
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+    assert plans.read(plan.plan_id).plan_id == plan.plan_id
+
+
+def test_calendar_fetch_refuses_redirect_before_following_it(monkeypatch):
+    other = CAL + "other.ics"
+    transport = _HttpTransport(
+        _http_response(307, headers={"Location": other}),
+        _http_response(200, body=RICH, headers={"ETag": '"v1"'}),
+    )
+    monkeypatch.setattr(
+        http_session.secrets,
+        "get",
+        lambda profile, key: {"login_name": "alice", "app_password": "probe"}.get(key),
+    )
+
+    with pytest.raises(http_session.SessionError) as error:
+        events.fetch(
+            PROFILE,
+            session=http_session.Session(PROFILE, transport=transport),
+            href=CAL + "keep-me.ics",
+        )
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+    assert [request["method"] for request in transport.requests] == ["GET"]
+    assert transport.requests[0]["url"] == CAL + "keep-me.ics"
+
+
+@pytest.mark.parametrize("action", ["cal.create", "cal.update"])
+def test_calendar_put_refuses_redirect_before_following_it(action, monkeypatch):
+    if action == "cal.create":
+        plan = mutate.plan_create(
+            PROFILE,
+            calendar_href=CAL,
+            summary="Created",
+            start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+            end=dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
+        )
+        success_status = 201
+    else:
+        plan = mutate.plan_update(
+            PROFILE,
+            session=_EventSession(RICH),
+            href=CAL + "keep-me.ics",
+            changes={"SUMMARY": "Renamed"},
+        )
+        success_status = 204
+    other = CAL + "other.ics"
+    transport = _HttpTransport(
+        _http_response(307, headers={"Location": other}),
+        _http_response(success_status),
+        _http_response(200, body=plans.payload_bytes(plan), headers={"ETag": '"v2"'}),
+    )
+    monkeypatch.setattr(
+        http_session.secrets,
+        "get",
+        lambda profile, key: {"login_name": "alice", "app_password": "probe"}.get(key),
+    )
+
+    with pytest.raises(http_session.SessionError) as error:
+        mutate.apply(
+            PROFILE,
+            session=http_session.Session(PROFILE, transport=transport),
+            plan=plan,
+        )
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+    assert [request["method"] for request in transport.requests] == ["PUT"]
+    assert transport.requests[0]["url"] == plan.href
+    assert plans.read(plan.plan_id).plan_id == plan.plan_id
+
+
+def test_calendar_readback_redirect_is_outcome_uncertain_without_following_it(monkeypatch):
+    plan = mutate.plan_create(
+        PROFILE,
+        calendar_href=CAL,
+        summary="Created",
+        start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+        end=dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
+    )
+    other = CAL + "other.ics"
+    transport = _HttpTransport(
+        _http_response(201),
+        _http_response(307, headers={"Location": other}),
+        _http_response(200, body=plans.payload_bytes(plan), headers={"ETag": '"v2"'}),
+    )
+    monkeypatch.setattr(
+        http_session.secrets,
+        "get",
+        lambda profile, key: {"login_name": "alice", "app_password": "probe"}.get(key),
+    )
+
+    with pytest.raises(events.EventError) as error:
+        mutate.apply(
+            PROFILE,
+            session=http_session.Session(PROFILE, transport=transport),
+            plan=plan,
+        )
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+    assert [request["method"] for request in transport.requests] == ["PUT", "GET"]
+    assert all(request["url"] == plan.href for request in transport.requests)
+    assert plans.read(plan.plan_id).plan_id == plan.plan_id
+
+
+def test_calendar_delete_refuses_redirect_without_following_it():
+    plan = mutate.plan_delete(
+        PROFILE,
+        session=_EventSession(RICH),
+        href=CAL + "keep-me.ics",
+    )
+    transport = _SequenceEventSession(
+        _EventResponse(
+            b"",
+            status=302,
+            headers={"Location": CAL + "another.ics"},
+        )
+    )
+
+    with pytest.raises(events.EventError) as error:
+        mutate.apply(PROFILE, session=transport, plan=plan)
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+    assert [request["method"] for request in transport.requests] == ["DELETE"]
+    assert plans.read(plan.plan_id).plan_id == plan.plan_id
+
+
+def test_calendar_delete_keeps_plan_when_exact_href_persists():
+    plan = mutate.plan_delete(
+        PROFILE,
+        session=_EventSession(RICH),
+        href=CAL + "keep-me.ics",
+    )
+    transport = _SequenceEventSession(
+        _EventResponse(b"", status=204),
+        _EventResponse(RICH),
+    )
+
+    with pytest.raises(events.EventError) as error:
+        mutate.apply(PROFILE, session=transport, plan=plan)
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+    assert [request["method"] for request in transport.requests] == ["DELETE", "GET"]
+    assert plans.read(plan.plan_id).plan_id == plan.plan_id
+
+
+def test_calendar_delete_consumes_only_after_exact_href_returns_404():
+    plan = mutate.plan_delete(
+        PROFILE,
+        session=_EventSession(RICH),
+        href=CAL + "keep-me.ics",
+    )
+    transport = _SequenceEventSession(
+        _EventResponse(b"", status=204),
+        _EventResponse(b"", status=404),
+    )
+
+    result = mutate.apply(PROFILE, session=transport, plan=plan)
+
+    assert result["verified"] == "deleted"
+    with pytest.raises(plans.PlanError) as error:
+        plans.read(plan.plan_id)
+    assert error.value.code == exits.TARGET_NOT_FOUND
+
+
+def test_all_day_conversion_requires_both_boundaries_and_preserves_exclusive_end():
+    raw = RICH.replace(
+        b"DTSTART;TZID=America/Sao_Paulo:20260901T110000",
+        b"DTSTART;VALUE=DATE:20260901",
+    ).replace(
+        b"DTEND;TZID=America/Sao_Paulo:20260901T120000",
+        b"DTEND;VALUE=DATE:20260902",
+    )
+
+    with pytest.raises(events.EventError) as single_boundary:
+        mutate.patch_event(
+            raw,
+            {"DTSTART": dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC)},
+        )
+    assert single_boundary.value.code == exits.USAGE
+
+    converted = mutate.patch_event(
+        raw,
+        {
+            "DTSTART": dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+            "DTEND": dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
+        },
+    )
+    assert _ref(converted.encode()).all_day is False
+
+    with pytest.raises(events.EventError) as invalid_end:
+        mutate.patch_event(raw, {"DTEND": dt.date(2026, 9, 1)})
+    assert invalid_end.value.code == exits.USAGE
+
+    with pytest.raises(events.EventError) as mixed_boundaries:
+        mutate.patch_event(
+            raw,
+            {
+                "DTSTART": dt.date(2026, 9, 1),
+                "DTEND": dt.datetime(2026, 9, 2, tzinfo=dt.UTC),
+            },
+        )
+    assert mixed_boundaries.value.code == exits.USAGE
+
+
+def _duration_event(*, all_day: bool = False) -> bytes:
+    raw = RICH.replace(
+        b"DTEND;TZID=America/Sao_Paulo:20260901T120000", b"DURATION:PT1H"
+    )
+    if all_day:
+        raw = raw.replace(
+            b"DTSTART;TZID=America/Sao_Paulo:20260901T110000",
+            b"DTSTART;VALUE=DATE:20260901",
+        ).replace(b"DURATION:PT1H", b"DURATION:P1D")
+    return raw
+
+
+def _event_component(raw: str | bytes):
+    calendar = icalendar.Calendar.from_ical(raw)
+    return next(item for item in calendar.walk() if item.name == "VEVENT")
+
+
+def test_duration_is_preserved_when_only_start_changes():
+    patched = mutate.patch_event(
+        _duration_event(),
+        {"DTSTART": dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC)},
+    )
+    event = _event_component(patched)
+
+    assert event.get("DURATION").dt == dt.timedelta(hours=1)
+    assert "DTEND" not in event
+    assert _ref(patched).end == "20260901T130000Z"
+
+
+@pytest.mark.parametrize("to_all_day", [True, False])
+def test_explicit_end_replaces_duration_during_boundary_conversion(to_all_day):
+    if to_all_day:
+        raw = _duration_event()
+        changes = {
+            "DTSTART": dt.date(2026, 9, 1),
+            "DTEND": dt.date(2026, 9, 2),
+        }
+    else:
+        raw = _duration_event(all_day=True)
+        changes = {
+            "DTSTART": dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+            "DTEND": dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
+        }
+
+    patched = mutate.patch_event(raw, changes)
+    event = _event_component(patched)
+
+    assert "DURATION" not in event
+    assert "DTEND" in event
+    assert _ref(patched).all_day is to_all_day
 
 
 def test_cli_create_and_apply_expose_plan_and_readback_verification(
@@ -731,3 +1317,156 @@ def test_a_plan_round_trips_arbitrary_bytes(tmp_path, monkeypatch):
     )
 
     assert plans.payload_bytes(plans.read(plan.plan_id)) == b"\x00\xff\n"
+
+
+def test_cli_apply_claims_before_loading_and_dispatching_a_plan(monkeypatch):
+    order: list[str] = []
+
+    class Claim:
+        def __enter__(self):
+            order.append("claim")
+
+        def __exit__(self, *exc_info):
+            return False
+
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    monkeypatch.setattr(plans, "claim", lambda plan_id: Claim())
+    monkeypatch.setattr(
+        plans,
+        "read",
+        lambda plan_id: order.append("read")
+        or SimpleNamespace(plan_id=plan_id, profile="home", action="cal.create"),
+    )
+    monkeypatch.setattr(cli.session, "Session", lambda profile: object())
+    monkeypatch.setattr(mutate, "apply", lambda *args, **kwargs: order.append("apply") or {})
+
+    assert cli._run_apply(SimpleNamespace(plan_id="stale", json=True)) == exits.OK
+    assert order == ["claim", "read", "apply"]
+
+
+@pytest.mark.parametrize("plan_id", ["../escape", "nested/id"])
+def test_cli_apply_rejects_invalid_plan_id_before_creating_a_lock(
+    monkeypatch, capsys, plan_id
+):
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    opened: list[str] = []
+    original_open = plans.os.open
+    monkeypatch.setattr(
+        plans.os,
+        "open",
+        lambda path, *args: (opened.append(str(path)) or original_open(path, *args)),
+    )
+
+    code = cli.main(["apply", plan_id, "--json"])
+    output = json.loads(capsys.readouterr().out)
+
+    assert code == exits.USAGE
+    assert output["code"] == exits.USAGE
+    assert opened == []
+
+
+def test_plan_claim_unlinks_the_lock_before_closing_its_descriptor(monkeypatch):
+    lock_path = plans._directory() / "valid.lock"
+    closed_while_named: list[bool] = []
+    original_close = plans.os.close
+
+    def close(descriptor):
+        closed_while_named.append(lock_path.exists())
+        original_close(descriptor)
+
+    monkeypatch.setattr(plans.os, "close", close)
+    with plans.claim("valid"):
+        assert lock_path.exists()
+
+    assert closed_while_named == [False]
+
+
+def test_cli_apply_reports_locked_and_missing_plans_after_claiming(monkeypatch):
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    plan = plans.write(
+        profile="home",
+        action="cal.delete",
+        href=CAL + "keep-me.ics",
+        etag='"v1"',
+        summary="Original",
+    )
+
+    with plans.claim(plan.plan_id), pytest.raises(plans.PlanError) as locked:
+        cli._run_apply(SimpleNamespace(plan_id=plan.plan_id, json=True))
+    assert locked.value.code == exits.LOCKED
+
+    plans.consume(plan.plan_id)
+    with pytest.raises(plans.PlanError) as missing:
+        cli._run_apply(SimpleNamespace(plan_id=plan.plan_id, json=True))
+    assert missing.value.code == exits.TARGET_NOT_FOUND
+
+
+def test_cli_apply_rechecks_a_plan_consumed_while_claiming(monkeypatch):
+    plan = plans.write(
+        profile="home",
+        action="cal.delete",
+        href=CAL + "keep-me.ics",
+        etag='"v1"',
+        summary="Original",
+    )
+    dispatched: list[bool] = []
+
+    class Claim:
+        def __enter__(self):
+            plans.consume(plan.plan_id)
+
+        def __exit__(self, *exc_info):
+            return False
+
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    monkeypatch.setattr(plans, "claim", lambda plan_id: Claim())
+    monkeypatch.setattr(
+        mutate,
+        "apply",
+        lambda *args, **kwargs: dispatched.append(True),
+    )
+
+    with pytest.raises(plans.PlanError) as error:
+        cli._run_apply(SimpleNamespace(plan_id=plan.plan_id, json=True))
+
+    assert error.value.code == exits.TARGET_NOT_FOUND
+    assert dispatched == []
+
+
+def test_plan_cancel_json_is_structured(capsys):
+    plan = plans.write(
+        profile="home",
+        action="cal.delete",
+        href=CAL + "keep-me.ics",
+        etag='"v1"',
+        summary="Original",
+    )
+
+    assert cli.main(["plan", "cancel", plan.plan_id, "--json"]) == exits.OK
+    assert json.loads(capsys.readouterr().out) == {"cancelled": plan.plan_id}
+
+
+@pytest.mark.parametrize("priority", [0, 10])
+def test_update_priority_range_is_validated_before_a_plan_is_written(
+    monkeypatch, capsys, priority
+):
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    transport = _SequenceEventSession()
+    monkeypatch.setattr(cli.session, "Session", lambda profile: transport)
+
+    code = cli.main(
+        [
+            "cal",
+            "update",
+            CAL + "keep-me.ics",
+            "--priority",
+            str(priority),
+            "--json",
+        ]
+    )
+    output = json.loads(capsys.readouterr().out)
+
+    assert code == exits.USAGE
+    assert output["code"] == exits.USAGE
+    assert transport.requests == []
+    assert plans.listing() == []
