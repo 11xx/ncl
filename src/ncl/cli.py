@@ -23,6 +23,7 @@ from . import (
     render,
     secrets,
     session,
+    todos,
 )
 from .config import ConfigError
 
@@ -297,6 +298,91 @@ def build_parser() -> argparse.ArgumentParser:
     _add_options(cal_delete)
     cal_delete.add_argument("href", help="Event resource href")
 
+    task = commands.add_parser(
+        "task",
+        help="Tasks in CalDAV collections",
+        description=(
+            "Tasks stored as VTODO components. A collection must advertise VTODO "
+            "before it can be selected."
+        ),
+    )
+    task_commands = task.add_subparsers(
+        dest="task_command", required=True, metavar="<command>", parser_class=_Parser
+    )
+    task_list = task_commands.add_parser(
+        "list",
+        help="List valid tasks with one CalDAV REPORT",
+        description="List valid VTODO resources with one depth-one CalDAV REPORT.",
+    )
+    _add_options(task_list)
+    task_list.add_argument("calendar", help="Calendar href, or an unambiguous display name")
+    task_list.add_argument(
+        "--status",
+        action="append",
+        choices=[status.lower() for status in todos.TODO_STATUSES],
+        default=[],
+        help="Keep tasks with this status; repeatable",
+    )
+
+    task_show = task_commands.add_parser(
+        "show", help="Read exactly one task href without collection discovery"
+    )
+    _add_options(task_show)
+    task_show.add_argument("href", help="Task resource href")
+
+    task_create = task_commands.add_parser(
+        "create", help="Plan a new VTODO in a collection that advertises VTODO"
+    )
+    _add_options(task_create)
+    task_create.add_argument("calendar", help="Calendar href, or an unambiguous display name")
+    task_create.add_argument("--summary", required=True)
+    task_create.add_argument("--description", default="")
+    task_create.add_argument("--start", help="Start date or ISO 8601 instant with an offset")
+    task_create.add_argument("--due", help="Due date or ISO 8601 instant with an offset")
+    task_create.add_argument("--priority", type=int, help="0 is unspecified; 1 is highest")
+    task_create.add_argument(
+        "--status", choices=[status.lower() for status in todos.TODO_STATUSES]
+    )
+    task_create.add_argument(
+        "--percent", "--percent-complete", dest="percent_complete", type=int
+    )
+    task_create.add_argument("--parent", dest="parent_uid", help="Parent task UID")
+
+    task_update = task_commands.add_parser(
+        "update", help="Plan a task change while preserving unmodeled iCalendar data"
+    )
+    _add_options(task_update)
+    task_update.add_argument("href", help="Task resource href")
+    task_update.add_argument("--summary")
+    task_update.add_argument("--description")
+    task_update.add_argument("--start", help="Start date or ISO 8601 instant with an offset")
+    task_update.add_argument("--due", help="Due date or ISO 8601 instant with an offset")
+    task_update.add_argument("--priority", type=int, help="0 is unspecified; 1 is highest")
+    task_update.add_argument(
+        "--status", choices=[status.lower() for status in todos.TODO_STATUSES]
+    )
+    task_update.add_argument(
+        "--percent", "--percent-complete", dest="percent_complete", type=int
+    )
+    task_update.add_argument("--parent", dest="parent_uid", help="Parent task UID")
+
+    task_complete = task_commands.add_parser(
+        "complete", help="Plan one conditional write for atomic task completion"
+    )
+    _add_options(task_complete)
+    task_complete.add_argument("href", help="Task resource href")
+    task_complete.add_argument(
+        "--completed", help="Completion instant, ISO 8601 with an explicit offset"
+    )
+
+    task_delete = task_commands.add_parser(
+        "delete",
+        help="Plan deletion and verify the exact task href is absent",
+        description="Plan deletion; apply verifies that the exact task href is absent (404).",
+    )
+    _add_options(task_delete)
+    task_delete.add_argument("href", help="Task resource href")
+
     file_commands = commands.add_parser(
         "files",
         help="Files over WebDAV",
@@ -462,10 +548,55 @@ def _boundary_moment(value: str, label: str) -> datetime.datetime | datetime.dat
     return _moment(value, label)
 
 
+def _todo_moment(value: str, label: str) -> datetime.datetime | datetime.date:
+    """Parse a task date or an offset-bearing instant."""
+    if "T" not in value and " " not in value:
+        try:
+            return datetime.date.fromisoformat(value)
+        except ValueError as exc:
+            raise todos.TodoError(
+                f"{label} is not an ISO 8601 date or instant", exits.USAGE
+            ) from exc
+    try:
+        parsed = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        try:
+            return datetime.date.fromisoformat(value)
+        except ValueError as exc:
+            raise todos.TodoError(
+                f"{label} is not an ISO 8601 date or instant", exits.USAGE
+            ) from exc
+    if parsed.tzinfo is None:
+        raise todos.TodoError(
+            f"{label} has no timezone offset; state the offset explicitly", exits.USAGE
+        )
+    return parsed
+
+
+def _todo_instant(value: str, label: str) -> datetime.datetime:
+    parsed = _todo_moment(value, label)
+    if not isinstance(parsed, datetime.datetime):
+        raise todos.TodoError(
+            f"{label} must be an ISO 8601 instant with an explicit offset", exits.USAGE
+        )
+    return parsed
+
+
 def _resolved_calendar(profile: Any, transport: session.Session, target: str) -> str:
     home = identity.discover(profile, session=transport).calendar_home
     calendars = caldav.list_calendars(profile, session=transport, calendar_home=home)
     return caldav.resolve(calendars, target).href
+
+
+def _resolved_component(
+    profile: Any,
+    transport: session.Session,
+    target: str,
+    component: str,
+) -> caldav.Calendar:
+    home = identity.discover(profile, session=transport).calendar_home
+    calendars = caldav.list_calendars(profile, session=transport, calendar_home=home)
+    return caldav.require_component(caldav.resolve(calendars, target), component)
 
 
 def _emit_plan(plan: Any, json_output: bool) -> int:
@@ -474,9 +605,11 @@ def _emit_plan(plan: Any, json_output: bool) -> int:
     else:
         render.emit(f"planned {plan.action}: {plan.summary or plan.href}")
         render.emit(f"  href    {plan.href}")
-        if plan.details.get("start"):
+        if plan.details.get("start") or plan.details.get("due"):
+            start = plan.details.get("start", "")
+            end = plan.details.get("end", plan.details.get("due", ""))
             render.emit(
-                f"  when    {plan.details['start']} .. {plan.details.get('end', '')}"
+                f"  when    {start} .. {end}"
             )
         render.emit(f"  apply   ncl apply {plan.plan_id}")
         render.emit("  nothing has been changed on the server yet.")
@@ -601,6 +734,98 @@ def _run_cal(args: argparse.Namespace) -> int:
     return exits.USAGE
 
 
+def _run_task(args: argparse.Namespace) -> int:
+    profile = _selected_profile(args)
+    transport = session.Session(profile)
+
+    if args.task_command == "list":
+        collection = _resolved_component(profile, transport, args.calendar, "VTODO")
+        found = todos.query(
+            profile,
+            session=transport,
+            calendar_href=collection.href,
+            statuses=tuple(args.status),
+            collection_writable=not collection.read_only,
+        )
+        if args.json:
+            _json({"tasks": [task.as_dict() for task in found]})
+        else:
+            for task in found:
+                state = task.status or ""
+                when = task.dtstart or task.due
+                render.emit(f"{state:12} {when:20}  {task.summary}")
+                render.emit(f"      {task.href}")
+                if task.parent_uid:
+                    render.emit(f"      parent  {task.parent_uid}")
+                if task.children:
+                    render.emit(f"      children {', '.join(task.children)}")
+        return exits.OK
+
+    if args.task_command == "show":
+        reference, raw = todos.fetch(profile, session=transport, href=args.href)
+        if args.json:
+            _json({"task": reference.as_dict(), "icalendar": raw.decode("utf-8", "replace")})
+        else:
+            for key, value in reference.as_dict().items():
+                render.emit(f"{key}: {value}")
+        return exits.OK
+
+    if args.task_command == "create":
+        collection = _resolved_component(profile, transport, args.calendar, "VTODO")
+        plan = todos.plan_create(
+            profile,
+            calendar_href=collection.href,
+            summary=args.summary,
+            description=args.description,
+            start=_todo_moment(args.start, "--start") if args.start else None,
+            due=_todo_moment(args.due, "--due") if args.due else None,
+            priority=args.priority,
+            status=args.status or "",
+            percent_complete=args.percent_complete,
+            parent_uid=args.parent_uid or "",
+        )
+        return _emit_plan(plan, args.json)
+
+    if args.task_command == "update":
+        changes: dict[str, Any] = {}
+        if args.summary is not None:
+            changes["SUMMARY"] = args.summary
+        if args.description is not None:
+            changes["DESCRIPTION"] = args.description
+        if args.start is not None:
+            changes["DTSTART"] = _todo_moment(args.start, "--start")
+        if args.due is not None:
+            changes["DUE"] = _todo_moment(args.due, "--due")
+        if args.priority is not None:
+            changes["PRIORITY"] = args.priority
+        if args.status is not None:
+            changes["STATUS"] = args.status
+        if args.percent_complete is not None:
+            changes["PERCENT-COMPLETE"] = args.percent_complete
+        if args.parent_uid is not None:
+            changes["RELATED-TO"] = args.parent_uid
+        if not changes:
+            raise todos.TodoError("no changes were requested", exits.USAGE)
+        plan = todos.plan_update(profile, session=transport, href=args.href, changes=changes)
+        return _emit_plan(plan, args.json)
+
+    if args.task_command == "complete":
+        completed = _todo_instant(args.completed, "--completed") if args.completed else None
+        plan = todos.plan_complete(
+            profile,
+            session=transport,
+            href=args.href,
+            completed=completed,
+        )
+        return _emit_plan(plan, args.json)
+
+    if args.task_command == "delete":
+        plan = todos.plan_delete(profile, session=transport, href=args.href)
+        return _emit_plan(plan, args.json)
+
+    return exits.USAGE
+
+
 def _run_plan(args: argparse.Namespace) -> int:
     if args.plan_command == "list":
         pending = plans.listing()
@@ -698,6 +923,8 @@ def _run_apply(args: argparse.Namespace) -> int:
         transport = session.Session(profile)
         if plan.action.startswith("cal."):
             result = mutate.apply(profile, session=transport, plan=plan)
+        elif plan.action.startswith("task."):
+            result = todos.apply(profile, session=transport, plan=plan)
         elif plan.action.startswith("files."):
             result = files.apply(profile, session=transport, plan=plan)
         else:
@@ -756,6 +983,8 @@ def _main(argv: list[str] | None = None) -> int:
             return _run_whoami(args)
         if args.command == "cal":
             return _run_cal(args)
+        if args.command == "task":
+            return _run_task(args)
         if args.command == "files":
             return _run_files(args)
         if args.command == "plan":
@@ -772,6 +1001,7 @@ def _main(argv: list[str] | None = None) -> int:
         identity.IdentityError,
         caldav.CalendarError,
         events.EventError,
+        todos.TodoError,
         files.FileError,
         plans.PlanError,
     ) as exc:

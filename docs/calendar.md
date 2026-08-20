@@ -54,7 +54,9 @@ unknown properties, nested components, URL, status, and—when requested—the
 projected description must remain as planned. Only server-managed `DTSTAMP` and
 `LAST-MODIFIED` values may be refreshed. A client that does not render these
 fields may still not show them; the projection only improves plain-text
-interoperability.
+interoperability. Property order does not affect equality, and CATEGORIES
+member order is treated as a set; the same component-neutral comparison is
+used for VTODO writes.
 
 Exact event reads and calendar `PUT`/`DELETE` requests refuse redirects before
 following them. A redirect before a mutation reaches a second target is a

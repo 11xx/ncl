@@ -31,6 +31,7 @@ TARGET_NOT_FOUND = 31
 SCOPE_DENIED = 32
 CONFLICT = 33
 UNSUPPORTED_STRUCTURE = 34
+UNSUPPORTED_COLLECTION = 35
 
 CONFIRMATION_REQUIRED = 40
 PLAN_STALE = 41
@@ -93,6 +94,9 @@ RESPONSE = {
     ),
     UNSUPPORTED_STRUCTURE: (
         "The resource contains structure this tool does not model. Do not rewrite it."
+    ),
+    UNSUPPORTED_COLLECTION: (
+        "The selected calendar collection does not advertise the requested component."
     ),
     CONFIRMATION_REQUIRED: (
         "A plan exists but was not applied. Confirm it explicitly before retrying."

@@ -14,6 +14,7 @@ PROFILE = Profile(
 )
 
 HOME = "https://cloud.example.invalid/remote.php/dav/calendars/alice/"
+CALENDAR_HREF = HOME + "tasks/"
 
 MULTISTATUS = b"""<?xml version="1.0"?>
 <d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
@@ -128,6 +129,30 @@ def test_components_are_read_from_the_supported_set():
     calendars, _ = _listing()
     by_name = {calendar.href.rsplit("/", 2)[-2]: calendar for calendar in calendars}
     assert by_name["work"].components == ("VEVENT",)
+
+
+def test_component_capability_accepts_vtodo_and_refuses_vevent_only_collections():
+    task_calendar = caldav.Calendar(
+        href=CALENDAR_HREF,
+        display_name="Tasks",
+        components=("VEVENT", "VTODO"),
+        read_only=False,
+        in_scope=True,
+    )
+    assert caldav.require_component(task_calendar, "VTODO") is task_calendar
+
+    with pytest.raises(caldav.CalendarError) as error:
+        caldav.require_component(
+            caldav.Calendar(
+                href=CALENDAR_HREF,
+                display_name="Events",
+                components=("VEVENT",),
+                read_only=False,
+                in_scope=True,
+            ),
+            "VTODO",
+        )
+    assert error.value.code == exits.UNSUPPORTED_COLLECTION
 
 
 def test_resolve_by_href_suffix_and_by_unique_display_name():
