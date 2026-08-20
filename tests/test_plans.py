@@ -125,6 +125,35 @@ def test_unknown_later_action_is_rejected_before_any_request_or_progress():
     assert [item.state for item in stored.progress] == ["pending", "pending"]
 
 
+def test_bundle_validator_runs_once_after_all_step_validators():
+    calls: list[str] = []
+
+    def validate(item: plans.Step) -> None:
+        calls.append(f"validate:{item.action}")
+
+    def execute(profile, *, session, step):
+        calls.append(f"execute:{step.action}")
+        return {"action": step.action, "href": step.href}
+
+    def reconcile(profile, *, session, step):
+        calls.append(f"reconcile:{step.action}")
+        return {"state": "verified"}
+
+    def validate_bundle(items: tuple[plans.Step, ...]) -> None:
+        calls.append(f"bundle:{len(items)}")
+
+    dispatch = plans.Dispatcher(validate, execute, reconcile, validate_bundle)
+    apply_bundle(bundle(step("fake.one", 1), step("fake.two", 2)), dispatch)
+
+    assert calls == [
+        "validate:fake.one",
+        "validate:fake.two",
+        "bundle:2",
+        "execute:fake.one",
+        "execute:fake.two",
+    ]
+
+
 def test_ordinary_second_step_failure_records_first_verified_and_resume_skips_it():
     calls: list[str] = []
     plan = bundle(step("fake.one", 1), step("fake.two", 2))

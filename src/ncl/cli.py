@@ -902,7 +902,12 @@ def _dispatchers() -> dict[str, plans.Dispatcher]:
     return {
         "cal.": plans.Dispatcher(mutate.validate_step, mutate.execute, mutate.reconcile),
         "task.": plans.Dispatcher(todos.validate_step, todos.execute, todos.reconcile),
-        "run.": plans.Dispatcher(runs.validate_step, runs.execute, runs.reconcile),
+        "run.": plans.Dispatcher(
+            runs.validate_step,
+            runs.execute,
+            runs.reconcile,
+            runs.validate_bundle,
+        ),
         "files.": plans.Dispatcher(files.validate_step, files.execute, files.reconcile),
     }
 

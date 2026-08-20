@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import json
 from dataclasses import replace
@@ -165,6 +166,26 @@ def test_standard_refid_and_relation_parameters_round_trip_exactly():
     assert ("b", {"GAP": "PT15M", "RELTYPE": "NEXT", "VALUE": "UID"}) in relations
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda calendar, todo: todo.add("REFID", "run-a"),
+        lambda calendar, todo: todo.add("REFID", "run-a", parameters={"VALUE": "TEXT"}),
+    ],
+)
+def test_run_parser_requires_one_parameter_free_refid(mutate):
+    steps, payloads = _created_run(count=1)
+    payloads[steps[0].href] = _mutate_resource(payloads[steps[0].href], mutate)
+
+    with pytest.raises(todos.TodoError, match="REFID") as error:
+        runs.list_runs(
+            PROFILE,
+            session=FakeSession(response(207, _run_report(payloads))),
+            calendar_href=CAL,
+        )
+    assert error.value.code == exits.MALFORMED_RESPONSE
+
+
 def test_create_plan_is_chain_ordered_and_root_last(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
     plan = runs.plan_create(
@@ -200,6 +221,8 @@ def test_list_and_show_use_one_report_and_derive_current_position(monkeypatch, c
     assert transport.requests[0]["method"] == "REPORT"
     run = listing["runs"][0]
     assert [step["summary"] for step in run["steps"]] == ["Step 1", "Step 2", "Step 3"]
+    assert run["root"]["writable"] is True
+    assert all(step["writable"] is True and step["unsupported"] == [] for step in run["steps"])
     assert run["gaps"] == ["PT15M", "unknown"]
     assert run["current_uid"] == next(
         step["uid"] for step in run["steps"] if step["position"] == 1
@@ -211,8 +234,36 @@ def test_list_and_show_use_one_report_and_derive_current_position(monkeypatch, c
     assert cli._main(["task", "run", "show", "--json", steps[-1].href]) == exits.OK
     shown = json.loads(capsys.readouterr().out)
     assert shown["run"]["root"]["href"] == steps[-1].href
+    assert shown["run"]["root"]["writable"] is True
+    assert all(step["writable"] is True for step in shown["run"]["steps"])
     assert len(transport.requests) == 1
     assert transport.requests[0]["method"] == "REPORT"
+
+
+def test_run_structured_output_marks_read_only_collection_without_refid_unsupported(
+    monkeypatch, capsys
+):
+    steps, payloads = _created_run(count=2)
+    read_only = replace(TASK_CALENDAR, read_only=True)
+    transport = FakeSession(response(207, _run_report(payloads)))
+    _patch_cli(monkeypatch, transport, calendars=(read_only,))
+
+    assert cli._main(["task", "run", "list", "--json", CAL]) == exits.OK
+    listing = json.loads(capsys.readouterr().out)
+    run = listing["runs"][0]
+    assert run["root"]["writable"] is False
+    assert all(
+        step["writable"] is False and step["unsupported"] == [] for step in run["steps"]
+    )
+
+    shown = runs.show_run(
+        PROFILE,
+        session=FakeSession(response(207, _run_report(payloads))),
+        root_href=steps[-1].href,
+        collection_writable=False,
+    ).as_dict()
+    assert shown["root"]["writable"] is False
+    assert all(step["writable"] is False for step in shown["steps"])
 
 
 def test_current_becomes_null_and_terminal_counts_include_skips():
@@ -533,6 +584,31 @@ def test_plan_edit_rejects_weak_etag_and_authoring_freezes_after_execution(monke
         assert error.value.code == exits.CONFLICT
 
 
+@pytest.mark.parametrize(
+    ("changes", "plan_summary", "step_summary"),
+    [
+        ({"SUMMARY": "Renamed"}, "Edit run resource Renamed", "Renamed"),
+        ({"SUMMARY": ""}, "Edit run resource ", ""),
+    ],
+)
+def test_plan_edit_structured_summary_comes_from_patched_payload(
+    tmp_path, monkeypatch, changes, plan_summary, step_summary
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    steps, payloads = _created_run(count=1)
+    plan = runs.plan_edit(
+        PROFILE,
+        session=FakeSession(response(207, _run_report(payloads))),
+        href=steps[0].href,
+        changes=changes,
+        now=NOW,
+    )
+
+    structured = plan.as_dict()
+    assert structured["summary"] == plan_summary
+    assert structured["steps"][0]["summary"] == step_summary
+
+
 def test_add_and_reorder_have_deterministic_write_order_and_explicit_gaps(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
     steps, payloads = _created_run(count=3, gaps=["PT15M", "PT30M"])
@@ -819,6 +895,61 @@ def test_run_dispatcher_prevalidates_whole_plan_before_any_write(tmp_path, monke
     transport = FakeSession()
     with plans.claim(corrupted.plan_id), pytest.raises(plans.PlanError) as error:
         plans.apply(PROFILE, session=transport, plan=corrupted, dispatchers=cli._dispatchers())
+    assert error.value.code == exits.PLAN_STALE
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize(
+    "corruption", ["self-cycle", "missing-target", "branch-disconnected", "cross-run"]
+)
+def test_run_final_graph_contract_rejects_corrupt_create_before_any_write(
+    tmp_path, monkeypatch, corruption
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    plan = runs.plan_create(
+        PROFILE,
+        calendar_href=CAL,
+        summary="Route",
+        step_summaries=["One", "Two", "Three"],
+        now=NOW,
+    )
+    first, second, third, root = plan.steps
+    payloads = {step.href: plans.payload_bytes(step) for step in plan.steps}
+    if corruption == "self-cycle":
+        payloads[first.href] = _replace_relations(
+            payloads[first.href],
+            [(root.details["uid"], "PARENT", {}), (first.details["uid"], "NEXT", {})],
+        )
+    elif corruption == "missing-target":
+        payloads[first.href] = _replace_relations(
+            payloads[first.href],
+            [(root.details["uid"], "PARENT", {}), ("missing", "NEXT", {})],
+        )
+    elif corruption == "branch-disconnected":
+        payloads[first.href] = _replace_relations(
+            payloads[first.href],
+            [(root.details["uid"], "PARENT", {}), (third.details["uid"], "NEXT", {})],
+        )
+    else:
+        payloads[first.href] = _replace_relations(
+            payloads[first.href],
+            [("other-run", "PARENT", {}), (second.details["uid"], "NEXT", {})],
+        )
+    corrupted = replace(
+        plan,
+        steps=tuple(
+            replace(
+                step,
+                payload=base64.b64encode(payloads[step.href]).decode("ascii"),
+            )
+            for step in plan.steps
+        ),
+    )
+    transport = FakeSession()
+
+    with plans.claim(corrupted.plan_id), pytest.raises(plans.PlanError) as error:
+        plans.apply(PROFILE, session=transport, plan=corrupted, dispatchers=cli._dispatchers())
+
     assert error.value.code == exits.PLAN_STALE
     assert transport.requests == []
 

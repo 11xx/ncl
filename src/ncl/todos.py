@@ -51,6 +51,7 @@ UNSUPPORTED_PROPERTIES = (
 # Repeatable properties such as ATTENDEE, RELATED-TO, and RSTATUS are not in
 # this set. RRULE is deliberately absent: RFC 5545 says it SHOULD NOT repeat,
 # rather than making a repeated RRULE malformed by cardinality alone.
+# REFID is deliberately absent because RFC 9253 permits zero or more values.
 VTODO_SINGLETON_PROPERTIES = frozenset(
     {
         "CLASS",
@@ -68,7 +69,6 @@ VTODO_SINGLETON_PROPERTIES = frozenset(
         "PERCENT-COMPLETE",
         "PRIORITY",
         "RECURRENCE-ID",
-        "REFID",
         "SEQUENCE",
         "STATUS",
         "SUMMARY",

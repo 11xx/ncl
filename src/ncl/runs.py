@@ -13,7 +13,8 @@ import datetime as dt
 import re
 import secrets as token_source
 from collections import defaultdict
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from typing import Any
 
 import icalendar
@@ -94,6 +95,7 @@ class RunGraph:
     root: RunResource
     steps: tuple[RunResource, ...]
     gaps: tuple[str | None, ...]
+    collection_writable: bool | None = None
 
     @property
     def current_index(self) -> int | None:
@@ -123,6 +125,7 @@ class RunGraph:
         value["unsupported"] = [
             name for name in value["unsupported"] if name != "REFID"
         ]
+        value["writable"] = self.collection_writable is not False
         value["refid"] = member.refid
         value["raw_status"] = member.raw_status
         value["status"] = member.status
@@ -315,8 +318,15 @@ def _parse_run_resource(resource: todos.TodoResource) -> RunResource:
             f"run resource {resource.reference.href} carries unsupported structure: {names}",
             exits.UNSUPPORTED_STRUCTURE,
         )
-    refid_property = component.get("REFID")
-    if refid_property is None or not str(refid_property).strip():
+    refid_properties = [
+        value for name, value in component.property_items() if name.upper() == "REFID"
+    ]
+    if len(refid_properties) != 1:
+        raise _run_error(
+            f"run resource {resource.reference.href} must have exactly one REFID"
+        )
+    refid_property = refid_properties[0]
+    if not str(refid_property).strip():
         raise _run_error(
             f"run resource {resource.reference.href} has no nonempty REFID"
         )
@@ -357,7 +367,13 @@ def _require_relation_count(
         raise _run_error(f"run resource {member.href} {message}")
 
 
-def _build_graph(calendar_href: str, members: list[RunResource], refid: str) -> RunGraph:
+def _build_graph(
+    calendar_href: str,
+    members: list[RunResource],
+    refid: str,
+    *,
+    collection_writable: bool | None = None,
+) -> RunGraph:
     candidates = [member for member in members if member.uid == refid]
     if len(candidates) != 1:
         raise _run_error(
@@ -447,10 +463,15 @@ def _build_graph(calendar_href: str, members: list[RunResource], refid: str) -> 
         outgoing[member.uid].gap if member.uid in outgoing else None
         for member in ordered[:-1]
     )
-    return RunGraph(calendar_href, root, tuple(ordered), gaps)
+    return RunGraph(calendar_href, root, tuple(ordered), gaps, collection_writable)
 
 
-def _graphs(resources: list[todos.TodoResource], calendar_href: str) -> list[RunGraph]:
+def _graphs(
+    resources: list[todos.TodoResource],
+    calendar_href: str,
+    *,
+    collection_writable: bool | None = None,
+) -> list[RunGraph]:
     grouped: dict[str, list[RunResource]] = defaultdict(list)
     for resource in resources:
         if not any(name == "REFID" for name in resource.reference.unsupported):
@@ -464,7 +485,15 @@ def _graphs(resources: list[todos.TodoResource], calendar_href: str) -> list[Run
         member = _parse_run_resource(resource)
         grouped[member.refid].append(member)
     return sorted(
-        (_build_graph(calendar_href, members, refid) for refid, members in grouped.items()),
+        (
+            _build_graph(
+                calendar_href,
+                members,
+                refid,
+                collection_writable=collection_writable,
+            )
+            for refid, members in grouped.items()
+        ),
         key=lambda graph: graph.root.href,
     )
 
@@ -488,7 +517,11 @@ def _read_graphs(
         calendar_href=calendar_href,
         collection_writable=collection_writable,
     )
-    return _graphs(resources, _canonical(profile, calendar_href))
+    return _graphs(
+        resources,
+        _canonical(profile, calendar_href),
+        collection_writable=collection_writable,
+    )
 
 
 def list_runs(
@@ -507,10 +540,21 @@ def list_runs(
     )
 
 
-def show_run(profile: Any, *, session: Session, root_href: str) -> RunGraph:
+def show_run(
+    profile: Any,
+    *,
+    session: Session,
+    root_href: str,
+    collection_writable: bool | None = None,
+) -> RunGraph:
     """Read and validate one root and all members from one collection report."""
     collection, target = _collection_for_root(profile, root_href)
-    for graph in _read_graphs(profile, session=session, calendar_href=collection):
+    for graph in _read_graphs(
+        profile,
+        session=session,
+        calendar_href=collection,
+        collection_writable=collection_writable,
+    ):
         if graph.root.href == target:
             return graph
     raise RunError(f"no run root exists at {target}", exits.TARGET_NOT_FOUND)
@@ -669,6 +713,55 @@ def _details(
     return value
 
 
+def _resource_from_payload(payload: bytes, *, href: str, etag: str = "") -> RunResource:
+    reference = todos._describe(payload, calendar_href="", href=href, etag=etag)
+    return _parse_run_resource(todos.TodoResource(reference, payload))
+
+
+def _graph_contract(
+    *,
+    calendar_href: str,
+    root_uid: str,
+    root_href: str,
+    checkpoints: list[RunResource],
+    gaps: tuple[str | None, ...],
+    operation: str,
+    state_overrides: dict[str, RunResource] | None = None,
+) -> dict[str, Any]:
+    if len(gaps) != len(checkpoints) - 1:
+        raise RunError("run plan has an invalid final graph gap count", exits.PLAN_STALE)
+    overrides = state_overrides or {}
+    checkpoint_values: list[dict[str, Any]] = []
+    for index, member in enumerate(checkpoints):
+        state = overrides.get(member.uid, member)
+        checkpoint_values.append(
+            {
+                "uid": member.uid,
+                "href": member.href,
+                "parent_uid": root_uid,
+                "next_uid": (
+                    checkpoints[index + 1].uid if index + 1 < len(checkpoints) else None
+                ),
+                "gap": gaps[index] if index < len(gaps) else None,
+                "status": state.status,
+                "percent_complete": state.percent_complete,
+                "completed": state.component.get("COMPLETED") is not None,
+            }
+        )
+    return {
+        "version": 1,
+        "operation": operation,
+        "calendar_href": calendar_href,
+        "run_uid": root_uid,
+        "root": {
+            "uid": root_uid,
+            "href": root_href,
+            "first_uid": checkpoints[0].uid,
+        },
+        "checkpoints": checkpoint_values,
+    }
+
+
 def _step(
     *,
     action: str,
@@ -690,8 +783,31 @@ def _step(
     )
 
 
-def _write(profile: Any, summary: str, steps: list[plans.Step]) -> plans.Plan:
-    return plans.write_bundle(profile=profile.name, summary=summary, steps=steps)
+def _write(
+    profile: Any,
+    summary: str,
+    steps: list[plans.Step],
+    *,
+    final_graph: dict[str, Any],
+) -> plans.Plan:
+    write_order = [
+        {
+            "action": step.action,
+            "href": step.href,
+            "uid": step.details.get("uid"),
+            "kind": step.details.get("kind"),
+        }
+        for step in steps
+    ]
+    contract = {**final_graph, "write_order": write_order}
+    frozen_steps = tuple(
+        replace(
+            step,
+            details={**step.details, "final_graph": deepcopy(contract)},
+        )
+        for step in steps
+    )
+    return plans.write_bundle(profile=profile.name, summary=summary, steps=frozen_steps)
 
 
 def plan_create(
@@ -713,6 +829,7 @@ def plan_create(
     root_uid = f"{token_source.token_hex(16)}@ncl-run"
     step_uids = [f"{token_source.token_hex(16)}@ncl-step" for _ in step_summaries]
     steps: list[plans.Step] = []
+    checkpoint_members: list[RunResource] = []
     for index, (step_uid, step_summary) in enumerate(zip(step_uids, step_summaries, strict=True)):
         payload = _new_step(
             uid=step_uid,
@@ -733,6 +850,7 @@ def plan_create(
             "",
             (),
         )
+        checkpoint_members.append(member)
         steps.append(
             _step(
                 action="run.create",
@@ -780,7 +898,19 @@ def plan_create(
             create=True,
         )
     )
-    return _write(profile, summary, steps)
+    return _write(
+        profile,
+        summary,
+        steps,
+        final_graph=_graph_contract(
+            calendar_href=collection,
+            root_uid=root_uid,
+            root_href=root_href,
+            checkpoints=checkpoint_members,
+            gaps=normalized_gaps,
+            operation="create",
+        ),
+    )
 
 
 def _ensure_open(graph: RunGraph) -> None:
@@ -945,7 +1075,34 @@ def plan_add(
                 details=_details(graph, graph.root, operation="root update", relation="FIRST"),
             )
         )
-    return _write(profile, f"Add checkpoint {summary}", steps)
+    final_steps = list(graph.steps)
+    final_steps.insert(
+        successor_index if successor_index is not None else len(final_steps), new_member
+    )
+    final_gaps: list[str | None] = []
+    for index, member in enumerate(final_steps[:-1]):
+        if member is new_member:
+            final_gaps.append(next_gap)
+        elif final_steps[index + 1] is new_member:
+            final_gaps.append(previous_gap)
+        else:
+            relation = member.relation("NEXT")
+            if relation is None:
+                raise RunError("run insertion lost an existing NEXT relation", exits.PLAN_STALE)
+            final_gaps.append(relation.gap)
+    return _write(
+        profile,
+        f"Add checkpoint {summary}",
+        steps,
+        final_graph=_graph_contract(
+            calendar_href=graph.calendar_href,
+            root_uid=graph.root.uid,
+            root_href=graph.root.href,
+            checkpoints=final_steps,
+            gaps=tuple(final_gaps),
+            operation="add",
+        ),
+    )
 
 
 def plan_reorder(
@@ -1043,7 +1200,19 @@ def plan_reorder(
                 "run": graph.as_dict(),
             }
         )
-    return _write(profile, f"Reorder run {graph.root.reference.summary}", steps)
+    return _write(
+        profile,
+        f"Reorder run {graph.root.reference.summary}",
+        steps,
+        final_graph=_graph_contract(
+            calendar_href=graph.calendar_href,
+            root_uid=graph.root.uid,
+            root_href=graph.root.href,
+            checkpoints=final_steps,
+            gaps=normalized_gaps,
+            operation="reorder",
+        ),
+    )
 
 
 def plan_edit(
@@ -1060,19 +1229,34 @@ def plan_edit(
     _ensure_open(graph)
     captured = todos._stamp_instant(now or dt.datetime.now(dt.UTC))
     payload = _patch_content(member.raw, changes, href=member.href, now=captured)
+    updated = todos._describe(
+        payload,
+        calendar_href=graph.calendar_href,
+        href=member.href,
+        etag=member.reference.etag,
+    )
+    steps = [
+        _step(
+            action="run.update",
+            member=member,
+            href=member.href,
+            summary=updated.summary,
+            payload=payload,
+            details=_details(graph, member, operation="content update"),
+        )
+    ]
     return _write(
         profile,
-        f"Edit run resource {member.reference.summary}",
-        [
-            _step(
-                action="run.update",
-                member=member,
-                href=member.href,
-                summary=member.reference.summary,
-                payload=payload,
-                details=_details(graph, member, operation="content update"),
-            )
-        ],
+        f"Edit run resource {updated.summary}",
+        steps,
+        final_graph=_graph_contract(
+            calendar_href=graph.calendar_href,
+            root_uid=graph.root.uid,
+            root_href=graph.root.href,
+            checkpoints=list(graph.steps),
+            gaps=graph.gaps,
+            operation="edit",
+        ),
     )
 
 
@@ -1117,32 +1301,41 @@ def plan_transition(
     else:
         changes = {"STATUS": "NEEDS-ACTION", "PERCENT-COMPLETE": 0, "COMPLETED": None}
     payload = _patch_transition(member.raw, changes, href=member.href, now=captured)
+    updated = _resource_from_payload(payload, href=member.href, etag=member.reference.etag)
     out_of_order = graph.current_uid != member.uid
+    steps = [
+        _step(
+            action="run.update",
+            member=member,
+            href=member.href,
+            summary=member.reference.summary,
+            payload=payload,
+            details=_details(
+                graph,
+                member,
+                operation="state transition",
+                transition=transition,
+                out_of_order=out_of_order,
+                current_uid=graph.current_uid,
+                current_position=(
+                    graph.current_index + 1 if graph.current_index is not None else None
+                ),
+            ),
+        )
+    ]
     return _write(
         profile,
         f"{transition} checkpoint {member.reference.summary}",
-        [
-            _step(
-                action="run.update",
-                member=member,
-                href=member.href,
-                summary=member.reference.summary,
-                payload=payload,
-                details=_details(
-                    graph,
-                    member,
-                    operation="state transition",
-                    transition=transition,
-                    out_of_order=out_of_order,
-                    current_uid=graph.current_uid,
-                    current_position=(
-                        graph.current_index + 1
-                        if graph.current_index is not None
-                        else None
-                    ),
-                ),
-            )
-        ],
+        steps,
+        final_graph=_graph_contract(
+            calendar_href=graph.calendar_href,
+            root_uid=graph.root.uid,
+            root_href=graph.root.href,
+            checkpoints=list(graph.steps),
+            gaps=graph.gaps,
+            operation="transition",
+            state_overrides={member.uid: updated},
+        ),
     )
 
 
@@ -1165,6 +1358,335 @@ def _patch_transition(
 
 
 _ACTIONS = {"run.create", "run.update"}
+
+
+def _contract_error(message: str) -> None:
+    raise plans.PlanError(f"run plan bundle {message}", exits.PLAN_STALE)
+
+
+def _direct_child(collection_href: str, href: str) -> bool:
+    return (
+        bool(collection_href)
+        and collection_href.endswith("/")
+        and href != collection_href
+        and href.rsplit("/", 1)[0] + "/" == collection_href
+        and bool(href.rsplit("/", 1)[-1])
+    )
+
+
+def _validate_contract_shape(
+    contract: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    required = {
+        "version",
+        "operation",
+        "calendar_href",
+        "run_uid",
+        "root",
+        "checkpoints",
+        "write_order",
+    }
+    if set(contract) != required:
+        _contract_error("has an unexpected final-graph contract shape")
+    if contract["version"] != 1 or isinstance(contract["version"], bool):
+        _contract_error("has an unsupported final-graph contract version")
+    operation = contract["operation"]
+    if operation not in {"create", "add", "reorder", "edit", "transition"}:
+        _contract_error("has an unknown final-graph operation")
+    collection_href = contract["calendar_href"]
+    run_uid = contract["run_uid"]
+    if not isinstance(collection_href, str) or not collection_href.endswith("/"):
+        _contract_error("has an invalid final-graph collection")
+    if not isinstance(run_uid, str) or not run_uid:
+        _contract_error("has an invalid final-graph run UID")
+
+    root = contract["root"]
+    if not isinstance(root, dict) or set(root) != {"uid", "href", "first_uid"}:
+        _contract_error("has an invalid final-graph root")
+    if (
+        root["uid"] != run_uid
+        or not isinstance(root["href"], str)
+        or not isinstance(root["first_uid"], str)
+        or not root["first_uid"]
+        or not _direct_child(collection_href, root["href"])
+    ):
+        _contract_error("has an invalid final-graph root identity")
+
+    checkpoints = contract["checkpoints"]
+    if not isinstance(checkpoints, list) or not checkpoints:
+        _contract_error("has no final-graph checkpoints")
+    checkpoint_keys = {
+        "uid",
+        "href",
+        "parent_uid",
+        "next_uid",
+        "gap",
+        "status",
+        "percent_complete",
+        "completed",
+    }
+    by_uid: dict[str, dict[str, Any]] = {}
+    by_href: dict[str, dict[str, Any]] = {}
+    for checkpoint in checkpoints:
+        if not isinstance(checkpoint, dict) or set(checkpoint) != checkpoint_keys:
+            _contract_error("has an invalid final-graph checkpoint")
+        uid = checkpoint["uid"]
+        href = checkpoint["href"]
+        if (
+            not isinstance(uid, str)
+            or not uid
+            or uid == run_uid
+            or not isinstance(href, str)
+            or not _direct_child(collection_href, href)
+            or uid in by_uid
+            or href in by_href
+        ):
+            _contract_error("has duplicate or cross-collection checkpoint identity")
+        if checkpoint["parent_uid"] != run_uid:
+            _contract_error("has a checkpoint from another run")
+        next_uid = checkpoint["next_uid"]
+        if next_uid is not None and (not isinstance(next_uid, str) or not next_uid):
+            _contract_error("has an invalid NEXT target")
+        gap = checkpoint["gap"]
+        if gap is not None:
+            if not isinstance(gap, str):
+                _contract_error("has a non-text GAP")
+            _parse_gap(gap, href=href)
+        status = checkpoint["status"]
+        if status not in {"NEEDS-ACTION", "IN-PROCESS", "COMPLETED", "CANCELLED"}:
+            _contract_error("has an invalid checkpoint state")
+        percent = checkpoint["percent_complete"]
+        if percent != "" and (
+            not isinstance(percent, int) or isinstance(percent, bool) or percent not in range(101)
+        ):
+            _contract_error("has an invalid checkpoint completion percentage")
+        completed = checkpoint["completed"]
+        if not isinstance(completed, bool):
+            _contract_error("has an invalid checkpoint completion marker")
+        if status == "COMPLETED" and (percent != 100 or not completed):
+            _contract_error("has an incomplete COMPLETED checkpoint")
+        if status != "COMPLETED" and (percent == 100 or completed):
+            _contract_error("has a completed timestamp outside COMPLETED state")
+        by_uid[uid] = checkpoint
+        by_href[href] = checkpoint
+
+    if root["first_uid"] not in by_uid:
+        _contract_error("has a missing FIRST target")
+    if root["href"] in by_href:
+        _contract_error("reuses the root href for a checkpoint")
+
+    incoming = {uid: 0 for uid in by_uid}
+    incoming[root["first_uid"]] += 1
+    for index, checkpoint in enumerate(checkpoints):
+        next_uid = checkpoint["next_uid"]
+        if next_uid is None:
+            if index != len(checkpoints) - 1:
+                _contract_error("has a disconnected checkpoint before the chain end")
+            continue
+        if next_uid == checkpoint["uid"] or next_uid not in by_uid:
+            _contract_error("has a self-cycle or missing NEXT target")
+        if index == len(checkpoints) - 1:
+            _contract_error("has an outgoing edge from the final checkpoint")
+        incoming[next_uid] += 1
+    if incoming[root["first_uid"]] != 1 or any(
+        count != 1 for uid, count in incoming.items() if uid != root["first_uid"]
+    ):
+        _contract_error("has a branch or disconnected checkpoint")
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    current = root["first_uid"]
+    while current not in seen:
+        seen.add(current)
+        ordered.append(current)
+        next_uid = by_uid[current]["next_uid"]
+        if next_uid is None:
+            break
+        current = next_uid
+    if len(ordered) != len(checkpoints) or ordered != [item["uid"] for item in checkpoints]:
+        _contract_error("is not one rooted linear graph")
+
+    write_order = contract["write_order"]
+    if not isinstance(write_order, list) or not write_order:
+        _contract_error("has no write order")
+    write_keys = {"action", "href", "uid", "kind"}
+    identities: set[tuple[str, str, str, str]] = set()
+    for item in write_order:
+        if not isinstance(item, dict) or set(item) != write_keys:
+            _contract_error("has an invalid write-order entry")
+        if (
+            item["action"] not in _ACTIONS
+            or item["kind"] not in {"root", "checkpoint"}
+            or not isinstance(item["href"], str)
+            or not isinstance(item["uid"], str)
+        ):
+            _contract_error("has an invalid write-order identity")
+        identity = (item["action"], item["href"], item["uid"], item["kind"])
+        if identity in identities:
+            _contract_error("writes the same resource more than once")
+        identities.add(identity)
+        if item["kind"] == "root":
+            if item["uid"] != run_uid or item["href"] != root["href"]:
+                _contract_error("has a write outside the final root identity")
+        elif item["uid"] not in by_uid or item["href"] != by_uid[item["uid"]]["href"]:
+            _contract_error("has a write outside the final checkpoint graph")
+
+    return root, checkpoints, write_order
+
+
+def _validate_write_order(
+    operation: str,
+    root: dict[str, Any],
+    checkpoints: list[dict[str, Any]],
+    write_order: list[dict[str, Any]],
+) -> None:
+    root_write = {"action": "run.update", "href": root["href"], "uid": root["uid"], "kind": "root"}
+    checkpoint_writes = {
+        item["uid"]: {
+            "action": "run.update",
+            "href": item["href"],
+            "uid": item["uid"],
+            "kind": "checkpoint",
+        }
+        for item in checkpoints
+    }
+    if operation == "create":
+        expected = [
+            {**item, "action": "run.create"}
+            for item in checkpoint_writes.values()
+        ] + [
+            {"action": "run.create", "href": root["href"], "uid": root["uid"], "kind": "root"}
+        ]
+        if write_order != expected:
+            _contract_error("does not write creates in checkpoint-then-root order")
+        return
+    if operation == "add":
+        creates = [item for item in write_order if item["action"] == "run.create"]
+        if len(creates) != 1 or creates[0]["kind"] != "checkpoint":
+            _contract_error("does not have exactly one checkpoint create")
+        new_uid = creates[0]["uid"]
+        expected = [creates[0]]
+        predecessor = [item for item in checkpoints if item["next_uid"] == new_uid]
+        if len(predecessor) > 1:
+            _contract_error("has multiple predecessors for an inserted checkpoint")
+        if predecessor:
+            expected.append(checkpoint_writes[predecessor[0]["uid"]])
+        if root["first_uid"] == new_uid:
+            expected.append(root_write)
+        if write_order != expected:
+            _contract_error("does not write an insertion in create-then-edge order")
+        return
+    if operation == "reorder":
+        if any(item["action"] != "run.update" for item in write_order):
+            _contract_error("contains a create in a reorder")
+        root_items = [item for item in write_order if item["kind"] == "root"]
+        if len(root_items) > 1 or (root_items and write_order[-1] != root_items[0]):
+            _contract_error("does not write the root last")
+        positions = {item["uid"]: index for index, item in enumerate(checkpoints)}
+        checkpoint_items = [item for item in write_order if item["kind"] == "checkpoint"]
+        if [positions[item["uid"]] for item in checkpoint_items] != sorted(
+            positions[item["uid"]] for item in checkpoint_items
+        ):
+            _contract_error("does not write changed edges in final order")
+        return
+    if len(write_order) != 1 or write_order[0]["action"] != "run.update":
+        _contract_error("has an invalid single-resource write order")
+
+
+def _validate_payload_against_contract(
+    step: plans.Step,
+    write_entry: dict[str, Any],
+    graph_entry: dict[str, Any],
+    *,
+    run_uid: str,
+    root: dict[str, Any],
+) -> None:
+    member = _resource_from_payload(plans.payload_bytes(step), href=step.href, etag=step.etag)
+    if member.refid != run_uid or member.uid != write_entry["uid"]:
+        _contract_error("contains a cross-run or mismatched UID payload")
+    if write_entry["kind"] == "root":
+        if member.uid != run_uid or member.refid != member.uid:
+            _contract_error("contains a mismatched root identity")
+        if any(
+            member.component.get(name) is not None
+            for name in ("STATUS", "PERCENT-COMPLETE", "COMPLETED")
+        ):
+            _contract_error("contains root execution state")
+        first = member.relation("FIRST")
+        if len(member.relations) != 1 or first is None or first.target != root["first_uid"]:
+            _contract_error("does not match the final FIRST edge")
+        return
+
+    parent = member.relation("PARENT")
+    if parent is None or parent.target != run_uid or parent.gap is not None:
+        _contract_error("does not match the final PARENT identity")
+    next_relation = member.relation("NEXT")
+    expected_next = graph_entry["next_uid"]
+    if expected_next is None:
+        if next_relation is not None:
+            _contract_error("has an unexpected final NEXT edge")
+    elif (
+        next_relation is None
+        or next_relation.target != expected_next
+        or next_relation.gap != graph_entry["gap"]
+    ):
+        _contract_error("does not match the final NEXT edge")
+    if (
+        member.status != graph_entry["status"]
+        or member.percent_complete != graph_entry["percent_complete"]
+        or (member.component.get("COMPLETED") is not None) != graph_entry["completed"]
+    ):
+        _contract_error("does not match the final checkpoint state")
+
+
+def validate_bundle(steps: tuple[plans.Step, ...]) -> None:
+    """Validate one frozen run graph before the first remote request."""
+    try:
+        if not isinstance(steps, tuple) or not steps:
+            _contract_error("has no steps")
+        contracts = [step.details.get("final_graph") for step in steps]
+        if any(not isinstance(contract, dict) for contract in contracts):
+            _contract_error("is missing its final-graph contract")
+        contract = contracts[0]
+        if any(candidate != contract for candidate in contracts[1:]):
+            _contract_error("has non-identical final-graph contracts")
+        root, checkpoints, write_order = _validate_contract_shape(contract)
+        if len(write_order) != len(steps):
+            _contract_error("has a write order that does not match its steps")
+        actual_order = [
+            {
+                "action": step.action,
+                "href": step.href,
+                "uid": step.details.get("uid"),
+                "kind": step.details.get("kind"),
+            }
+            for step in steps
+        ]
+        if actual_order != write_order:
+            _contract_error("has steps in a different order from its contract")
+        _validate_write_order(contract["operation"], root, checkpoints, write_order)
+        by_uid = {item["uid"]: item for item in checkpoints}
+        for step, expected in zip(steps, write_order, strict=True):
+            graph_entry = (
+                root if expected["kind"] == "root" else by_uid[expected["uid"]]
+            )
+            _validate_payload_against_contract(
+                step,
+                expected,
+                graph_entry,
+                run_uid=contract["run_uid"],
+                root=root,
+            )
+            if not _direct_child(contract["calendar_href"], step.href):
+                _contract_error("contains a cross-collection resource href")
+            if expected["kind"] == "checkpoint" and expected["uid"] not in by_uid:
+                _contract_error("contains an unknown checkpoint write")
+    except plans.PlanError:
+        raise
+    except todos.TodoError as exc:
+        raise plans.PlanError(exc.message, exits.PLAN_STALE) from exc
+    except (KeyError, TypeError, ValueError, IndexError) as exc:
+        raise plans.PlanError("run plan bundle has malformed graph data", exits.PLAN_STALE) from exc
 
 
 def validate_step(step: plans.Step) -> None:
