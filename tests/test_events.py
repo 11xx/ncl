@@ -1251,6 +1251,20 @@ def test_building_an_event_refuses_a_backwards_interval():
     assert error.value.code == exits.USAGE
 
 
+def test_build_event_serializes_typed_related_to_with_a_reltype_parameter():
+    raw = mutate.build_event(
+        uid="anchor@example",
+        summary="Anchor",
+        start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+        end=dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
+        related_to=(("child@example", "child"),),
+        now=dt.datetime(2026, 9, 1, tzinfo=dt.UTC),
+    )
+
+    assert "RELATED-TO;RELTYPE=CHILD:child@example" in raw
+    assert "RELATED-TO:('child'\\, 'CHILD')" not in raw
+
+
 def test_planning_outside_the_allowlist_is_refused():
     start = dt.datetime(2026, 9, 1, 11, 0, tzinfo=dt.UTC)
     end = dt.datetime(2026, 9, 1, 12, 0, tzinfo=dt.UTC)

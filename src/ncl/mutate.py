@@ -200,6 +200,20 @@ def _semantic_calendar(raw: bytes) -> tuple[Any, ...]:
         raise EventError("the stored event is not valid iCalendar") from exc
 
 
+def _add_related_to(event: Any, relation: str | tuple[str, str]) -> None:
+    """Add one RELATED-TO value, with an RFC 5545 relation type when given."""
+    if isinstance(relation, tuple):
+        if len(relation) != 2 or not all(isinstance(item, str) and item for item in relation):
+            raise EventError(
+                "a typed RELATED-TO value needs a non-empty UID and relation type",
+                exits.USAGE,
+            )
+        uid, reltype = relation
+        event.add("related-to", uid, parameters={"RELTYPE": reltype.upper()})
+        return
+    event.add("related-to", relation)
+
+
 def _optional_fields(
     event: Any,
     *,
@@ -212,7 +226,7 @@ def _optional_fields(
     url: str = "",
     classification: str = "",
     color: str = "",
-    related_to: tuple[str, ...] = (),
+    related_to: tuple[str | tuple[str, str], ...] = (),
     alarms: tuple[str, ...] = (),
 ) -> None:
     """Attach the properties that tell a client how much an event matters."""
@@ -247,11 +261,11 @@ def _optional_fields(
     if color:
         # RFC 7986 takes a CSS3 colour name; Nextcloud honours it per event.
         event.add("color", color)
-    for uid in related_to:
+    for relation in related_to:
         # RELATED-TO is what ties a preparation block, a travel block, and the
         # appointment they serve into one thing a client can follow, without
         # inventing a convention this tool would then have to defend.
-        event.add("related-to", uid)
+        _add_related_to(event, relation)
     for trigger in alarms:
         event.add_component(_alarm(trigger))
 
@@ -271,7 +285,7 @@ def build_event(
     url: str = "",
     classification: str = "",
     color: str = "",
-    related_to: tuple[str, ...] = (),
+    related_to: tuple[str | tuple[str, str], ...] = (),
     alarms: tuple[str, ...] = (),
     portable_description: bool = False,
     now: dt.datetime | None = None,
