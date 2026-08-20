@@ -300,15 +300,18 @@ def plan_create(
     )
     return plans.write(
         profile=profile.name,
-        action="create",
-        calendar_href=calendar_href,
+        action="cal.create",
         href=_resource_href(calendar_href, uid),
-        uid=uid,
         etag="",
         summary=summary,
-        start=events._utc(start),
-        end=events._utc(end),
-        payload=payload,
+        payload=payload.encode("utf-8"),
+        content_type="text/calendar; charset=utf-8",
+        details={
+            "calendar_href": calendar_href,
+            "uid": uid,
+            "start": events._utc(start),
+            "end": events._utc(end),
+        },
     )
 
 
@@ -335,15 +338,18 @@ def plan_update(
     )
     return plans.write(
         profile=profile.name,
-        action="update",
-        calendar_href=reference.calendar_href,
+        action="cal.update",
         href=reference.href,
-        uid=reference.uid,
         etag=reference.etag,
         summary=updated.summary,
-        start=updated.start,
-        end=updated.end,
-        payload=payload,
+        payload=payload.encode("utf-8"),
+        content_type="text/calendar; charset=utf-8",
+        details={
+            "calendar_href": reference.calendar_href,
+            "uid": reference.uid,
+            "start": updated.start,
+            "end": updated.end,
+        },
     )
 
 
@@ -357,15 +363,16 @@ def plan_delete(profile: Any, *, session: Session, href: str) -> plans.Plan:
         )
     return plans.write(
         profile=profile.name,
-        action="delete",
-        calendar_href=reference.calendar_href,
+        action="cal.delete",
         href=reference.href,
-        uid=reference.uid,
         etag=reference.etag,
         summary=reference.summary,
-        start=reference.start,
-        end=reference.end,
-        payload="",
+        details={
+            "calendar_href": reference.calendar_href,
+            "uid": reference.uid,
+            "start": reference.start,
+            "end": reference.end,
+        },
     )
 
 
@@ -401,25 +408,25 @@ def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]
             f"{plan.href} is outside this profile's calendar allowlist", exits.SCOPE_DENIED
         )
 
-    if plan.action == "delete":
+    if plan.action == "cal.delete":
         response = session.request("DELETE", plan.href, headers={"If-Match": plan.etag})
-    elif plan.action == "create":
+    elif plan.action == "cal.create":
         # The href derives from a freshly minted UID, so anything already there
         # is a different event: refuse rather than overwrite it.
         response = session.request(
             "PUT",
             plan.href,
-            headers={"Content-Type": "text/calendar; charset=utf-8", "If-None-Match": "*"},
-            data=plan.payload,
+            headers={"Content-Type": plan.content_type, "If-None-Match": "*"},
+            data=plans.payload_bytes(plan),
         )
-    elif plan.action == "update":
+    elif plan.action == "cal.update":
         # Conditional on the ETag observed while planning, so a change that
         # landed in between conflicts instead of being silently overwritten.
         response = session.request(
             "PUT",
             plan.href,
-            headers={"Content-Type": "text/calendar; charset=utf-8", "If-Match": plan.etag},
-            data=plan.payload,
+            headers={"Content-Type": plan.content_type, "If-Match": plan.etag},
+            data=plans.payload_bytes(plan),
         )
     else:
         raise plans.PlanError(f"unknown plan action {plan.action!r}", exits.USAGE)
@@ -430,7 +437,7 @@ def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]
             "its current state",
             exits.CONFLICT,
         )
-    if response.status == 404 and plan.action != "create":
+    if response.status == 404 and plan.action != "cal.create":
         raise EventError(f"no event exists at {plan.href}", exits.TARGET_NOT_FOUND)
     if response.status not in {200, 201, 204}:
         raise EventError(
@@ -438,8 +445,12 @@ def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]
             exits.SERVER_ERROR,
         )
 
-    result: dict[str, Any] = {"action": plan.action, "href": plan.href, "uid": plan.uid}
-    if plan.action == "delete":
+    result: dict[str, Any] = {
+        "action": plan.action,
+        "href": plan.href,
+        "uid": plan.details.get("uid", ""),
+    }
+    if plan.action == "cal.delete":
         result["verified"] = "deleted"
         plans.consume(plan.plan_id)
         return result
@@ -451,7 +462,7 @@ def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]
     result["summary"] = stored.summary
     result["start"] = stored.start
     result["verified"] = stored.summary == plan.summary and _same_instant(
-        stored.start, plan.start
+        stored.start, str(plan.details.get("start", ""))
     )
     if not result["verified"]:
         raise EventError(

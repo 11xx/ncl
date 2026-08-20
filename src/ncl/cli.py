@@ -362,10 +362,12 @@ def _emit_plan(plan: Any, json_output: bool) -> int:
     if json_output:
         _json({"plan": plan.as_dict()})
     else:
-        render.emit(f"planned {plan.action}: {plan.summary or plan.uid}")
+        render.emit(f"planned {plan.action}: {plan.summary or plan.href}")
         render.emit(f"  href    {plan.href}")
-        if plan.start:
-            render.emit(f"  when    {plan.start} .. {plan.end}")
+        if plan.details.get("start"):
+            render.emit(
+                f"  when    {plan.details['start']} .. {plan.details.get('end', '')}"
+            )
         render.emit(f"  apply   ncl apply {plan.plan_id}")
         render.emit("  nothing has been changed on the server yet.")
     return exits.CONFIRMATION_REQUIRED
@@ -486,7 +488,7 @@ def _run_plan(args: argparse.Namespace) -> int:
             _json({"plans": [plan.as_dict() for plan in pending]})
         else:
             for plan in pending:
-                render.emit(f"{plan.plan_id}  {plan.action:6} {plan.summary or plan.uid}")
+                render.emit(f"{plan.plan_id}  {plan.action:12} {plan.summary or plan.href}")
         return exits.OK
     if args.plan_command == "show":
         plan = plans.read(args.plan_id)
