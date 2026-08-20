@@ -28,7 +28,15 @@ SUPPORTED = {"VEVENT"}
 #: Recurrence needs RECURRENCE-ID semantics to identify the right component,
 #: and scheduling properties make an edit send invitations or cancellations —
 #: an external side effect rather than a local change.
-UNSUPPORTED_PROPERTIES = ("RRULE", "RDATE", "RECURRENCE-ID", "ORGANIZER", "ATTENDEE")
+UNSUPPORTED_PROPERTIES = (
+    "RRULE",
+    "RDATE",
+    "EXDATE",
+    "EXRULE",
+    "RECURRENCE-ID",
+    "ORGANIZER",
+    "ATTENDEE",
+)
 
 
 class EventError(RuntimeError):
@@ -227,7 +235,11 @@ def _describe(raw: bytes, *, calendar_href: str, href: str, etag: str) -> EventR
         end=_utc(end_value) if end_value is not None else "",
         all_day=isinstance(start_value, dt.date) and not isinstance(start_value, dt.datetime),
         recurring=any(
-            "RRULE" in event or "RDATE" in event or "RECURRENCE-ID" in event
+            "RRULE" in event
+            or "RDATE" in event
+            or "EXDATE" in event
+            or "EXRULE" in event
+            or "RECURRENCE-ID" in event
             for event in vevents
         ),
         writable=not unsupported,

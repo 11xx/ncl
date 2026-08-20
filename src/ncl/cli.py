@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from . import (
+    appointments,
     caldav,
     checks,
     events,
@@ -297,6 +298,103 @@ def build_parser() -> argparse.ArgumentParser:
     cal_delete = cal_commands.add_parser("delete", help="Plan a deletion; changes nothing yet")
     _add_options(cal_delete)
     cal_delete.add_argument("href", help="Event resource href")
+
+    cal_appointment = cal_commands.add_parser(
+        "appointment",
+        help="Plan a linked appointment, travel, and preparation bundle",
+        description=(
+            "Appointment bundles create or reschedule exactly three timed VEVENTs. "
+            "All durations are RFC 5545 day/time values; route URLs are stored "
+            "verbatim and never fetched."
+        ),
+    )
+    appointment_commands = cal_appointment.add_subparsers(
+        dest="appointment_command", required=True, metavar="<command>", parser_class=_Parser
+    )
+
+    appointment_create = appointment_commands.add_parser(
+        "create", help="Plan a three-event appointment bundle; changes nothing yet"
+    )
+    _add_options(appointment_create)
+    appointment_create.add_argument(
+        "calendar", help="Calendar href, or an unambiguous display name"
+    )
+    appointment_create.add_argument("--summary", required=True, help="Appointment summary")
+    appointment_create.add_argument(
+        "--from", "--start", dest="start", required=True,
+        help="Appointment start, ISO 8601 with an offset and whole seconds",
+    )
+    appointment_create.add_argument(
+        "--to", "--end", dest="end", required=True,
+        help="Appointment end, ISO 8601 with an offset and whole seconds",
+    )
+    appointment_create.add_argument("--origin", required=True, help="Exact origin text")
+    appointment_create.add_argument(
+        "--destination", required=True, help="Exact destination address for LOCATION"
+    )
+    appointment_create.add_argument("--mode", required=True, help="Stated travel mode")
+    appointment_create.add_argument(
+        "--route-estimate", required=True, help="Positive RFC 5545 duration"
+    )
+    appointment_create.add_argument(
+        "--on-site-buffer", required=True, help="Nonnegative RFC 5545 duration"
+    )
+    appointment_create.add_argument(
+        "--stop-wait-margin", required=True, help="Nonnegative RFC 5545 duration"
+    )
+    appointment_create.add_argument(
+        "--preparation-duration", required=True, help="Positive RFC 5545 duration"
+    )
+    appointment_create.add_argument(
+        "--route-url", default=None, help="Optional route URL; stored verbatim, never fetched"
+    )
+    appointment_create.add_argument(
+        "--description", default="", help="Optional appointment prose"
+    )
+
+    appointment_update = appointment_commands.add_parser(
+        "update", help="Plan a reschedule of exact appointment bundle hrefs"
+    )
+    _add_options(appointment_update)
+    appointment_update.add_argument("appointment_href", help="Exact appointment event href")
+    appointment_update.add_argument("travel_href", help="Exact travel event href")
+    appointment_update.add_argument("preparation_href", help="Exact preparation event href")
+    appointment_update.add_argument("--summary", help="Replacement appointment summary")
+    appointment_update.add_argument(
+        "--from", "--start", dest="start", required=True,
+        help="New appointment start, ISO 8601 with an offset and whole seconds",
+    )
+    appointment_update.add_argument(
+        "--to", "--end", dest="end", required=True,
+        help="New appointment end, ISO 8601 with an offset and whole seconds",
+    )
+    appointment_update.add_argument("--origin", required=True, help="Exact origin text")
+    appointment_update.add_argument(
+        "--destination", required=True, help="Exact destination address for LOCATION"
+    )
+    appointment_update.add_argument("--mode", required=True, help="Stated travel mode")
+    appointment_update.add_argument(
+        "--route-estimate", required=True, help="Positive RFC 5545 duration"
+    )
+    appointment_update.add_argument(
+        "--on-site-buffer", required=True, help="Nonnegative RFC 5545 duration"
+    )
+    appointment_update.add_argument(
+        "--stop-wait-margin", required=True, help="Nonnegative RFC 5545 duration"
+    )
+    appointment_update.add_argument(
+        "--preparation-duration", required=True, help="Positive RFC 5545 duration"
+    )
+    route_options = appointment_update.add_mutually_exclusive_group()
+    route_options.add_argument(
+        "--route-url", help="Replace the route URL verbatim; omission preserves it; never fetched"
+    )
+    route_options.add_argument(
+        "--clear-route-url", action="store_true", help="Remove the route URL"
+    )
+    appointment_update.add_argument(
+        "--description", help="Replacement appointment prose; omission preserves it"
+    )
 
     task = commands.add_parser(
         "task",
@@ -744,6 +842,72 @@ def _run_cal(args: argparse.Namespace) -> int:
     if args.cal_command == "delete":
         plan = mutate.plan_delete(profile, session=transport, href=args.href)
         return _emit_plan(plan, args.json)
+
+    if args.cal_command == "appointment":
+        if args.appointment_command == "create":
+            href = _resolved_calendar(profile, transport, args.calendar)
+            plan = appointments.plan_create(
+                profile,
+                calendar_href=href,
+                summary=args.summary,
+                start=appointments.parse_instant(args.start, "--from"),
+                end=appointments.parse_instant(args.end, "--to"),
+                origin=args.origin,
+                destination=args.destination,
+                mode=args.mode,
+                route_estimate=appointments.parse_duration(
+                    args.route_estimate, "--route-estimate", positive=True
+                ),
+                on_site_buffer=appointments.parse_duration(
+                    args.on_site_buffer, "--on-site-buffer"
+                ),
+                stop_wait_margin=appointments.parse_duration(
+                    args.stop_wait_margin, "--stop-wait-margin"
+                ),
+                preparation_duration=appointments.parse_duration(
+                    args.preparation_duration, "--preparation-duration", positive=True
+                ),
+                route_url=args.route_url,
+                description=args.description,
+            )
+            return _emit_plan(plan, args.json)
+
+        if args.appointment_command == "update":
+            plan = appointments.plan_update(
+                profile,
+                session=transport,
+                appointment_href=args.appointment_href,
+                travel_href=args.travel_href,
+                preparation_href=args.preparation_href,
+                start=appointments.parse_instant(args.start, "--from"),
+                end=appointments.parse_instant(args.end, "--to"),
+                origin=args.origin,
+                destination=args.destination,
+                mode=args.mode,
+                route_estimate=appointments.parse_duration(
+                    args.route_estimate, "--route-estimate", positive=True
+                ),
+                on_site_buffer=appointments.parse_duration(
+                    args.on_site_buffer, "--on-site-buffer"
+                ),
+                stop_wait_margin=appointments.parse_duration(
+                    args.stop_wait_margin, "--stop-wait-margin"
+                ),
+                preparation_duration=appointments.parse_duration(
+                    args.preparation_duration, "--preparation-duration", positive=True
+                ),
+                summary=args.summary,
+                description=args.description,
+                route_url=(
+                    args.route_url
+                    if args.route_url is not None
+                    else appointments.PRESERVE_ROUTE_URL
+                ),
+                clear_route_url=args.clear_route_url,
+            )
+            return _emit_plan(plan, args.json)
+
+        return exits.USAGE
 
     return exits.USAGE
 

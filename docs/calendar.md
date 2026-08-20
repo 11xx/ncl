@@ -46,6 +46,82 @@ tool never parses prose back into structured fields and never fetches a URL.
 Duplicate, nested, reversed, or unpaired delimiters are refused before a plan
 is created, because replacement would otherwise be ambiguous.
 
+## Appointment bundles
+
+An appointment bundle is one appointment anchor, one travel block, and one
+preparation block in the same allowlisted calendar. Create it with all facts
+stated explicitly:
+
+```text
+ncl cal appointment create <calendar> \
+  --summary "Appointment" \
+  --from 2026-09-01T14:00:00-03:00 --to 2026-09-01T15:00:00-03:00 \
+  --origin "Home" --destination "Rua A, 10" --mode bus \
+  --route-estimate PT1H --on-site-buffer PT15M \
+  --stop-wait-margin PT10M --preparation-duration PT20M \
+  [--route-url <directions-uri>] [--description <appointment-prose>]
+```
+
+Starts and ends need an explicit offset and whole-second precision. Durations
+use RFC 5545 day/time syntax: weeks, days, hours, minutes, and seconds are
+accepted; months, years, negative values, fractional seconds, zero route or
+preparation durations, and arithmetic overflow are refused. On-site buffer
+and stop/wait margin may be zero. The timeline is calculated exactly backwards:
+
+```text
+target arrival    = appointment start - on-site buffer
+planned departure = target arrival - route estimate
+leave home        = planned departure - stop/wait margin
+preparation start = leave home - preparation duration
+```
+
+The plan always contains exactly three ordered steps: appointment, travel,
+preparation. Planning does not write. The appointment stores the summary,
+boundaries, destination in `LOCATION`, and optional appointment prose. Travel
+covers leave-home through target-arrival and stores origin, destination, mode,
+all computed instants, and the three route durations in one deterministic
+owned `DESCRIPTION` block. A route URL is stored in travel's `URL` property and
+in its matching owned-block line; it is never fetched. Preparation covers the
+backward-computed preparation interval. The command does not infer preparation
+notes; notes belong on that preparation event.
+
+The three UIDs are generated once when the plan is frozen. The appointment
+names both children with `RELATED-TO;RELTYPE=CHILD`, and travel and preparation
+each name the appointment with `RELATED-TO;RELTYPE=PARENT`. These relations are
+typed standard iCalendar properties, not text encoded as a tuple.
+
+Reschedule only by naming all three exact resources:
+
+```text
+ncl cal appointment update <appointment-href> <travel-href> <preparation-href> \
+  --from <new-iso> --to <new-iso> --origin <origin> \
+  --destination <address> --mode <mode> --route-estimate <duration> \
+  --on-site-buffer <duration> --stop-wait-margin <duration> \
+  --preparation-duration <duration> [--summary <summary>] \
+  [--description <appointment-prose>] [--route-url <directions-uri>]
+```
+
+Update reads those exact hrefs, requires strong ETags, checks that they share
+one collection, and verifies one direct timed VEVENT at each href, distinct
+UIDs, and the reciprocal typed topology. Recurrence, scheduling properties,
+extra VEVENTs, all-day or duration-based resources, malformed relations, and a
+malformed or missing travel owned block are refused before a plan is stored.
+The UID, href, and unrelated authored data survive. Appointment prose and
+preparation notes are preserved when their options are omitted. Route URL
+omission preserves the existing URL, `--route-url` replaces it, and
+`--clear-route-url` removes both the property and the owned-block line.
+Authored travel text outside the owned block is preserved; text inside the
+block is replaced by the new snapshot.
+
+Appointment bundles use the ordinary non-atomic plan lifecycle. Apply sends
+appointment, travel, and preparation PUTs in that order, using
+`If-None-Match: *` for creation and each captured `If-Match` ETag for update,
+and reads each exact href back before recording it verified. A partial failure
+does not roll back an earlier verified event. An uncertain step blocks later
+steps until `ncl plan reconcile <plan-id>` classifies it. This slice adds no
+bundle delete operation, routing provider, recurrence behavior, or generic
+CRUD bundle marker.
+
 Create and update remain plan/apply operations. Updates and deletions require a
 strong quoted ETag observed while planning. Applying a calendar write reads the
 exact resource back and compares semantic iCalendar content: identity, the

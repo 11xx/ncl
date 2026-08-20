@@ -87,6 +87,39 @@ WORK WITH TASKS
   unsupported sibling components remain readable but are refused for mutation;
   a DATE DTSTART can use DURATION only in whole days or weeks.
 
+PLAN APPOINTMENT TRAVEL
+  ncl cal appointment create <calendar> --summary S --from <iso> --to <iso> \\
+    --origin O --destination D --mode M --route-estimate <duration> \\
+    --on-site-buffer <duration> --stop-wait-margin <duration> \\
+    --preparation-duration <duration> [--route-url U]
+  ncl cal appointment update <appointment-href> <travel-href> <preparation-href> \\
+    --from <iso> --to <iso> --origin O --destination D --mode M \\
+    --route-estimate <duration> --on-site-buffer <duration> \\
+    --stop-wait-margin <duration> --preparation-duration <duration>
+
+  These commands freeze one three-step bundle in appointment, travel,
+  preparation order. Start and end need explicit offsets and whole seconds.
+  Route estimate and preparation duration are positive RFC 5545 day/time
+  durations; on-site buffer and stop/wait margin are nonnegative. The tool
+  calculates target arrival, planned departure, leave-home, and preparation
+  start backwards from the appointment start, using no routing provider.
+
+  The appointment stores its summary, exact destination in LOCATION, and
+  optional prose. Travel stores the stated route facts in one owned
+  DESCRIPTION block and, when present, the route URL verbatim. Preparation is
+  the event for preparation notes. The three generated UIDs are linked by
+  reciprocal typed RELATED-TO CHILD/PARENT properties. The plan output exposes
+  metadata only; it does not expose the frozen iCalendar bodies.
+
+  Update takes the three exact hrefs and strong ETags observed by its reads.
+  It refuses a different collection, recurrence or scheduling structure,
+  extra VEVENTs, all-day or duration-based events, broken relations, or a
+  malformed travel block. Omitted route URL preserves it; --route-url replaces
+  it; --clear-route-url removes it. Authored text outside the travel block and
+  unmentioned event data survive. Apply uses the ordinary resumable lifecycle:
+  each exact PUT is followed by a readback, verified steps are skipped on
+  resume, and an uncertain step blocks later steps until reconciliation.
+
 REACH ALLOWLISTED FILES
   ncl files list <collection-href>  List one collection, without recursion.
   ncl files stat <resource-href>    Read size, mtime, media type, and ETag.

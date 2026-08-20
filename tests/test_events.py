@@ -191,13 +191,26 @@ def test_all_day_end_is_exclusive():
     assert reference.end == "20260902"
 
 
-def test_recurrence_override_is_marked_recurring():
+@pytest.mark.parametrize(
+    ("property_name", "value"),
+    [
+        ("RRULE", "FREQ=WEEKLY"),
+        ("RDATE", "20260908T110000Z"),
+        ("EXDATE", "20260908T110000Z"),
+        ("EXRULE", "FREQ=WEEKLY"),
+        ("RECURRENCE-ID", "20260901T110000Z"),
+    ],
+)
+def test_recurrence_structure_is_marked_recurring(property_name, value):
     raw = RICH.replace(
         b"DTSTAMP:20260817T120000Z",
-        b"DTSTAMP:20260817T120000Z\nRECURRENCE-ID:20260901T110000Z",
+        f"DTSTAMP:20260817T120000Z\n{property_name}:{value}".encode(),
     )
 
-    assert _ref(raw).recurring is True
+    reference = _ref(raw)
+
+    assert reference.recurring is True
+    assert property_name in reference.unsupported
 
 
 @pytest.mark.parametrize("status", ["CONFIRMED", "TENTATIVE", "CANCELLED"])
@@ -1249,6 +1262,20 @@ def test_building_an_event_refuses_a_backwards_interval():
     with pytest.raises(events.EventError) as error:
         mutate.build_event(uid="u", summary="s", start=start, end=end)
     assert error.value.code == exits.USAGE
+
+
+def test_build_event_serializes_typed_related_to_with_a_reltype_parameter():
+    raw = mutate.build_event(
+        uid="anchor@example",
+        summary="Anchor",
+        start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+        end=dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
+        related_to=(("child@example", "child"),),
+        now=dt.datetime(2026, 9, 1, tzinfo=dt.UTC),
+    )
+
+    assert "RELATED-TO;RELTYPE=CHILD:child@example" in raw
+    assert "RELATED-TO:('child'\\, 'CHILD')" not in raw
 
 
 def test_planning_outside_the_allowlist_is_refused():
