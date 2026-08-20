@@ -51,6 +51,10 @@ STATUSES = ("CONFIRMED", "TENTATIVE", "CANCELLED")
 
 CLASSES = ("PUBLIC", "PRIVATE", "CONFIDENTIAL")
 
+PORTABLE_START = "--- ncl portable fields ---"
+PORTABLE_END = "--- end ncl portable fields ---"
+_PORTABLE_PROPERTIES = ("LOCATION", "URL", "STATUS", "CATEGORIES", "PRIORITY", "TRANSP", "CLASS")
+
 
 def _alarm(trigger: str) -> Any:
     """A display reminder, offset from the event's start.
@@ -70,6 +74,109 @@ def _alarm(trigger: str) -> Any:
             f"{trigger!r} is not an RFC 5545 duration such as -PT15M or -P1D", exits.USAGE
         ) from exc
     return alarm
+
+
+def _property_values(component: Any, name: str) -> tuple[Any, ...]:
+    value = component.get(name)
+    if value is None:
+        return ()
+    if isinstance(value, list):
+        return tuple(value)
+    return (value,)
+
+
+def _portable_text(value: Any) -> str:
+    """Render a property as one safe, plain-text line."""
+    return str(value).replace("\r", r"\r").replace("\n", r"\n")
+
+
+def _ical_text(value: Any) -> str:
+    raw = value.to_ical() if hasattr(value, "to_ical") else str(value).encode("utf-8")
+    return raw.decode("utf-8", "replace")
+
+
+def _portable_lines(event: Any) -> list[str]:
+    lines: list[str] = []
+    for name in _PORTABLE_PROPERTIES:
+        if name == "CATEGORIES":
+            categories: list[str] = []
+            for value in _property_values(event, name):
+                items = getattr(value, "cats", None)
+                if items is None:
+                    categories.append(str(value))
+                else:
+                    categories.extend(str(item) for item in items)
+            if categories:
+                lines.append(f"{name}: {_portable_text(', '.join(categories))}")
+            continue
+        for value in _property_values(event, name):
+            text = _portable_text(value)
+            if text:
+                lines.append(f"{name}: {text}")
+
+    for component in event.subcomponents:
+        if component.name != "VALARM":
+            continue
+        trigger = component.get("TRIGGER")
+        if trigger is not None:
+            lines.append(f"VALARM TRIGGER: {_portable_text(_ical_text(trigger))}")
+    return lines
+
+
+def _portable_bounds(description: str) -> tuple[int, int] | None:
+    starts: list[tuple[int, int]] = []
+    ends: list[tuple[int, int]] = []
+    offset = 0
+    for line in description.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        if PORTABLE_START in content or PORTABLE_END in content:
+            if content == PORTABLE_START:
+                starts.append((offset, offset + len(line)))
+            elif content == PORTABLE_END:
+                ends.append((offset, offset + len(line)))
+            else:
+                raise EventError(
+                    "the description contains a portable delimiter that is not on its own line",
+                    exits.USAGE,
+                )
+        offset += len(line)
+
+    if not starts and not ends:
+        return None
+    if len(starts) != 1 or len(ends) != 1:
+        raise EventError(
+            "the description contains duplicate, nested, or unpaired portable delimiters",
+            exits.USAGE,
+        )
+    start, _ = starts[0]
+    end_start, end = ends[0]
+    if end_start < start:
+        raise EventError(
+            "the description contains reversed portable delimiters", exits.USAGE
+        )
+    return start, end
+
+
+def _portable_description(description: str, event: Any) -> str:
+    """Replace or append the canonical structured-field compatibility block."""
+    bounds = _portable_bounds(description)
+    block = "\n".join((PORTABLE_START, *_portable_lines(event), PORTABLE_END))
+    if bounds is not None:
+        start, end = bounds
+        suffix = description[end:]
+        return description[:start] + block + ("\n" if suffix else "") + suffix
+    prose = description.rstrip("\r\n")
+    return block if not prose else f"{prose}\n\n{block}"
+
+
+def _description(event: Any) -> str:
+    values = _property_values(event, "DESCRIPTION")
+    return "\n".join(str(value) for value in values)
+
+
+def _set_description(event: Any, description: str) -> None:
+    event.pop("DESCRIPTION", None)
+    event.add("description", description)
 
 
 def _optional_fields(
@@ -148,14 +255,15 @@ def build_event(
     color: str = "",
     related_to: tuple[str, ...] = (),
     alarms: tuple[str, ...] = (),
+    portable_description: bool = False,
     now: dt.datetime | None = None,
     sequence: int = 0,
 ) -> str:
     """Serialize one simple VEVENT.
 
-    Deliberately narrow: no recurrence, no attendees, no alarms. Those are
-    refused rather than half-modelled, because writing a structure this tool
-    does not understand is how an update silently destroys what it did not read.
+    Deliberately narrow: no recurrence or attendees. Those are refused rather
+    than half-modelled, because writing a structure this tool does not understand
+    is how an update silently destroys what it did not read.
     """
     start = _stamp(start)
     end = _stamp(end)
@@ -186,11 +294,19 @@ def build_event(
         related_to=related_to,
         alarms=alarms,
     )
+    if portable_description:
+        _set_description(event, _portable_description(description, event))
     calendar.add_component(event)
     return calendar.to_ical().decode("utf-8")
 
 
-def patch_event(raw: bytes, changes: dict[str, Any], *, now: dt.datetime | None = None) -> str:
+def patch_event(
+    raw: bytes,
+    changes: dict[str, Any],
+    *,
+    portable_description: bool = False,
+    now: dt.datetime | None = None,
+) -> str:
     """Apply named changes to a stored event, preserving everything else.
 
     The whole resource is reparsed and re-serialized, and only the requested
@@ -240,6 +356,9 @@ def patch_event(raw: bytes, changes: dict[str, Any], *, now: dt.datetime | None 
         event.pop(key, None)
         event.add(key, value)
 
+    if portable_description:
+        _set_description(event, _portable_description(_description(event), event))
+
     start = getattr(event.get("DTSTART"), "dt", None)
     end = getattr(event.get("DTEND"), "dt", None)
     if isinstance(start, dt.datetime) and isinstance(end, dt.datetime) and end <= start:
@@ -274,6 +393,7 @@ def plan_create(
     color: str = "",
     related_to: tuple[str, ...] = (),
     alarms: tuple[str, ...] = (),
+    portable_description: bool = False,
 ) -> plans.Plan:
     if not profiles.in_scope(calendar_href, list(profile.calendars)):
         raise CalendarError(
@@ -297,11 +417,16 @@ def plan_create(
         color=color,
         related_to=related_to,
         alarms=alarms,
+        portable_description=portable_description,
+    )
+    href = _resource_href(calendar_href, uid)
+    planned = events._describe(
+        payload.encode("utf-8"), calendar_href=calendar_href, href=href, etag=""
     )
     return plans.write(
         profile=profile.name,
         action="cal.create",
-        href=_resource_href(calendar_href, uid),
+        href=href,
         etag="",
         summary=summary,
         payload=payload.encode("utf-8"),
@@ -311,6 +436,9 @@ def plan_create(
             "uid": uid,
             "start": events._utc(start),
             "end": events._utc(end),
+            "url": planned.url,
+            "status": planned.status,
+            "portable_description": portable_description,
         },
     )
 
@@ -321,6 +449,7 @@ def plan_update(
     session: Session,
     href: str,
     changes: dict[str, Any],
+    portable_description: bool = False,
 ) -> plans.Plan:
     reference, raw = events.fetch(profile, session=session, href=href)
     if not reference.etag:
@@ -329,7 +458,7 @@ def plan_update(
             "conditional and could overwrite a concurrent change",
             exits.MALFORMED_RESPONSE,
         )
-    payload = patch_event(raw, changes)
+    payload = patch_event(raw, changes, portable_description=portable_description)
     updated = events._describe(
         payload.encode("utf-8"),
         calendar_href=reference.calendar_href,
@@ -349,6 +478,9 @@ def plan_update(
             "uid": reference.uid,
             "start": updated.start,
             "end": updated.end,
+            "url": updated.url,
+            "status": updated.status,
+            "portable_description": portable_description,
         },
     )
 
@@ -394,6 +526,17 @@ def _same_instant(stored: str, planned: str) -> bool:
         return dt.datetime.strptime(stored, fmt) == dt.datetime.strptime(planned, fmt)
     except ValueError:
         return False
+
+
+def _description_from_raw(raw: bytes) -> str:
+    try:
+        calendar = icalendar.Calendar.from_ical(raw)
+    except (ValueError, IndexError) as exc:
+        raise EventError("the stored event is not valid iCalendar") from exc
+    targets = [item for item in calendar.walk() if item.name == "VEVENT"]
+    if not targets:
+        raise EventError("the stored resource holds no VEVENT")
+    return _description(targets[0])
 
 
 def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]:
@@ -457,17 +600,29 @@ def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]
 
     # A server may accept a PUT and still rewrite or drop part of it, so the
     # mutation is not established until the stored resource says what was asked.
-    stored, _ = events.fetch(profile, session=session, href=plan.href)
+    stored, stored_raw = events.fetch(profile, session=session, href=plan.href)
     result["etag"] = stored.etag
     result["summary"] = stored.summary
     result["start"] = stored.start
-    result["verified"] = stored.summary == plan.summary and _same_instant(
-        stored.start, str(plan.details.get("start", ""))
-    )
+    result["url"] = stored.url
+    result["status"] = stored.status
+    mismatches: list[str] = []
+    if stored.summary != plan.summary:
+        mismatches.append(f"summary {stored.summary!r} != {plan.summary!r}")
+    if not _same_instant(stored.start, str(plan.details.get("start", ""))):
+        mismatches.append(f"start {stored.start!r} != {plan.details.get('start', '')!r}")
+    for field in ("url", "status"):
+        if field in plan.details and getattr(stored, field) != plan.details[field]:
+            mismatches.append(f"{field} {getattr(stored, field)!r} != {plan.details[field]!r}")
+    if plan.details.get("portable_description"):
+        expected_description = _description_from_raw(plans.payload_bytes(plan))
+        if _description_from_raw(stored_raw) != expected_description:
+            mismatches.append("portable description differs from the planned projection")
+        result["portable_description_verified"] = True
+    result["verified"] = not mismatches
     if not result["verified"]:
         raise EventError(
-            f"the server stored something different at {plan.href}: it reports summary "
-            f"{stored.summary!r} starting {stored.start!r}",
+            f"the server stored something different at {plan.href}: " + "; ".join(mismatches),
             exits.OUTCOME_UNCERTAIN,
         )
     plans.consume(plan.plan_id)

@@ -39,9 +39,12 @@ READ
 
   The window is required, and times need an explicit UTC offset: a local time
   is ambiguous across one DST transition each year and nonexistent across the
-  other. An event carrying structure this release will not rewrite — a
-  recurrence rule, attendees, an alarm — is listed with what makes it
-  unwritable. It can be read; it cannot be edited here.
+  other. JSON event references include `url` and `status`, using an empty value
+  when the VEVENT property is absent. Human `cal show` displays the URL, while
+  a cancelled event is marked in a human listing without putting links on every
+  row. An event carrying structure this release will not rewrite — a recurrence
+  rule or attendees — is listed with what makes it unwritable. It can be read;
+  it cannot be edited here.
 
 REACH ALLOWLISTED FILES
   ncl files list <collection-href>  List one collection, without recursion.
@@ -77,6 +80,20 @@ CHANGE NOTHING BY ACCIDENT
   from whoever read the preview or from the agent that produced it. Where a
   human's approval is genuinely required, stop after planning and wait to be
   told to continue.
+
+  `cal create` and `cal update` accept `--portable-description` when a caller
+  wants selected structured fields copied into a deterministic plain-text block
+  in DESCRIPTION. The block contains LOCATION, URL, STATUS, CATEGORIES,
+  PRIORITY, TRANSP, CLASS, and VALARM trigger values in that order. It is an
+  opt-in compatibility projection: the VEVENT properties remain canonical, a
+  URL is never fetched, and prose outside the tool-owned block survives. A
+  malformed, duplicated, nested, reversed, or unpaired block is refused.
+
+  On update, omitting `--alarm` preserves existing reminders, `--alarm` replaces
+  them with the repeatable offsets supplied, and `--clear-alarms` removes all of
+  them. The two options are mutually exclusive. A calendar client may still
+  hide URL or other structured fields; the projection only makes them readable
+  to more clients and cannot force a client to display them.
 
 WHAT IT REFUSES
   Scope is an allowlist of hrefs in configuration. The server issues no scoped

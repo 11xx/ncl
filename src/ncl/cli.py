@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -93,6 +94,25 @@ def _add_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _normalize_alarm_values(argv: list[str]) -> list[str]:
+    """Keep duration values beginning with ``-`` attached to ``--alarm``."""
+    normalized: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if (
+            token == "--alarm"
+            and index + 1 < len(argv)
+            and argv[index + 1].startswith("-P")
+        ):
+            normalized.append(f"--alarm={argv[index + 1]}")
+            index += 2
+            continue
+        normalized.append(token)
+        index += 1
+    return normalized
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(
         prog="ncl",
@@ -153,7 +173,10 @@ def build_parser() -> argparse.ArgumentParser:
     cal_list = cal_commands.add_parser("list", help="Discover calendars, with href and scope")
     _add_options(cal_list)
 
-    cal_events = cal_commands.add_parser("events", help="List events overlapping a required window")
+    cal_events = cal_commands.add_parser(
+        "events",
+        help="List events with structured URL/status over a required window",
+    )
     _add_options(cal_events)
     cal_events.add_argument("calendar", help="Calendar href, or an unambiguous display name")
     cal_events.add_argument(
@@ -163,7 +186,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--to", dest="end", required=True, help="End instant, ISO 8601 with an offset"
     )
 
-    cal_show = cal_commands.add_parser("show", help="Read one event by href")
+    cal_show = cal_commands.add_parser(
+        "show", help="Read one event by href, including its structured URL/status"
+    )
     _add_options(cal_show)
     cal_show.add_argument("href", help="Event resource href")
 
@@ -213,6 +238,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--alarm", action="append", default=[], dest="alarms",
         help="Reminder offset, e.g. -PT15M or -P1D; repeatable",
     )
+    cal_create.add_argument(
+        "--portable-description", action="store_true",
+        help="Project structured fields into a deterministic DESCRIPTION block",
+    )
     cal_update = cal_commands.add_parser(
         "update", help="Plan a change to one event; changes nothing yet"
     )
@@ -239,9 +268,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--related-to", action="append", dest="related_to",
         help="Replace the UIDs this event belongs with; repeatable",
     )
-    cal_update.add_argument(
+    alarm_options = cal_update.add_mutually_exclusive_group()
+    alarm_options.add_argument(
         "--alarm", action="append", dest="alarms",
-        help="Replace reminders, e.g. -PT15M; repeatable",
+        help=(
+            "Replace reminders with these offsets; repeatable (omission preserves), "
+            "e.g. --alarm=-PT15M"
+        ),
+    )
+    alarm_options.add_argument(
+        "--clear-alarms", action="store_true",
+        help="Remove every reminder; mutually exclusive with --alarm",
+    )
+    cal_update.add_argument(
+        "--portable-description", action="store_true",
+        help="Regenerate the deterministic DESCRIPTION compatibility block",
     )
 
     cal_delete = cal_commands.add_parser("delete", help="Plan a deletion; changes nothing yet")
@@ -453,7 +494,8 @@ def _run_cal(args: argparse.Namespace) -> int:
             _json({"events": [event.as_dict() for event in found]})
         else:
             for event in found:
-                flag = "" if event.writable else f"  [{', '.join(event.unsupported)}]"
+                status = "  [CANCELLED]" if event.status.upper() == "CANCELLED" else ""
+                flag = status if event.writable else status + f"  [{', '.join(event.unsupported)}]"
                 render.emit(f"{event.start} .. {event.end}  {event.summary}{flag}")
                 render.emit(f"      {event.href}")
         return exits.OK
@@ -486,6 +528,7 @@ def _run_cal(args: argparse.Namespace) -> int:
             color=args.color,
             related_to=tuple(args.related_to),
             alarms=tuple(args.alarms),
+            portable_description=args.portable_description,
         )
         return _emit_plan(plan, args.json)
 
@@ -517,11 +560,19 @@ def _run_cal(args: argparse.Namespace) -> int:
             changes["COLOR"] = args.color
         if args.related_to is not None:
             changes["RELATED-TO"] = args.related_to
-        if args.alarms is not None:
-            changes["VALARM"] = args.alarms
-        if not changes:
+        if args.clear_alarms:
+            changes["VALARM"] = ()
+        elif args.alarms is not None:
+            changes["VALARM"] = tuple(args.alarms)
+        if not changes and not args.portable_description:
             raise events.EventError("no changes were requested", exits.USAGE)
-        plan = mutate.plan_update(profile, session=transport, href=args.href, changes=changes)
+        plan = mutate.plan_update(
+            profile,
+            session=transport,
+            href=args.href,
+            changes=changes,
+            portable_description=args.portable_description,
+        )
         return _emit_plan(plan, args.json)
 
     if args.cal_command == "delete":
@@ -639,7 +690,7 @@ def _run_apply(args: argparse.Namespace) -> int:
 
 def _main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(_normalize_alarm_values(sys.argv[1:] if argv is None else argv))
     json_output = bool(args.json)
 
     try:
