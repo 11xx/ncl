@@ -62,11 +62,21 @@ class FakeSession:
         return self.responses.pop(0)
 
 
+def _apply_bundle(plan, transport):
+    with plans.claim(plan.plan_id):
+        return plans.apply(
+            PROFILE,
+            session=transport,
+            plan=plan,
+            dispatchers=cli._dispatchers(),
+        )
+
+
 def response(
     status: int,
     body: bytes = b"",
     headers: Mapping[str, str] | None = None,
-    url: str = ROOT,
+    url: str = "",
 ) -> Response:
     return Response(status, headers or {}, body, url)
 
@@ -221,9 +231,9 @@ def test_write_planning_freezes_an_if_match_replacement_without_putting():
     )
 
     assert [request["method"] for request in transport.requests] == ["PROPFIND"]
-    assert plan.action == "files.write"
-    assert plan.etag == '"v1"'
-    assert plans.payload_bytes(plan) == b"replacement"
+    assert plan.steps[0].action == "files.write"
+    assert plan.steps[0].etag == '"v1"'
+    assert plans.payload_bytes(plan.steps[0]) == b"replacement"
 
 
 def test_write_planning_freezes_an_if_none_match_creation():
@@ -233,8 +243,8 @@ def test_write_planning_freezes_an_if_none_match_creation():
         href=SCRIPT,
         content=b"new",
     )
-    assert plan.etag == ""
-    assert plan.details["exists"] is False
+    assert plan.steps[0].etag == ""
+    assert plan.steps[0].details["exists"] is False
 
 
 def test_apply_conditionally_writes_and_verifies_exact_readback():
@@ -250,7 +260,7 @@ def test_apply_conditionally_writes_and_verifies_exact_readback():
         response(200, b"new", {"ETag": '"stored"', "Content-Type": "application/json"}),
     )
 
-    result = files.apply(PROFILE, session=transport, plan=plan)
+    result = _apply_bundle(plan, transport)
 
     put = transport.requests[0]
     assert put["method"] == "PUT"
@@ -271,7 +281,7 @@ def test_apply_keeps_a_plan_when_readback_differs():
     transport = FakeSession(response(201), response(200, b"changed"))
 
     with pytest.raises(files.FileError) as error:
-        files.apply(PROFILE, session=transport, plan=plan)
+        _apply_bundle(plan, transport)
     assert error.value.code == exits.OUTCOME_UNCERTAIN
     assert plans.read(plan.plan_id).plan_id == plan.plan_id
 
@@ -285,7 +295,7 @@ def test_delete_is_conditional_and_verified_missing():
     )
     transport = FakeSession(response(204), response(404))
 
-    result = files.apply(PROFILE, session=transport, plan=plan)
+    result = _apply_bundle(plan, transport)
 
     assert transport.requests[0]["headers"] == {"If-Match": '"v1"'}
     assert result["verified"] == "deleted"
@@ -339,9 +349,9 @@ def test_cli_write_returns_a_frozen_plan_without_sending_put(
 
     assert code == exits.CONFIRMATION_REQUIRED
     rendered = json.loads(capsys.readouterr().out)
-    assert rendered["plan"]["action"] == "files.write"
-    assert rendered["plan"]["payload_bytes"] == len(source.read_bytes())
-    assert "payload" not in rendered["plan"]
+    assert rendered["plan"]["steps"][0]["action"] == "files.write"
+    assert rendered["plan"]["steps"][0]["payload_bytes"] == len(source.read_bytes())
+    assert "payload" not in rendered["plan"]["steps"][0]
     assert [request["method"] for request in transport.requests] == ["PROPFIND"]
 
 

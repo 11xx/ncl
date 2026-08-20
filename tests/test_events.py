@@ -89,6 +89,30 @@ def _ref(raw=RICH, etag='"v1"'):
     )
 
 
+def _apply_bundle(plan, transport):
+    with plans.claim(plan.plan_id):
+        return plans.apply(
+            PROFILE,
+            session=transport,
+            plan=plan,
+            dispatchers=cli._dispatchers(),
+        )
+
+
+def _write(**kwargs):
+    payload = kwargs.pop("payload", b"")
+    ttl = kwargs.pop("ttl", plans.DEFAULT_TTL_SECONDS)
+    now = kwargs.pop("now", None)
+    summary = kwargs.pop("summary")
+    return plans.write_bundle(
+        profile=kwargs.pop("profile"),
+        summary=summary,
+        steps=(plans.freeze_step(payload=payload, summary=summary, **kwargs),),
+        ttl=ttl,
+        now=now,
+    )
+
+
 def test_an_event_carrying_unmodelled_structure_is_reported_unwritable():
     reference = _ref(RECURRING)
     assert reference.recurring is True
@@ -644,13 +668,13 @@ def test_create_plan_and_apply_verify_url_status_and_portable_description():
         status="cancelled",
         portable_description=True,
     )
-    stored = plans.payload_bytes(plan)
+    stored = plans.payload_bytes(plan.steps[0])
     transport = _SequenceEventSession(
         _EventResponse(b"", status=201),
         _EventResponse(stored, etag='"v2"'),
     )
 
-    result = mutate.apply(PROFILE, session=transport, plan=plan)
+    result = _apply_bundle(plan, transport)
 
     assert [request["method"] for request in transport.requests] == ["PUT", "GET"]
     assert result["url"] == "https://example.invalid/created"
@@ -669,7 +693,7 @@ def test_create_readback_verifies_the_planned_end():
         start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
         end=dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
     )
-    altered = plans.payload_bytes(plan).replace(
+    altered = plans.payload_bytes(plan.steps[0]).replace(
         b"DTEND:20260901T120000Z", b"DTEND:20260901T130000Z"
     )
     transport = _SequenceEventSession(
@@ -678,7 +702,7 @@ def test_create_readback_verifies_the_planned_end():
     )
 
     with pytest.raises(events.EventError) as error:
-        mutate.apply(PROFILE, session=transport, plan=plan)
+        _apply_bundle(plan, transport)
 
     assert error.value.code == exits.OUTCOME_UNCERTAIN
     assert plans.read(plan.plan_id).plan_id == plan.plan_id
@@ -701,13 +725,13 @@ def test_update_plan_and_apply_verify_changed_structured_fields_and_projection()
         changes={"URL": "https://example.invalid/new", "STATUS": "CANCELLED"},
         portable_description=True,
     )
-    stored = plans.payload_bytes(plan)
+    stored = plans.payload_bytes(plan.steps[0])
     transport = _SequenceEventSession(
         _EventResponse(b"", status=204),
         _EventResponse(stored, etag='"v2"'),
     )
 
-    result = mutate.apply(PROFILE, session=transport, plan=plan)
+    result = _apply_bundle(plan, transport)
 
     assert result["url"] == "https://example.invalid/new"
     assert result["status"] == "CANCELLED"
@@ -782,14 +806,14 @@ def test_calendar_readback_keeps_unknown_nested_and_end_content(alter):
         href=CAL + "keep-me.ics",
         changes={"SUMMARY": "Renamed"},
     )
-    altered = alter(plans.payload_bytes(plan))
+    altered = alter(plans.payload_bytes(plan.steps[0]))
     transport = _SequenceEventSession(
         _EventResponse(b"", status=204),
         _EventResponse(altered, etag='"v2"'),
     )
 
     with pytest.raises(events.EventError) as error:
-        mutate.apply(PROFILE, session=transport, plan=plan)
+        _apply_bundle(plan, transport)
 
     assert error.value.code == exits.OUTCOME_UNCERTAIN
     assert plans.read(plan.plan_id).plan_id == plan.plan_id
@@ -802,7 +826,7 @@ def test_calendar_readback_compares_semantic_content_not_property_order():
         href=CAL + "keep-me.ics",
         changes={"SUMMARY": "Renamed"},
     )
-    lines = plans.payload_bytes(plan).decode("utf-8").splitlines(keepends=True)
+    lines = plans.payload_bytes(plan.steps[0]).decode("utf-8").splitlines(keepends=True)
     summary_index = next(index for index, line in enumerate(lines) if line.startswith("SUMMARY:"))
     custom_index = next(
         index for index, line in enumerate(lines) if line.startswith("X-CUSTOM-FIELD:")
@@ -813,7 +837,7 @@ def test_calendar_readback_compares_semantic_content_not_property_order():
         _EventResponse("".join(lines).encode("utf-8"), etag='"v2"'),
     )
 
-    result = mutate.apply(PROFILE, session=transport, plan=plan)
+    result = _apply_bundle(plan, transport)
 
     assert result["verified"] is True
     with pytest.raises(plans.PlanError):
@@ -837,13 +861,13 @@ def test_calendar_readback_ignores_category_member_order():
         href=CAL + "categories.ics",
         changes={"SUMMARY": "Renamed"},
     )
-    stored = plans.payload_bytes(plan).replace(b"CATEGORIES:A,B", b"CATEGORIES:B,A")
+    stored = plans.payload_bytes(plan.steps[0]).replace(b"CATEGORIES:A,B", b"CATEGORIES:B,A")
     transport = _SequenceEventSession(
         _EventResponse(b"", status=204),
         _EventResponse(stored, etag='"v2"'),
     )
 
-    result = mutate.apply(PROFILE, session=transport, plan=plan)
+    result = _apply_bundle(plan, transport)
 
     assert result["verified"] is True
     with pytest.raises(plans.PlanError):
@@ -857,14 +881,14 @@ def test_calendar_readback_refuses_a_missing_category_member():
         href=CAL + "categories.ics",
         changes={"SUMMARY": "Renamed"},
     )
-    stored = plans.payload_bytes(plan).replace(b"CATEGORIES:A,B", b"CATEGORIES:A")
+    stored = plans.payload_bytes(plan.steps[0]).replace(b"CATEGORIES:A,B", b"CATEGORIES:A")
     transport = _SequenceEventSession(
         _EventResponse(b"", status=204),
         _EventResponse(stored, etag='"v2"'),
     )
 
     with pytest.raises(events.EventError) as error:
-        mutate.apply(PROFILE, session=transport, plan=plan)
+        _apply_bundle(plan, transport)
 
     assert error.value.code == exits.OUTCOME_UNCERTAIN
     assert plans.read(plan.plan_id).plan_id == plan.plan_id
@@ -917,7 +941,9 @@ def test_calendar_put_refuses_redirect_before_following_it(action, monkeypatch):
     transport = _HttpTransport(
         _http_response(307, headers={"Location": other}),
         _http_response(success_status),
-        _http_response(200, body=plans.payload_bytes(plan), headers={"ETag": '"v2"'}),
+        _http_response(
+            200, body=plans.payload_bytes(plan.steps[0]), headers={"ETag": '"v2"'}
+        ),
     )
     monkeypatch.setattr(
         http_session.secrets,
@@ -926,15 +952,11 @@ def test_calendar_put_refuses_redirect_before_following_it(action, monkeypatch):
     )
 
     with pytest.raises(http_session.SessionError) as error:
-        mutate.apply(
-            PROFILE,
-            session=http_session.Session(PROFILE, transport=transport),
-            plan=plan,
-        )
+        _apply_bundle(plan, http_session.Session(PROFILE, transport=transport))
 
     assert error.value.code == exits.MALFORMED_RESPONSE
     assert [request["method"] for request in transport.requests] == ["PUT"]
-    assert transport.requests[0]["url"] == plan.href
+    assert transport.requests[0]["url"] == plan.steps[0].href
     assert plans.read(plan.plan_id).plan_id == plan.plan_id
 
 
@@ -950,7 +972,9 @@ def test_calendar_readback_redirect_is_outcome_uncertain_without_following_it(mo
     transport = _HttpTransport(
         _http_response(201),
         _http_response(307, headers={"Location": other}),
-        _http_response(200, body=plans.payload_bytes(plan), headers={"ETag": '"v2"'}),
+        _http_response(
+            200, body=plans.payload_bytes(plan.steps[0]), headers={"ETag": '"v2"'}
+        ),
     )
     monkeypatch.setattr(
         http_session.secrets,
@@ -959,15 +983,11 @@ def test_calendar_readback_redirect_is_outcome_uncertain_without_following_it(mo
     )
 
     with pytest.raises(events.EventError) as error:
-        mutate.apply(
-            PROFILE,
-            session=http_session.Session(PROFILE, transport=transport),
-            plan=plan,
-        )
+        _apply_bundle(plan, http_session.Session(PROFILE, transport=transport))
 
     assert error.value.code == exits.OUTCOME_UNCERTAIN
     assert [request["method"] for request in transport.requests] == ["PUT", "GET"]
-    assert all(request["url"] == plan.href for request in transport.requests)
+    assert all(request["url"] == plan.steps[0].href for request in transport.requests)
     assert plans.read(plan.plan_id).plan_id == plan.plan_id
 
 
@@ -986,7 +1006,7 @@ def test_calendar_delete_refuses_redirect_without_following_it():
     )
 
     with pytest.raises(events.EventError) as error:
-        mutate.apply(PROFILE, session=transport, plan=plan)
+        _apply_bundle(plan, transport)
 
     assert error.value.code == exits.MALFORMED_RESPONSE
     assert [request["method"] for request in transport.requests] == ["DELETE"]
@@ -1005,7 +1025,7 @@ def test_calendar_delete_keeps_plan_when_exact_href_persists():
     )
 
     with pytest.raises(events.EventError) as error:
-        mutate.apply(PROFILE, session=transport, plan=plan)
+        _apply_bundle(plan, transport)
 
     assert error.value.code == exits.OUTCOME_UNCERTAIN
     assert [request["method"] for request in transport.requests] == ["DELETE", "GET"]
@@ -1023,7 +1043,7 @@ def test_calendar_delete_consumes_only_after_exact_href_returns_404():
         _EventResponse(b"", status=404),
     )
 
-    result = mutate.apply(PROFILE, session=transport, plan=plan)
+    result = _apply_bundle(plan, transport)
 
     assert result["verified"] == "deleted"
     with pytest.raises(plans.PlanError) as error:
@@ -1153,11 +1173,13 @@ def test_cli_create_and_apply_expose_plan_and_readback_verification(
     plan = plans.read(planned["plan"]["plan_id"])
 
     assert code == exits.CONFIRMATION_REQUIRED
-    assert planned["plan"]["action"] == "cal.create"
-    assert "URL: https://example.invalid/cli" in _description(plans.payload_bytes(plan))
-    assert "STATUS: CANCELLED" in _description(plans.payload_bytes(plan))
+    assert planned["plan"]["steps"][0]["action"] == "cal.create"
+    assert "URL: https://example.invalid/cli" in _description(
+        plans.payload_bytes(plan.steps[0])
+    )
+    assert "STATUS: CANCELLED" in _description(plans.payload_bytes(plan.steps[0]))
 
-    stored = plans.payload_bytes(plan)
+    stored = plans.payload_bytes(plan.steps[0])
     monkeypatch.setattr(
         cli.session,
         "Session",
@@ -1252,7 +1274,7 @@ def test_a_query_window_must_move_forwards():
 
 def test_an_expired_plan_is_stale_rather_than_applied(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
-    plan = plans.write(
+    plan = _write(
         profile="home",
         action="cal.create",
         href=CAL + "x.ics",
@@ -1271,7 +1293,7 @@ def test_an_expired_plan_is_stale_rather_than_applied(tmp_path, monkeypatch):
 
 def test_a_plan_round_trips_and_is_consumed_once(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
-    plan = plans.write(
+    plan = _write(
         profile="home",
         action="cal.delete",
         href=CAL + "x.ics",
@@ -1279,7 +1301,7 @@ def test_a_plan_round_trips_and_is_consumed_once(tmp_path, monkeypatch):
         summary="s",
         details={"uid": "x", "start": "", "end": ""},
     )
-    assert plans.read(plan.plan_id).etag == '"v1"'
+    assert plans.read(plan.plan_id).steps[0].etag == '"v1"'
     assert [item.plan_id for item in plans.listing()] == [plan.plan_id]
     plans.consume(plan.plan_id)
     assert plans.listing() == []
@@ -1290,7 +1312,7 @@ def test_a_plan_round_trips_and_is_consumed_once(tmp_path, monkeypatch):
 
 def test_a_plan_payload_is_not_echoed_in_its_summary_view(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
-    plan = plans.write(
+    plan = _write(
         profile="home",
         action="cal.create",
         href=CAL + "x.ics",
@@ -1301,12 +1323,12 @@ def test_a_plan_payload_is_not_echoed_in_its_summary_view(tmp_path, monkeypatch)
         details={"uid": "x", "start": "", "end": ""},
     )
     assert "payload" not in plan.as_dict()
-    assert plan.as_dict()["payload_bytes"] > 0
+    assert plan.as_dict()["steps"][0]["payload_bytes"] > 0
 
 
 def test_a_plan_round_trips_arbitrary_bytes(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
-    plan = plans.write(
+    plan = _write(
         profile="home",
         action="files.write",
         href="https://cloud.example.invalid/remote.php/dav/files/alice/blob",
@@ -1316,7 +1338,7 @@ def test_a_plan_round_trips_arbitrary_bytes(tmp_path, monkeypatch):
         content_type="application/octet-stream",
     )
 
-    assert plans.payload_bytes(plans.read(plan.plan_id)) == b"\x00\xff\n"
+    assert plans.payload_bytes(plans.read(plan.plan_id).steps[0]) == b"\x00\xff\n"
 
 
 def test_cli_apply_claims_before_loading_and_dispatching_a_plan(monkeypatch):
@@ -1338,7 +1360,7 @@ def test_cli_apply_claims_before_loading_and_dispatching_a_plan(monkeypatch):
         or SimpleNamespace(plan_id=plan_id, profile="home", action="cal.create"),
     )
     monkeypatch.setattr(cli.session, "Session", lambda profile: object())
-    monkeypatch.setattr(mutate, "apply", lambda *args, **kwargs: order.append("apply") or {})
+    monkeypatch.setattr(plans, "apply", lambda *args, **kwargs: order.append("apply") or {})
 
     assert cli._run_apply(SimpleNamespace(plan_id="stale", json=True)) == exits.OK
     assert order == ["claim", "read", "apply"]
@@ -1383,7 +1405,7 @@ def test_plan_claim_unlinks_the_lock_before_closing_its_descriptor(monkeypatch):
 
 def test_cli_apply_reports_locked_and_missing_plans_after_claiming(monkeypatch):
     monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
-    plan = plans.write(
+    plan = _write(
         profile="home",
         action="cal.delete",
         href=CAL + "keep-me.ics",
@@ -1402,7 +1424,7 @@ def test_cli_apply_reports_locked_and_missing_plans_after_claiming(monkeypatch):
 
 
 def test_cli_apply_rechecks_a_plan_consumed_while_claiming(monkeypatch):
-    plan = plans.write(
+    plan = _write(
         profile="home",
         action="cal.delete",
         href=CAL + "keep-me.ics",
@@ -1434,7 +1456,7 @@ def test_cli_apply_rechecks_a_plan_consumed_while_claiming(monkeypatch):
 
 
 def test_plan_cancel_json_is_structured(capsys):
-    plan = plans.write(
+    plan = _write(
         profile="home",
         action="cal.delete",
         href=CAL + "keep-me.ics",
@@ -1443,7 +1465,11 @@ def test_plan_cancel_json_is_structured(capsys):
     )
 
     assert cli.main(["plan", "cancel", plan.plan_id, "--json"]) == exits.OK
-    assert json.loads(capsys.readouterr().out) == {"cancelled": plan.plan_id}
+    assert json.loads(capsys.readouterr().out) == {
+        "cancelled": plan.plan_id,
+        "remote_effects_undone": False,
+        "warning": "Verified remote effects were not undone.",
+    }
 
 
 @pytest.mark.parametrize("priority", [0, 10])

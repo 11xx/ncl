@@ -62,8 +62,19 @@ Exact event reads and calendar `PUT`/`DELETE` requests refuse redirects before
 following them. A redirect before a mutation reaches a second target is a
 malformed response. A calendar deletion is established only when the exact
 href returns 404 after the `DELETE`; a redirect, persistent resource, or
-malformed or unexpected post-write readback is outcome-uncertain, and the plan
-remains pending so the caller can reconcile instead of blindly retrying.
+malformed or unexpected post-write readback is outcome-uncertain. The uncertain
+step blocks the ordered plan until `ncl plan reconcile <plan-id>` reads the
+exact href. Reconciliation compares semantic iCalendar content: an exact
+planned create or update is verified, a missing create or an update with its
+old strong ETag and different content is pending, and changed conflicting state
+remains uncertain. A missing delete is verified; its old strong ETag still
+present is pending. Reconciliation reads only.
+
+Plans execute steps in order, record each verified step durably, stop on the
+first failure, and never roll back a verified remote effect. Applying resumes
+by skipping verified steps. Partial plans do not expire, while untouched plans
+retain their short freshness window. Cancelling a partial plan removes local
+progress but does not undo remote effects.
 `cal update --from` and `--to` accept `YYYY-MM-DD` when both boundaries are
 explicitly supplied to convert an event between all-day and timed forms; mixed
 boundary types and non-exclusive all-day ends are refused before a plan is

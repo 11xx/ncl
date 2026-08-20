@@ -13,7 +13,7 @@ from typing import Any
 
 import icalendar
 
-from . import events, exits, ical_semantics, plans, profiles
+from . import etag, events, exits, ical_semantics, plans, profiles
 from .caldav import CalendarError
 from .events import EventError
 from .session import Session, SessionError
@@ -458,24 +458,29 @@ def plan_create(
     planned = events._describe(
         payload.encode("utf-8"), calendar_href=calendar_href, href=href, etag=""
     )
-    return plans.write(
+    return plans.write_bundle(
         profile=profile.name,
-        action="cal.create",
-        href=href,
-        etag="",
         summary=summary,
-        payload=payload.encode("utf-8"),
-        content_type="text/calendar; charset=utf-8",
-        details={
-            "calendar_href": calendar_href,
-            "uid": uid,
-            "start": events._utc(start),
-            "end": events._utc(end),
-            "all_day": planned.all_day,
-            "url": planned.url,
-            "status": planned.status,
-            "portable_description": portable_description,
-        },
+        steps=(
+            plans.freeze_step(
+                action="cal.create",
+                href=href,
+                etag="",
+                summary=summary,
+                payload=payload.encode("utf-8"),
+                content_type="text/calendar; charset=utf-8",
+                details={
+                    "calendar_href": calendar_href,
+                    "uid": uid,
+                    "start": events._utc(start),
+                    "end": events._utc(end),
+                    "all_day": planned.all_day,
+                    "url": planned.url,
+                    "status": planned.status,
+                    "portable_description": portable_description,
+                },
+            ),
+        ),
     )
 
 
@@ -511,24 +516,29 @@ def plan_update(
         href=reference.href,
         etag=etag,
     )
-    return plans.write(
+    return plans.write_bundle(
         profile=profile.name,
-        action="cal.update",
-        href=reference.href,
-        etag=etag,
         summary=updated.summary,
-        payload=payload.encode("utf-8"),
-        content_type="text/calendar; charset=utf-8",
-        details={
-            "calendar_href": reference.calendar_href,
-            "uid": reference.uid,
-            "start": updated.start,
-            "end": updated.end,
-            "all_day": updated.all_day,
-            "url": updated.url,
-            "status": updated.status,
-            "portable_description": portable_description,
-        },
+        steps=(
+            plans.freeze_step(
+                action="cal.update",
+                href=reference.href,
+                etag=etag,
+                summary=updated.summary,
+                payload=payload.encode("utf-8"),
+                content_type="text/calendar; charset=utf-8",
+                details={
+                    "calendar_href": reference.calendar_href,
+                    "uid": reference.uid,
+                    "start": updated.start,
+                    "end": updated.end,
+                    "all_day": updated.all_day,
+                    "url": updated.url,
+                    "status": updated.status,
+                    "portable_description": portable_description,
+                },
+            ),
+        ),
     )
 
 
@@ -541,18 +551,23 @@ def plan_delete(profile: Any, *, session: Session, href: str) -> plans.Plan:
             exits.MALFORMED_RESPONSE,
         )
     etag = events.strong_etag(reference.etag)
-    return plans.write(
+    return plans.write_bundle(
         profile=profile.name,
-        action="cal.delete",
-        href=reference.href,
-        etag=etag,
         summary=reference.summary,
-        details={
-            "calendar_href": reference.calendar_href,
-            "uid": reference.uid,
-            "start": reference.start,
-            "end": reference.end,
-        },
+        steps=(
+            plans.freeze_step(
+                action="cal.delete",
+                href=reference.href,
+                etag=etag,
+                summary=reference.summary,
+                details={
+                    "calendar_href": reference.calendar_href,
+                    "uid": reference.uid,
+                    "start": reference.start,
+                    "end": reference.end,
+                },
+            ),
+        ),
     )
 
 
@@ -639,83 +654,98 @@ def _verify_deleted(session: Session, href: str) -> None:
     )
 
 
-def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]:
-    """Execute a frozen plan, conditionally, and read the result back."""
-    if plan.profile != profile.name:
-        raise plans.PlanError(
-            f"plan {plan.plan_id} was made for profile {plan.profile!r}", exits.USAGE
-        )
-    plans.check_fresh(plan)
-    if not profiles.in_scope(plan.href, list(profile.calendars)):
-        raise CalendarError(
-            f"{plan.href} is outside this profile's calendar allowlist", exits.SCOPE_DENIED
-        )
+_ACTIONS = {"cal.create", "cal.update", "cal.delete"}
 
-    if plan.action == "cal.delete":
+
+def validate_step(step: plans.Step) -> None:
+    """Validate calendar step structure without reading the server."""
+    if step.action not in _ACTIONS:
+        raise plans.PlanError(f"unknown calendar plan action {step.action!r}", exits.USAGE)
+    body = plans.payload_bytes(step)
+    if step.action == "cal.delete":
+        if body:
+            raise plans.PlanError(
+                "calendar deletion steps must not carry a payload", exits.PLAN_STALE
+            )
+        events.strong_etag(step.etag)
+        return
+    if not step.content_type or not body:
+        raise plans.PlanError("calendar write steps need content and a payload", exits.PLAN_STALE)
+    if step.action == "cal.create" and step.etag:
+        raise plans.PlanError("calendar creates cannot carry an ETag", exits.PLAN_STALE)
+    if step.action == "cal.update":
+        events.strong_etag(step.etag)
+
+
+def _calendar_target(profile: Any, step: plans.Step) -> str:
+    target = events._canonical(profile, step.href)
+    if not profiles.in_scope(target, list(profile.calendars)):
+        raise CalendarError(
+            f"{target} is outside this profile's calendar allowlist", exits.SCOPE_DENIED
+        )
+    return target
+
+
+def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
+    """Execute one frozen calendar step and verify the exact resource."""
+    validate_step(step)
+    target = _calendar_target(profile, step)
+    if step.action == "cal.delete":
         response = session.request(
             "DELETE",
-            plan.href,
-            headers={"If-Match": plan.etag},
+            target,
+            headers={"If-Match": step.etag},
             max_redirects=0,
         )
-        _refuse_redirect(response, action="deletion", href=plan.href)
-    elif plan.action == "cal.create":
-        # The href derives from a freshly minted UID, so anything already there
-        # is a different event: refuse rather than overwrite it.
+        _refuse_redirect(response, action="deletion", href=target)
+    elif step.action == "cal.create":
         response = session.request(
             "PUT",
-            plan.href,
-            headers={"Content-Type": plan.content_type, "If-None-Match": "*"},
-            data=plans.payload_bytes(plan),
+            target,
+            headers={"Content-Type": step.content_type, "If-None-Match": "*"},
+            data=plans.payload_bytes(step),
             max_redirects=0,
         )
-        _refuse_redirect(response, action="creation", href=plan.href)
-    elif plan.action == "cal.update":
-        # Conditional on the ETag observed while planning, so a change that
-        # landed in between conflicts instead of being silently overwritten.
-        response = session.request(
-            "PUT",
-            plan.href,
-            headers={"Content-Type": plan.content_type, "If-Match": plan.etag},
-            data=plans.payload_bytes(plan),
-            max_redirects=0,
-        )
-        _refuse_redirect(response, action="update", href=plan.href)
+        _refuse_redirect(response, action="creation", href=target)
     else:
-        raise plans.PlanError(f"unknown plan action {plan.action!r}", exits.USAGE)
+        response = session.request(
+            "PUT",
+            target,
+            headers={"Content-Type": step.content_type, "If-Match": step.etag},
+            data=plans.payload_bytes(step),
+            max_redirects=0,
+        )
+        _refuse_redirect(response, action="update", href=target)
 
     if response.status == 412:
         raise plans.PlanError(
-            f"the event at {plan.href} changed since the plan was made; re-plan against "
+            f"the event at {target} changed since the plan was made; re-plan against "
             "its current state",
             exits.CONFLICT,
         )
-    if response.status == 404 and plan.action != "cal.create":
-        raise EventError(f"no event exists at {plan.href}", exits.TARGET_NOT_FOUND)
+    if response.status == 404 and step.action != "cal.create":
+        raise EventError(f"no event exists at {target}", exits.TARGET_NOT_FOUND)
     if response.status not in {200, 201, 204}:
         raise EventError(
-            f"the server refused the {plan.action} with status {response.status}",
+            f"the server refused the {step.action} with status {response.status}",
             exits.SERVER_ERROR,
         )
 
     result: dict[str, Any] = {
-        "action": plan.action,
-        "href": plan.href,
-        "uid": plan.details.get("uid", ""),
+        "action": step.action,
+        "href": target,
+        "uid": step.details.get("uid", ""),
     }
-    if plan.action == "cal.delete":
-        _verify_deleted(session, plan.href)
+    if step.action == "cal.delete":
+        _verify_deleted(session, target)
         result["verified"] = "deleted"
-        plans.consume(plan.plan_id)
         return result
 
-    # A server may accept a PUT and still rewrite or drop part of it, so the
-    # mutation is not established until the stored resource says what was asked.
     try:
-        stored, stored_raw = events.fetch(profile, session=session, href=plan.href)
+        stored, stored_raw = events.fetch(profile, session=session, href=target)
     except (EventError, SessionError) as exc:
         raise EventError(
-            f"the server accepted {plan.action}, but its readback could not be verified",
+            f"the server accepted {step.action}, but its readback could not be verified",
             exits.OUTCOME_UNCERTAIN,
         ) from exc
     result["etag"] = stored.etag
@@ -726,29 +756,64 @@ def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]
     result["url"] = stored.url
     result["status"] = stored.status
     mismatches: list[str] = []
-    if stored.summary != plan.summary:
-        mismatches.append(f"summary {stored.summary!r} != {plan.summary!r}")
-    if not _same_instant(stored.start, str(plan.details.get("start", ""))):
-        mismatches.append(f"start {stored.start!r} != {plan.details.get('start', '')!r}")
-    if not _same_instant(stored.end, str(plan.details.get("end", ""))):
-        mismatches.append(f"end {stored.end!r} != {plan.details.get('end', '')!r}")
-    if "all_day" in plan.details and stored.all_day != plan.details["all_day"]:
-        mismatches.append(f"all_day {stored.all_day!r} != {plan.details['all_day']!r}")
+    if stored.summary != step.summary:
+        mismatches.append(f"summary {stored.summary!r} != {step.summary!r}")
+    if not _same_instant(stored.start, str(step.details.get("start", ""))):
+        mismatches.append(f"start {stored.start!r} != {step.details.get('start', '')!r}")
+    if not _same_instant(stored.end, str(step.details.get("end", ""))):
+        mismatches.append(f"end {stored.end!r} != {step.details.get('end', '')!r}")
+    if "all_day" in step.details and stored.all_day != step.details["all_day"]:
+        mismatches.append(f"all_day {stored.all_day!r} != {step.details['all_day']!r}")
     for field in ("url", "status"):
-        if field in plan.details and getattr(stored, field) != plan.details[field]:
-            mismatches.append(f"{field} {getattr(stored, field)!r} != {plan.details[field]!r}")
-    if _semantic_calendar(stored_raw) != _semantic_calendar(plans.payload_bytes(plan)):
+        if field in step.details and getattr(stored, field) != step.details[field]:
+            mismatches.append(f"{field} {getattr(stored, field)!r} != {step.details[field]!r}")
+    if _semantic_calendar(stored_raw) != _semantic_calendar(plans.payload_bytes(step)):
         mismatches.append("semantic iCalendar content differs from the planned resource")
-    if plan.details.get("portable_description"):
-        expected_description = _description_from_raw(plans.payload_bytes(plan))
+    if step.details.get("portable_description"):
+        expected_description = _description_from_raw(plans.payload_bytes(step))
         if _description_from_raw(stored_raw) != expected_description:
             mismatches.append("portable description differs from the planned projection")
         result["portable_description_verified"] = True
     result["verified"] = not mismatches
     if not result["verified"]:
         raise EventError(
-            f"the server stored something different at {plan.href}: " + "; ".join(mismatches),
+            f"the server stored something different at {target}: " + "; ".join(mismatches),
             exits.OUTCOME_UNCERTAIN,
         )
-    plans.consume(plan.plan_id)
     return result
+
+
+def reconcile(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
+    """Read the exact event and classify the frozen calendar operation."""
+    validate_step(step)
+    target = _calendar_target(profile, step)
+    try:
+        stored, raw = events.fetch(profile, session=session, href=target)
+    except EventError as exc:
+        if exc.code == exits.TARGET_NOT_FOUND and step.action == "cal.create":
+            return {"state": "pending"}
+        if exc.code == exits.TARGET_NOT_FOUND and step.action == "cal.delete":
+            return {"state": "verified"}
+        if exc.code == exits.TARGET_NOT_FOUND:
+            return {"state": "uncertain"}
+        raise
+    try:
+        exact = _semantic_calendar(raw) == _semantic_calendar(plans.payload_bytes(step))
+    except EventError:
+        raise
+    if step.action == "cal.create":
+        return {"state": "verified" if exact else "uncertain"}
+    current_etag = etag.normalize_strong(stored.etag)
+    old_etag = etag.normalize_strong(step.etag)
+    if step.action == "cal.update":
+        if exact:
+            return {"state": "verified"}
+        return {"state": "pending" if current_etag == old_etag else "uncertain"}
+    if current_etag == old_etag:
+        return {"state": "pending"}
+    return {"state": "uncertain"}
+
+
+def apply(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
+    """Execute one step for callers that use the resource module directly."""
+    return execute(profile, session=session, step=step)

@@ -58,9 +58,21 @@ components. Property order is irrelevant, and CATEGORIES member order is
 treated as a set; only server-managed `DTSTAMP` and `LAST-MODIFIED` refreshes
 are allowed. A delete is successful only after a GET of the exact href returns
 404. A redirect, persistent target, malformed readback, or unreachable
-readback returns outcome-uncertain and leaves the plan pending. Completion is
-a single PUT containing `STATUS:COMPLETED`, one UTC completion instant, and
+readback marks the step outcome-uncertain and blocks the plan. `ncl plan
+reconcile <plan-id>` reads the first uncertain task: exact planned content is
+verified; a missing create or an old strong ETag with different update content
+is pending; a changed or conflicting resource remains uncertain. A missing
+delete is verified, its old strong ETag still present is pending, and changed
+state remains uncertain. Reconciliation sends reads only. Completion is a
+single PUT containing `STATUS:COMPLETED`, one UTC completion instant, and
 `PERCENT-COMPLETE:100`.
+
+Plans are ordered and non-atomic. Every action is validated before the first
+request, verified steps are recorded and skipped when resuming, and execution
+stops at the first failure without rolling back earlier remote effects. Any
+partial plan does not expire; an untouched plan retains its short freshness
+window. Cancelling a partial plan removes local state but does not undo remote
+effects.
 
 The modeled mutation fields are summary, description, start, due, priority,
 status, percentage, and the parent UID. A due date may be supplied without a

@@ -81,8 +81,9 @@ WORK WITH TASKS
   and completion are read back and semantically compared, preserving unknown
   properties and nested components; only DTSTAMP and LAST-MODIFIED may be
   refreshed by the server. A deletion is verified only when the exact href
-  returns 404. Redirects, persistent targets, and uncertain readbacks leave
-  the plan pending. Recurrence, scheduling structures, positive DURATION, and
+  returns 404. Redirects, persistent targets, and uncertain readbacks mark
+  the step uncertain and block the plan until `ncl plan reconcile` reads the
+  exact resource. Recurrence, scheduling structures, positive DURATION, and
   unsupported sibling components remain readable but are refused for mutation;
   a DATE DTSTART can use DURATION only in whole days or weeks.
 
@@ -107,14 +108,31 @@ CHANGE NOTHING BY ACCIDENT
   it would do, prints it, and exits 40 with a plan id. The server is untouched
   until:
 
-  ncl apply <plan-id>           Execute that frozen plan, once.
-  ncl plan list|show|cancel     Inspect or discard what is pending.
+  ncl apply <plan-id>           Execute or resume that frozen plan.
+  ncl plan list|show|cancel     Inspect or discard a plan.
+  ncl plan reconcile <plan-id>  Read the first uncertain step and classify it.
+
+  A plan contains one or more ordered frozen steps. Applying claims the plan
+  before loading it, validates every action and step before the first request,
+  then executes pending steps in order. A verified step is durably recorded and
+  skipped on resume. The loop stops at the first failure, never rolls back a
+  verified remote effect, and does not describe the bundle as atomic. A plan
+  with any verified or uncertain progress does not expire; an untouched plan
+  retains its short freshness window.
 
   Creation is conditional on nothing being there; replacement and deletion are
   conditional on the strong ETag read while planning, so a change that landed
-  in between conflicts instead of being overwritten. Applying claims the plan
-  before loading it: a simultaneous claimant is locked out, and a plan consumed
-  by another caller is not dispatched from an older observation.
+  in between conflicts instead of being overwritten. An uncertain step blocks
+  apply until `ncl plan reconcile` reads its exact href. Reconciliation marks
+  exact planned content verified, returns a demonstrably absent or unchanged
+  effect to pending for retry, and keeps changed or conflicting state
+  uncertain. Reconciliation reads only; it never retries or writes the
+  mutation.
+
+  Applying claims the plan before loading it: a simultaneous claimant is
+  locked out, and a plan consumed by another caller is not dispatched from an
+  older observation. Cancelling a partial plan removes only local state;
+  verified remote effects are not undone.
 
   After a calendar write the exact resource is read back and compared using
   semantic iCalendar content. Unknown properties, nested components, boundary
@@ -124,7 +142,7 @@ CHANGE NOTHING BY ACCIDENT
   redirects before following them. A redirect before a mutation reaches a
   second target is malformed. A calendar deletion is established only when
   the exact href returns 404 after DELETE. A redirect, persistent resource, or
-  malformed post-write readback leaves the plan pending and returns the
+  malformed post-write readback marks the step uncertain and returns the
   outcome-uncertain code. Collection deletion is refused.
 
   This boundary is not authorization. `ncl` cannot tell whether a plan id came

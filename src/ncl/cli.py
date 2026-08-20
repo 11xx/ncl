@@ -445,6 +445,11 @@ def build_parser() -> argparse.ArgumentParser:
     plan_show = plan_commands.add_parser("show", help="Show one plan in full")
     _add_options(plan_show)
     plan_show.add_argument("plan_id")
+    plan_reconcile = plan_commands.add_parser(
+        "reconcile", help="Read the first uncertain step and classify its effect"
+    )
+    _add_options(plan_reconcile)
+    plan_reconcile.add_argument("plan_id")
     plan_cancel = plan_commands.add_parser(
         "cancel", help="Discard a plan; --json emits a cancellation object"
     )
@@ -603,17 +608,26 @@ def _emit_plan(plan: Any, json_output: bool) -> int:
     if json_output:
         _json({"plan": plan.as_dict()})
     else:
-        render.emit(f"planned {plan.action}: {plan.summary or plan.href}")
-        render.emit(f"  href    {plan.href}")
-        if plan.details.get("start") or plan.details.get("due"):
-            start = plan.details.get("start", "")
-            end = plan.details.get("end", plan.details.get("due", ""))
+        render.emit(f"planned {plan.summary or 'bundle'} ({len(plan.steps)} step(s))")
+        for index, (step, progress) in enumerate(
+            zip(plan.steps, plan.progress, strict=True), start=1
+        ):
             render.emit(
-                f"  when    {start} .. {end}"
+                f"  {index}. {progress.state:9} {step.action:14} "
+                f"{step.summary or step.href} ({len(plans.payload_bytes(step))} bytes)"
             )
+            render.emit(f"       href    {step.href}")
         render.emit(f"  apply   ncl apply {plan.plan_id}")
         render.emit("  nothing has been changed on the server yet.")
     return exits.CONFIRMATION_REQUIRED
+
+
+def _dispatchers() -> dict[str, plans.Dispatcher]:
+    return {
+        "cal.": plans.Dispatcher(mutate.validate_step, mutate.execute, mutate.reconcile),
+        "task.": plans.Dispatcher(todos.validate_step, todos.execute, todos.reconcile),
+        "files.": plans.Dispatcher(files.validate_step, files.execute, files.reconcile),
+    }
 
 
 def _run_cal(args: argparse.Namespace) -> int:
@@ -833,22 +847,84 @@ def _run_plan(args: argparse.Namespace) -> int:
             _json({"plans": [plan.as_dict() for plan in pending]})
         else:
             for plan in pending:
-                render.emit(f"{plan.plan_id}  {plan.action:12} {plan.summary or plan.href}")
+                render.emit(
+                    f"{plan.plan_id}  {plan.summary or 'bundle'} "
+                    f"({len(plan.steps)} step(s))"
+                )
+                for index, (step, progress) in enumerate(
+                    zip(plan.steps, plan.progress, strict=True), start=1
+                ):
+                    render.emit(
+                        f"  {index}. {progress.state:9} {step.action:14} "
+                        f"{step.summary or step.href} ({len(plans.payload_bytes(step))} bytes)"
+                    )
         return exits.OK
     if args.plan_command == "show":
         plan = plans.read(args.plan_id)
         if args.json:
             _json({"plan": plan.as_dict()})
         else:
-            for key, value in plan.as_dict().items():
-                render.emit(f"{key}: {value}")
+            render.emit(f"plan_id: {plan.plan_id}")
+            render.emit(f"profile: {plan.profile}")
+            render.emit(f"summary: {plan.summary}")
+            render.emit(f"created_at: {plan.created_at}")
+            render.emit(f"expires_at: {plan.expires_at}")
+            for index, (step, progress) in enumerate(
+                zip(plan.steps, plan.progress, strict=True), start=1
+            ):
+                render.emit(
+                    f"step {index}: {progress.state} {step.action} "
+                    f"{step.summary or step.href} ({len(plans.payload_bytes(step))} bytes)"
+                )
+                render.emit(f"  href: {step.href}")
+                render.emit(f"  etag: {step.etag}")
+                render.emit(f"  details: {step.details}")
+                render.emit(
+                    f"  progress: {progress.state} at {progress.timestamp} "
+                    f"(exit {progress.exit_code})"
+                )
+        return exits.OK
+    if args.plan_command == "reconcile":
+        profile = _selected_profile(args)
+        with plans.claim(args.plan_id):
+            plan = plans.read(args.plan_id)
+            transport = session.Session(profile)
+            result = plans.reconcile(
+                profile,
+                session=transport,
+                plan=plan,
+                dispatchers=_dispatchers(),
+            )
+        if args.json:
+            _json(result)
+        else:
+            render.emit(
+                f"reconciled step {result['index'] + 1}: {result['state']} "
+                f"{result['action']} {result['href']}"
+            )
+            if result["complete"]:
+                render.emit("  plan complete; all steps are verified.")
+            elif result["state"] == "pending":
+                render.emit("  no remote effect was found; apply may retry this step.")
+            else:
+                render.emit("  the plan remains blocked until the resource is resolved.")
         return exits.OK
     if args.plan_command == "cancel":
-        plans.consume(args.plan_id)
+        with plans.claim(args.plan_id):
+            plans.read(args.plan_id)
+            plans.consume(args.plan_id)
+        warning = "Verified remote effects were not undone."
         if args.json:
-            _json({"cancelled": args.plan_id})
+            _json(
+                {
+                    "cancelled": args.plan_id,
+                    "remote_effects_undone": False,
+                    "warning": warning,
+                }
+            )
         else:
             render.emit(f"cancelled {args.plan_id}")
+            render.emit(warning)
         return exits.OK
     return exits.USAGE
 
@@ -921,14 +997,12 @@ def _run_apply(args: argparse.Namespace) -> int:
     with plans.claim(args.plan_id):
         plan = plans.read(args.plan_id)
         transport = session.Session(profile)
-        if plan.action.startswith("cal."):
-            result = mutate.apply(profile, session=transport, plan=plan)
-        elif plan.action.startswith("task."):
-            result = todos.apply(profile, session=transport, plan=plan)
-        elif plan.action.startswith("files."):
-            result = files.apply(profile, session=transport, plan=plan)
-        else:
-            raise plans.PlanError(f"unknown plan action {plan.action!r}", exits.USAGE)
+        result = plans.apply(
+            profile,
+            session=transport,
+            plan=plan,
+            dispatchers=_dispatchers(),
+        )
     if args.json:
         _json(result)
     else:

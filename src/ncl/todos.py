@@ -831,20 +831,29 @@ def plan_create(
         href=_resource_href(calendar_href, uid),
         etag="",
     )
-    return plans.write(
+    return plans.write_bundle(
         profile=profile.name,
-        action="task.create",
-        href=reference.href,
-        etag="",
         summary=summary,
-        payload=payload.encode("utf-8"),
-        content_type="text/calendar; charset=utf-8",
-        details=_details(reference),
+        steps=(
+            plans.freeze_step(
+                action="task.create",
+                href=reference.href,
+                etag="",
+                summary=summary,
+                payload=payload.encode("utf-8"),
+                content_type="text/calendar; charset=utf-8",
+                details=_details(reference),
+            ),
+        ),
     )
 
 
 def _require_etag(reference: TodoRef, operation: str) -> str:
-    candidate = etag.normalize_strong(reference.etag)
+    return _require_strong_etag(reference.etag, operation)
+
+
+def _require_strong_etag(value: str, operation: str) -> str:
+    candidate = etag.normalize_strong(value)
     if candidate is None:
         raise TodoError(
             f"the server returned no strong quoted ETag for this task, so {operation} "
@@ -871,15 +880,20 @@ def plan_update(
         href=reference.href,
         etag=strong,
     )
-    return plans.write(
+    return plans.write_bundle(
         profile=profile.name,
-        action="task.update",
-        href=reference.href,
-        etag=strong,
         summary=updated.summary,
-        payload=payload.encode("utf-8"),
-        content_type="text/calendar; charset=utf-8",
-        details=_details(updated),
+        steps=(
+            plans.freeze_step(
+                action="task.update",
+                href=reference.href,
+                etag=strong,
+                summary=updated.summary,
+                payload=payload.encode("utf-8"),
+                content_type="text/calendar; charset=utf-8",
+                details=_details(updated),
+            ),
+        ),
     )
 
 
@@ -908,28 +922,38 @@ def plan_complete(
         href=reference.href,
         etag=strong,
     )
-    return plans.write(
+    return plans.write_bundle(
         profile=profile.name,
-        action="task.complete",
-        href=reference.href,
-        etag=strong,
         summary=updated.summary,
-        payload=payload.encode("utf-8"),
-        content_type="text/calendar; charset=utf-8",
-        details=_details(updated),
+        steps=(
+            plans.freeze_step(
+                action="task.complete",
+                href=reference.href,
+                etag=strong,
+                summary=updated.summary,
+                payload=payload.encode("utf-8"),
+                content_type="text/calendar; charset=utf-8",
+                details=_details(updated),
+            ),
+        ),
     )
 
 
 def plan_delete(profile: Any, *, session: Session, href: str) -> plans.Plan:
     reference, _ = fetch(profile, session=session, href=href)
     strong = _require_etag(reference, "a deletion")
-    return plans.write(
+    return plans.write_bundle(
         profile=profile.name,
-        action="task.delete",
-        href=reference.href,
-        etag=strong,
         summary=reference.summary,
-        details=_details(reference),
+        steps=(
+            plans.freeze_step(
+                action="task.delete",
+                href=reference.href,
+                etag=strong,
+                summary=reference.summary,
+                details=_details(reference),
+            ),
+        ),
     )
 
 
@@ -955,100 +979,151 @@ def _verify_deleted(session: Session, href: str) -> None:
     )
 
 
-def _readback(profile: Any, *, session: Session, plan: plans.Plan) -> TodoRef:
+def _readback(profile: Any, *, session: Session, step: plans.Step) -> TodoRef:
     try:
-        stored, stored_raw = fetch(profile, session=session, href=plan.href)
+        stored, stored_raw = fetch(profile, session=session, href=step.href)
     except (SessionError, TodoError) as exc:
         raise TodoError(
-            f"the server accepted {plan.action}, but its exact task readback could not be verified",
+            f"the server accepted {step.action}, but its exact task readback could not be verified",
             exits.OUTCOME_UNCERTAIN,
         ) from exc
     try:
         matches = ical_semantics.calendar(stored_raw) == ical_semantics.calendar(
-            plans.payload_bytes(plan)
+            plans.payload_bytes(step)
         )
     except ValueError as exc:
         raise TodoError(
-            f"the server accepted {plan.action}, but its task content could not be compared",
+            f"the server accepted {step.action}, but its task content could not be compared",
             exits.OUTCOME_UNCERTAIN,
         ) from exc
     if not matches:
         raise TodoError(
-            f"the server stored different semantic task content at {plan.href}",
+            f"the server stored different semantic task content at {step.href}",
             exits.OUTCOME_UNCERTAIN,
         )
     return stored
 
 
-def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]:
-    """Execute one frozen task plan conditionally and read successful writes back."""
-    if plan.profile != profile.name:
-        raise plans.PlanError(
-            f"plan {plan.plan_id} was made for profile {plan.profile!r}", exits.USAGE
-        )
-    plans.check_fresh(plan)
-    if not profiles.in_scope(plan.href, list(profile.calendars)):
-        raise CalendarError(
-            f"{plan.href} is outside this profile's calendar allowlist", exits.SCOPE_DENIED
-        )
+_ACTIONS = {"task.create", "task.update", "task.complete", "task.delete"}
 
-    if plan.action == "task.delete":
+
+def validate_step(step: plans.Step) -> None:
+    """Validate task step structure without reading the server."""
+    if step.action not in _ACTIONS:
+        raise plans.PlanError(f"unknown task plan action {step.action!r}", exits.USAGE)
+    body = plans.payload_bytes(step)
+    if step.action == "task.delete":
+        if body:
+            raise plans.PlanError("task deletion steps must not carry a payload", exits.PLAN_STALE)
+        _require_strong_etag(step.etag, "a deletion")
+        return
+    if not step.content_type or not body:
+        raise plans.PlanError("task write steps need content and a payload", exits.PLAN_STALE)
+    if step.action == "task.create" and step.etag:
+        raise plans.PlanError("task creates cannot carry an ETag", exits.PLAN_STALE)
+    if step.action in {"task.update", "task.complete"}:
+        _require_strong_etag(step.etag, "an update")
+
+
+def _task_target(profile: Any, step: plans.Step) -> str:
+    return _scoped_href(profile, step.href)
+
+
+def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
+    """Execute one frozen task step conditionally and verify its readback."""
+    validate_step(step)
+    target = _task_target(profile, step)
+    if step.action == "task.delete":
         response = session.request(
             "DELETE",
-            plan.href,
-            headers={"If-Match": plan.etag},
+            target,
+            headers={"If-Match": step.etag},
             max_redirects=0,
         )
-        _refuse_redirect(response, action="deletion", href=plan.href)
-    elif plan.action == "task.create":
+        _refuse_redirect(response, action="deletion", href=target)
+    elif step.action == "task.create":
         response = session.request(
             "PUT",
-            plan.href,
-            headers={"Content-Type": plan.content_type, "If-None-Match": "*"},
-            data=plans.payload_bytes(plan),
+            target,
+            headers={"Content-Type": step.content_type, "If-None-Match": "*"},
+            data=plans.payload_bytes(step),
             max_redirects=0,
         )
-        _refuse_redirect(response, action="creation", href=plan.href)
-    elif plan.action in {"task.update", "task.complete"}:
-        response = session.request(
-            "PUT",
-            plan.href,
-            headers={"Content-Type": plan.content_type, "If-Match": plan.etag},
-            data=plans.payload_bytes(plan),
-            max_redirects=0,
-        )
-        _refuse_redirect(response, action="update", href=plan.href)
+        _refuse_redirect(response, action="creation", href=target)
     else:
-        raise plans.PlanError(f"unknown plan action {plan.action!r}", exits.USAGE)
+        response = session.request(
+            "PUT",
+            target,
+            headers={"Content-Type": step.content_type, "If-Match": step.etag},
+            data=plans.payload_bytes(step),
+            max_redirects=0,
+        )
+        _refuse_redirect(response, action="update", href=target)
 
     if response.status == 412:
         raise plans.PlanError(
-            f"the task at {plan.href} changed since the plan was made; re-plan against "
+            f"the task at {target} changed since the plan was made; re-plan against "
             "its current state",
             exits.CONFLICT,
         )
-    if response.status == 404 and plan.action != "task.create":
-        raise TodoError(f"no task exists at {plan.href}", exits.TARGET_NOT_FOUND)
+    if response.status == 404 and step.action != "task.create":
+        raise TodoError(f"no task exists at {target}", exits.TARGET_NOT_FOUND)
     if response.status not in {200, 201, 204}:
         raise TodoError(
-            f"the server refused the {plan.action} with status {response.status}",
+            f"the server refused the {step.action} with status {response.status}",
             exits.SERVER_ERROR,
         )
 
     result: dict[str, Any] = {
-        "action": plan.action,
-        "href": plan.href,
-        "uid": plan.details.get("uid", ""),
+        "action": step.action,
+        "href": target,
+        "uid": step.details.get("uid", ""),
     }
-    if plan.action == "task.delete":
-        _verify_deleted(session, plan.href)
+    if step.action == "task.delete":
+        _verify_deleted(session, target)
         result["verified"] = "deleted"
-        plans.consume(plan.plan_id)
         return result
 
-    stored = _readback(profile, session=session, plan=plan)
+    stored = _readback(profile, session=session, step=step)
     result["etag"] = stored.etag
     result["task"] = stored.as_dict()
     result["verified"] = True
-    plans.consume(plan.plan_id)
     return result
+
+
+def reconcile(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
+    """Read the exact task and classify the frozen task operation."""
+    validate_step(step)
+    target = _task_target(profile, step)
+    try:
+        stored, raw = fetch(profile, session=session, href=target)
+    except TodoError as exc:
+        if exc.code == exits.TARGET_NOT_FOUND and step.action == "task.create":
+            return {"state": "pending"}
+        if exc.code == exits.TARGET_NOT_FOUND and step.action == "task.delete":
+            return {"state": "verified"}
+        if exc.code == exits.TARGET_NOT_FOUND:
+            return {"state": "uncertain"}
+        raise
+    try:
+        exact = ical_semantics.calendar(raw) == ical_semantics.calendar(plans.payload_bytes(step))
+    except ValueError as exc:
+        raise TodoError(
+            "the task could not be semantically compared", exits.MALFORMED_RESPONSE
+        ) from exc
+    if step.action == "task.create":
+        return {"state": "verified" if exact else "uncertain"}
+    current_etag = etag.normalize_strong(stored.etag)
+    old_etag = etag.normalize_strong(step.etag)
+    if step.action in {"task.update", "task.complete"}:
+        if exact:
+            return {"state": "verified"}
+        return {"state": "pending" if current_etag == old_etag else "uncertain"}
+    if current_etag == old_etag:
+        return {"state": "pending"}
+    return {"state": "uncertain"}
+
+
+def apply(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
+    """Execute one step for callers that use the resource module directly."""
+    return execute(profile, session=session, step=step)
