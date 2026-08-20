@@ -13,7 +13,7 @@ from typing import Any
 
 import icalendar
 
-from . import events, exits, plans, profiles
+from . import events, exits, ical_semantics, plans, profiles
 from .caldav import CalendarError
 from .events import EventError
 from .session import Session, SessionError
@@ -62,13 +62,6 @@ CLASSES = ("PUBLIC", "PRIVATE", "CONFIDENTIAL")
 PORTABLE_START = "--- ncl portable fields ---"
 PORTABLE_END = "--- end ncl portable fields ---"
 _PORTABLE_PROPERTIES = ("LOCATION", "URL", "STATUS", "CATEGORIES", "PRIORITY", "TRANSP", "CLASS")
-
-# CalDAV servers may refresh these timestamps while storing a resource. Their
-# presence is still validated by ``events._describe``; only a server-side value
-# rewrite is outside the semantic comparison. Every other property and nested
-# component remains part of the readback invariant.
-_SERVER_MANAGED_PROPERTIES = frozenset({"DTSTAMP", "LAST-MODIFIED"})
-
 
 def _validate_priority(value: Any) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value not in PRIORITY_RANGE:
@@ -200,55 +193,11 @@ def _set_description(event: Any, description: str) -> None:
     event.add("description", description)
 
 
-def _semantic_value(value: Any) -> tuple[Any, ...]:
-    typed = getattr(value, "dt", None)
-    if isinstance(typed, dt.datetime):
-        if typed.tzinfo is None:
-            return ("datetime", "floating", typed.isoformat())
-        return ("datetime", "instant", typed.astimezone(dt.UTC).isoformat())
-    if isinstance(typed, dt.date):
-        return ("date", typed.isoformat())
-    if isinstance(typed, dt.timedelta):
-        return ("duration", typed.total_seconds())
-    categories = getattr(value, "cats", None)
-    if categories is not None:
-        return ("categories", tuple(sorted(str(item) for item in categories)))
-    return ("text", str(value))
-
-
-def _semantic_parameter(value: Any) -> Any:
-    if isinstance(value, (list, tuple)):
-        return tuple(sorted(_semantic_parameter(item) for item in value))
-    return str(value)
-
-
-def _semantic_component(component: Any) -> tuple[Any, ...]:
-    properties = []
-    for name, value in component.property_items():
-        upper_name = name.upper()
-        if upper_name in _SERVER_MANAGED_PROPERTIES:
-            continue
-        params = getattr(value, "params", {})
-        parameters = tuple(
-            sorted((key.upper(), _semantic_parameter(item)) for key, item in params.items())
-        )
-        properties.append((upper_name, parameters, _semantic_value(value)))
-    children = sorted(
-        (_semantic_component(child) for child in component.subcomponents), key=repr
-    )
-    return (
-        component.name.upper(),
-        tuple(sorted(properties, key=repr)),
-        tuple(children),
-    )
-
-
 def _semantic_calendar(raw: bytes) -> tuple[Any, ...]:
     try:
-        calendar = icalendar.Calendar.from_ical(raw)
-    except (ValueError, IndexError, TypeError) as exc:
+        return ical_semantics.calendar(raw)
+    except ValueError as exc:
         raise EventError("the stored event is not valid iCalendar") from exc
-    return _semantic_component(calendar)
 
 
 def _optional_fields(

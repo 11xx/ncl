@@ -8,14 +8,13 @@ one resource can hold a recurring master plus overrides that all share it.
 from __future__ import annotations
 
 import datetime as dt
-import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Any
 
 import icalendar
 
-from . import exits, profiles
+from . import etag, exits, profiles
 from .caldav import CalendarError, _canonical
 from .identity import CALDAV, DAV, _element_name, _status_code
 from .session import Session
@@ -176,13 +175,10 @@ def _event_bounds(
     return start_value, end_value
 
 
-_STRONG_ETAG = re.compile(r'^"[\x21\x23-\x7e\x80-\xff]*"$')
-
-
 def strong_etag(value: str) -> str:
     """Return a strong quoted entity tag suitable for an ``If-Match`` header."""
-    candidate = value.strip() if isinstance(value, str) else ""
-    if not _STRONG_ETAG.fullmatch(candidate):
+    candidate = etag.normalize_strong(value)
+    if candidate is None:
         raise EventError(
             "the server returned an unusable ETag; only a strong quoted ETag can be used "
             "for a conditional calendar mutation",
