@@ -90,6 +90,13 @@ def replace_todo_property(raw: bytes, name: str, value, *, parameters=None) -> b
     return calendar.to_ical()
 
 
+def add_todo_property(raw: bytes, name: str, value, *, parameters=None) -> bytes:
+    calendar = icalendar.Calendar.from_ical(raw)
+    todo = next(item for item in calendar.walk() if item.name == "VTODO")
+    todo.add(name, value, parameters=parameters)
+    return calendar.to_ical()
+
+
 def raw_todo(
     uid: str,
     summary: str,
@@ -195,6 +202,22 @@ def test_list_uses_one_vtodo_report_and_derives_parent_children_with_filters():
     all_tasks = todos.query(PROFILE, session=transport, calendar_href=CAL)
     assert all_tasks[0].uid == "parent"
     assert all_tasks[0].children == ("child-a", "child-b")
+
+
+def test_task_list_rejects_report_href_outside_selected_collection(monkeypatch, capsys):
+    leak = "https://cloud.example.invalid/remote.php/dav/calendars/bob/tasks/leak.ics"
+    body = report_body(report_entry(leak, raw_todo("leak", "Leak"), '"v1"'))
+    transport = FakeSession(response(207, body))
+    _patch_cli(monkeypatch, transport, [TASK_CALENDAR])
+
+    code = cli._main(["task", "list", "--json", CAL])
+    error = json.loads(capsys.readouterr().out)
+
+    assert code == exits.SCOPE_DENIED
+    assert error["code"] == exits.SCOPE_DENIED
+    assert len(transport.requests) == 1
+    assert transport.requests[0]["method"] == "REPORT"
+    assert transport.requests[0]["url"] == CAL
 
 
 def test_due_only_creation_has_no_start_and_freezes_a_task_plan(tmp_path, monkeypatch):
@@ -536,6 +559,101 @@ def test_task_report_entry_without_successful_calendar_data_is_malformed():
 
 
 @pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("UID", "second"),
+        ("SUMMARY", "Again"),
+        ("DTSTART", dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC)),
+        ("DUE", dt.datetime(2026, 9, 3, 12, tzinfo=dt.UTC)),
+        ("COMPLETED", NOW),
+        ("STATUS", "COMPLETED"),
+        ("PRIORITY", 2),
+        ("PERCENT-COMPLETE", 50),
+        ("SEQUENCE", 1),
+        ("LOCATION", "Somewhere else"),
+        ("URL", "https://example.invalid/task"),
+    ],
+)
+def test_task_parser_rejects_duplicate_vtodo_singletons(name, value):
+    raw = raw_todo(
+        "child",
+        "Read me",
+        start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+        due=dt.datetime(2026, 9, 3, 11, tzinfo=dt.UTC),
+        status="needs-action",
+        percent_complete=10,
+        priority=3,
+    )
+    raw = add_todo_property(raw, name, value)
+    raw = add_todo_property(raw, name, value)
+
+    with pytest.raises(todos.TodoError, match=name) as error:
+        todos._describe(raw, calendar_href=CAL, href=TASK, etag='"v1"')
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+
+
+def test_task_parser_rejects_duplicate_duration():
+    raw = raw_todo(
+        "duration",
+        "Long task",
+        start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+    )
+    raw = add_todo_property(raw, "DURATION", dt.timedelta(hours=2))
+    raw = add_todo_property(raw, "DURATION", dt.timedelta(hours=2))
+
+    with pytest.raises(todos.TodoError, match="DURATION") as error:
+        todos._describe(raw, calendar_href=CAL, href=TASK, etag='"v1"')
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+
+
+def test_duration_task_is_readable_but_unwritable_without_losing_duration():
+    raw = add_todo_property(
+        raw_todo(
+            "duration",
+            "Long task",
+            start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+        ),
+        "DURATION",
+        dt.timedelta(hours=2),
+    )
+    reference = todos._describe(raw, calendar_href=CAL, href=TASK, etag='"v1"')
+
+    assert reference.writable is False
+    assert reference.unsupported == ("DURATION",)
+    assert b"DURATION:PT2H\r\n" in raw
+
+    with pytest.raises(todos.TodoError, match="DURATION") as error:
+        todos.plan_update(
+            PROFILE,
+            session=FakeSession(response(200, raw, {"ETag": '"v1"'}, url=TASK)),
+            href=TASK,
+            changes={"SUMMARY": "No mutation"},
+        )
+
+    assert error.value.code == exits.UNSUPPORTED_STRUCTURE
+
+
+def test_task_parser_rejects_due_and_duration_together():
+    raw = add_todo_property(
+        raw_todo(
+            "duration",
+            "Conflicting task",
+            start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+            due=dt.datetime(2026, 9, 3, 11, tzinfo=dt.UTC),
+        ),
+        "DURATION",
+        dt.timedelta(hours=2),
+    )
+
+    with pytest.raises(todos.TodoError, match="DUE and DURATION") as error:
+        todos._describe(raw, calendar_href=CAL, href=TASK, etag='"v1"')
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+
+
+@pytest.mark.parametrize(
     ("name", "value", "message"),
     [
         ("STATUS", "NOT-A-STATUS", "STATUS"),
@@ -563,6 +681,17 @@ def test_task_parser_rejects_invalid_scalar_values(name, value, message):
             parameters={"VALUE": "DATE"},
         ),
         replace_todo_property(raw_todo("child", "Bad"), "COMPLETED", dt.date(2026, 8, 20)),
+        replace_todo_property(
+            raw_todo("child", "Bad"),
+            "COMPLETED",
+            dt.datetime(2026, 8, 20, 12, 0),
+        ),
+        replace_todo_property(
+            raw_todo("child", "Bad"),
+            "COMPLETED",
+            dt.datetime(2026, 8, 20, 12, 0),
+            parameters={"TZID": "America/Sao_Paulo"},
+        ),
         replace_todo_property(
             raw_todo("child", "Bad", start=dt.date(2026, 9, 1), due=dt.date(2026, 9, 3)),
             "DUE",

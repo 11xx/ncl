@@ -26,10 +26,12 @@ TODO_STATUSES = ("NEEDS-ACTION", "IN-PROCESS", "COMPLETED", "CANCELLED")
 PRIORITY_RANGE = range(0, 10)
 PERCENT_RANGE = range(0, 101)
 
-# These properties either describe a recurring series or participate in
-# iCalendar scheduling. The parser names them in output, and mutation refuses
-# the whole resource before changing any modeled property.
+# These properties either describe a recurring series, participate in
+# iCalendar scheduling, or are not modeled by this module. The parser names
+# them in output, and mutation refuses the whole resource before changing any
+# modeled property.
 UNSUPPORTED_PROPERTIES = (
+    "DURATION",
     "RRULE",
     "RDATE",
     "EXDATE",
@@ -41,6 +43,35 @@ UNSUPPORTED_PROPERTIES = (
     "SCHEDULE-AGENT",
     "SCHEDULE-FORCE-SEND",
     "SCHEDULE-STATUS",
+)
+
+# RFC 5545 VTODO properties in the required and optional singleton groups.
+# Repeatable properties such as ATTENDEE, RELATED-TO, and RSTATUS are not in
+# this set. RRULE is deliberately absent: RFC 5545 says it SHOULD NOT repeat,
+# rather than making a repeated RRULE malformed by cardinality alone.
+VTODO_SINGLETON_PROPERTIES = frozenset(
+    {
+        "CLASS",
+        "COMPLETED",
+        "CREATED",
+        "DESCRIPTION",
+        "DTSTART",
+        "DTSTAMP",
+        "DUE",
+        "DURATION",
+        "GEO",
+        "LAST-MODIFIED",
+        "LOCATION",
+        "ORGANIZER",
+        "PERCENT-COMPLETE",
+        "PRIORITY",
+        "RECURRENCE-ID",
+        "SEQUENCE",
+        "STATUS",
+        "SUMMARY",
+        "UID",
+        "URL",
+    }
 )
 
 
@@ -159,6 +190,20 @@ def _value_kind(value: Any) -> str | None:
     return None
 
 
+def _validate_singletons(component: Any, *, href: str) -> None:
+    location = f" at {href}" if href else ""
+    counts: dict[str, int] = {}
+    for name, _ in component.property_items():
+        upper_name = name.upper()
+        if upper_name in VTODO_SINGLETON_PROPERTIES:
+            counts[upper_name] = counts.get(upper_name, 0) + 1
+    duplicates = sorted(name for name, count in counts.items() if count > 1)
+    if duplicates:
+        raise TodoError(
+            f"the task{location} repeats singleton properties: {', '.join(duplicates)}"
+        )
+
+
 def _validate_boundaries(
     start: Any,
     due: Any,
@@ -190,6 +235,8 @@ def _validate_boundaries(
 
 def _validate_todo(component: Any, *, href: str) -> None:
     location = f" at {href}" if href else ""
+    _validate_singletons(component, href=href)
+
     uid = component.get("UID")
     if uid is None or not str(uid).strip():
         raise TodoError(f"the task{location} has no UID")
@@ -198,17 +245,37 @@ def _validate_todo(component: Any, *, href: str) -> None:
     if not isinstance(stamp, dt.datetime) or stamp.tzinfo is None:
         raise TodoError(f"the task{location} has no valid DTSTAMP")
 
+    start_property = component.get("DTSTART")
+    due_property = component.get("DUE")
+    duration_property = component.get("DURATION")
     start = _property_value(component, "DTSTART")
     due = _property_value(component, "DUE")
     if component.get("DTSTART") is not None and start is None:
         raise TodoError(f"the task{location} has an invalid DTSTART")
     if component.get("DUE") is not None and due is None:
         raise TodoError(f"the task{location} has an invalid DUE")
+    if duration_property is not None:
+        duration = _property_value(component, "DURATION")
+        if not isinstance(duration, dt.timedelta):
+            raise TodoError(f"the task{location} has an invalid DURATION")
+        if due_property is not None:
+            raise TodoError(f"the task{location} has both DUE and DURATION")
+        if start_property is None:
+            raise TodoError(f"the task{location} has DURATION without DTSTART")
     _validate_boundaries(start, due, href=href, code=exits.MALFORMED_RESPONSE)
 
     completed_property = component.get("COMPLETED")
     completed = _property_value(component, "COMPLETED")
-    if completed_property is not None and not isinstance(completed, dt.datetime):
+    completed_params = getattr(completed_property, "params", {})
+    if (
+        completed_property is not None
+        and (
+            not isinstance(completed, dt.datetime)
+            or completed.tzinfo is None
+            or completed.utcoffset() != dt.timedelta(0)
+            or any(str(name).upper() == "TZID" for name in completed_params)
+        )
+    ):
         raise TodoError(f"the task{location} has an invalid COMPLETED value")
 
     status = _component_text(component, "STATUS").upper()
@@ -514,6 +581,18 @@ def _check_calendar_scope(profile: Any, calendar_href: str) -> None:
         )
 
 
+def _check_response_scope(profile: Any, calendar_href: str, href: str) -> None:
+    if not profiles.in_scope(href, (calendar_href,)):
+        raise CalendarError(
+            f"{href} is outside the selected calendar collection {calendar_href}",
+            exits.SCOPE_DENIED,
+        )
+    if not profiles.in_scope(href, list(profile.calendars)):
+        raise CalendarError(
+            f"{href} is outside this profile's calendar allowlist", exits.SCOPE_DENIED
+        )
+
+
 def _scoped_href(profile: Any, href: str) -> str:
     target = _canonical(profile, href)
     if not profiles.in_scope(target, list(profile.calendars)):
@@ -561,6 +640,7 @@ def query(
         if not data:
             continue
         href = _canonical(profile, raw_href)
+        _check_response_scope(profile, calendar_href, href)
         found.append(
             _describe(
                 data,
