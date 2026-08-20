@@ -41,11 +41,20 @@ Collections are never deleted by this command, which rules out an accidental
 recursive removal.
 
 Neither command changes the server. `ncl apply <plan-id>` performs the frozen
-request once. A write is then read back and compared byte for byte. A deletion
-is followed by a depth-zero lookup that must report the resource absent. An
-ETag mismatch is a conflict; a successful request followed by different or
-indeterminate stored state is an uncertain outcome and must be reconciled by a
-read rather than blindly retried.
+request as one ordered step. Every step in a bundle is validated before the
+first request; verified steps are recorded and skipped on resume, execution
+stops at the first failure, and no verified remote effect is rolled back. A
+write is then read back and compared byte for byte. A deletion is followed by
+a depth-zero lookup that must report the resource absent. An ETag mismatch is
+a conflict; a successful request followed by different or indeterminate stored
+state is an uncertain outcome and blocks the plan until
+`ncl plan reconcile <plan-id>` reads the exact href. Reconciliation compares
+exact file bytes: exact planned content is verified, a missing create is
+pending, the old strong ETag with different content is pending for an existing
+write, a missing delete is verified, and changed content or ETag remains
+uncertain. Reconciliation reads only. Partial plans do not expire; untouched
+plans retain their short freshness window. Cancelling a partial plan removes
+local progress but does not undo remote effects.
 
 The module does not create collections, copy or move resources, acquire WebDAV
 locks, manage shares, or bypass a server quota. Those are separate operations

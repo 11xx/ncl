@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import re
 
+import pytest
+
 from ncl import cli, exits, guide
 
 # Every `ncl <command>` the guide mentions, including a second level such as
@@ -46,6 +48,16 @@ def test_guide_is_nonempty_and_names_only_registered_commands():
             )
 
     assert mentioned, "the guide names no commands at all"
+
+
+def test_top_level_help_describes_resumable_plan_application(capsys):
+    with pytest.raises(SystemExit) as error:
+        cli.main(["--help"])
+
+    assert error.value.code == exits.OK
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "apply Execute or resume a frozen plan" in help_text
+    assert "Execute a frozen plan, once" not in help_text
 
 
 def test_every_exit_code_has_one_response():

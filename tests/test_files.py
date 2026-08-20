@@ -7,7 +7,7 @@ import pytest
 
 from ncl import cli, exits, files, plans
 from ncl.config import Profile
-from ncl.session import Response
+from ncl.session import Response, SessionError
 
 PROFILE = Profile(
     "home",
@@ -52,21 +52,34 @@ def failed_entry(href: str, status: str = "HTTP/1.1 404 Not Found") -> str:
 
 
 class FakeSession:
-    def __init__(self, *responses: Response):
+    def __init__(self, *responses: Response | Exception):
         self.responses = list(responses)
         self.requests: list[dict] = []
 
     def request(self, method, url, *, headers=None, data=None, **kwargs):
         self.requests.append({"method": method, "url": url, "headers": headers, "data": data})
         assert self.responses, f"unexpected request: {method} {url}"
-        return self.responses.pop(0)
+        outcome = self.responses.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def _apply_bundle(plan, transport):
+    with plans.claim(plan.plan_id):
+        return plans.apply(
+            PROFILE,
+            session=transport,
+            plan=plan,
+            dispatchers=cli._dispatchers(),
+        )
 
 
 def response(
     status: int,
     body: bytes = b"",
     headers: Mapping[str, str] | None = None,
-    url: str = ROOT,
+    url: str = "",
 ) -> Response:
     return Response(status, headers or {}, body, url)
 
@@ -221,9 +234,9 @@ def test_write_planning_freezes_an_if_match_replacement_without_putting():
     )
 
     assert [request["method"] for request in transport.requests] == ["PROPFIND"]
-    assert plan.action == "files.write"
-    assert plan.etag == '"v1"'
-    assert plans.payload_bytes(plan) == b"replacement"
+    assert plan.steps[0].action == "files.write"
+    assert plan.steps[0].etag == '"v1"'
+    assert plans.payload_bytes(plan.steps[0]) == b"replacement"
 
 
 def test_write_planning_freezes_an_if_none_match_creation():
@@ -233,8 +246,29 @@ def test_write_planning_freezes_an_if_none_match_creation():
         href=SCRIPT,
         content=b"new",
     )
-    assert plan.etag == ""
-    assert plan.details["exists"] is False
+    assert plan.steps[0].etag == ""
+    assert plan.steps[0].details["exists"] is False
+
+
+@pytest.mark.parametrize("bad_etag", ["", "*", 'W/"v1"', "v1"])
+def test_file_replacement_and_deletion_require_strong_quoted_etags(bad_etag):
+    body = multistatus(entry(SCRIPT, etag=bad_etag))
+    with pytest.raises(files.FileError) as write_error:
+        files.plan_write(
+            PROFILE,
+            session=FakeSession(response(207, body)),
+            href=SCRIPT,
+            content=b"replacement",
+        )
+    assert write_error.value.code == exits.MALFORMED_RESPONSE
+
+    with pytest.raises(files.FileError) as delete_error:
+        files.plan_delete(
+            PROFILE,
+            session=FakeSession(response(207, body)),
+            href=SCRIPT,
+        )
+    assert delete_error.value.code == exits.MALFORMED_RESPONSE
 
 
 def test_apply_conditionally_writes_and_verifies_exact_readback():
@@ -250,7 +284,7 @@ def test_apply_conditionally_writes_and_verifies_exact_readback():
         response(200, b"new", {"ETag": '"stored"', "Content-Type": "application/json"}),
     )
 
-    result = files.apply(PROFILE, session=transport, plan=plan)
+    result = _apply_bundle(plan, transport)
 
     put = transport.requests[0]
     assert put["method"] == "PUT"
@@ -271,9 +305,99 @@ def test_apply_keeps_a_plan_when_readback_differs():
     transport = FakeSession(response(201), response(200, b"changed"))
 
     with pytest.raises(files.FileError) as error:
-        files.apply(PROFILE, session=transport, plan=plan)
+        _apply_bundle(plan, transport)
     assert error.value.code == exits.OUTCOME_UNCERTAIN
+    assert isinstance(error.value.__cause__, files.FileError)
     assert plans.read(plan.plan_id).plan_id == plan.plan_id
+
+
+def test_apply_keeps_request_failure_classification_before_acceptance(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    plan = files.plan_write(
+        PROFILE,
+        session=FakeSession(response(404)),
+        href=SCRIPT,
+        content=b"new",
+    )
+    transport = FakeSession(
+        SessionError("the configured origin was unreachable", exits.UNREACHABLE)
+    )
+
+    with pytest.raises(SessionError) as error:
+        _apply_bundle(plan, transport)
+
+    assert error.value.code == exits.UNREACHABLE
+    stored = plans.read(plan.plan_id)
+    assert stored.progress[0].state == "pending"
+    assert stored.progress[0].exit_code == exits.UNREACHABLE
+    assert stored.expires_at is not None
+
+
+def test_cli_apply_marks_an_unreachable_put_readback_uncertain_and_blocks_retry(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    plan = files.plan_write(
+        PROFILE,
+        session=FakeSession(response(404)),
+        href=SCRIPT,
+        content=b"new",
+    )
+    first = FakeSession(
+        response(201, url=plan.steps[0].href),
+        SessionError("the configured origin was unreachable", exits.UNREACHABLE),
+    )
+    second = FakeSession()
+    transports = iter((first, second))
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    monkeypatch.setattr(cli.session, "Session", lambda profile: next(transports))
+
+    assert cli.main(["apply", plan.plan_id, "--json"]) == exits.OUTCOME_UNCERTAIN
+    first_result = json.loads(capsys.readouterr().out)
+    assert first_result["code"] == exits.OUTCOME_UNCERTAIN
+    stored = plans.read(plan.plan_id)
+    assert stored.progress[0].state == "uncertain"
+    assert stored.progress[0].exit_code == exits.OUTCOME_UNCERTAIN
+    assert stored.expires_at is None
+    assert [request["method"] for request in first.requests] == ["PUT", "GET"]
+
+    assert cli.main(["apply", plan.plan_id, "--json"]) == exits.OUTCOME_UNCERTAIN
+    second_result = json.loads(capsys.readouterr().out)
+    assert second_result["code"] == exits.OUTCOME_UNCERTAIN
+    assert second.requests == []
+
+
+def test_cli_apply_marks_a_post_delete_readback_failure_uncertain_and_blocks_retry(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    plan = files.plan_delete(
+        PROFILE,
+        session=FakeSession(response(207, multistatus(entry(SCRIPT)))),
+        href=SCRIPT,
+    )
+    first = FakeSession(
+        response(204, url=plan.steps[0].href),
+        SessionError("the configured origin was unreachable", exits.UNREACHABLE),
+    )
+    second = FakeSession()
+    transports = iter((first, second))
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    monkeypatch.setattr(cli.session, "Session", lambda profile: next(transports))
+
+    assert cli.main(["apply", plan.plan_id, "--json"]) == exits.OUTCOME_UNCERTAIN
+    first_result = json.loads(capsys.readouterr().out)
+    assert first_result["code"] == exits.OUTCOME_UNCERTAIN
+    stored = plans.read(plan.plan_id)
+    assert stored.progress[0].state == "uncertain"
+    assert stored.progress[0].exit_code == exits.OUTCOME_UNCERTAIN
+    assert stored.expires_at is None
+    assert [request["method"] for request in first.requests] == ["DELETE", "PROPFIND"]
+
+    assert cli.main(["apply", plan.plan_id, "--json"]) == exits.OUTCOME_UNCERTAIN
+    second_result = json.loads(capsys.readouterr().out)
+    assert second_result["code"] == exits.OUTCOME_UNCERTAIN
+    assert second.requests == []
 
 
 def test_delete_is_conditional_and_verified_missing():
@@ -285,11 +409,103 @@ def test_delete_is_conditional_and_verified_missing():
     )
     transport = FakeSession(response(204), response(404))
 
-    result = files.apply(PROFILE, session=transport, plan=plan)
+    result = _apply_bundle(plan, transport)
 
     assert transport.requests[0]["headers"] == {"If-Match": '"v1"'}
     assert result["verified"] == "deleted"
 
+
+def test_file_reconciliation_classifies_exact_missing_old_and_changed_states():
+    create = files.plan_write(
+        PROFILE,
+        session=FakeSession(response(404)),
+        href=SCRIPT,
+        content=b"new",
+    )
+    assert files.reconcile(
+        PROFILE,
+        session=FakeSession(response(404)),
+        step=create.steps[0],
+    ) == {"state": "pending"}
+    assert files.reconcile(
+        PROFILE,
+        session=FakeSession(response(200, b"new", {"ETag": '"v2"'})),
+        step=create.steps[0],
+    ) == {"state": "verified"}
+    assert files.reconcile(
+        PROFILE,
+        session=FakeSession(response(200, b"different", {"ETag": '"v2"'})),
+        step=create.steps[0],
+    ) == {"state": "uncertain"}
+
+    existing_body = multistatus(entry(SCRIPT, etag='"old"'))
+    update = files.plan_write(
+        PROFILE,
+        session=FakeSession(response(207, existing_body)),
+        href=SCRIPT,
+        content=b"new",
+    )
+    assert files.reconcile(
+        PROFILE,
+        session=FakeSession(response(200, b"old", {"ETag": '"old"'})),
+        step=update.steps[0],
+    ) == {"state": "pending"}
+    assert files.reconcile(
+        PROFILE,
+        session=FakeSession(response(200, b"changed", {"ETag": '"changed"'})),
+        step=update.steps[0],
+    ) == {"state": "uncertain"}
+
+    delete = files.plan_delete(
+        PROFILE,
+        session=FakeSession(response(207, existing_body)),
+        href=SCRIPT,
+    )
+    assert files.reconcile(
+        PROFILE,
+        session=FakeSession(response(404)),
+        step=delete.steps[0],
+    ) == {"state": "verified"}
+    assert files.reconcile(
+        PROFILE,
+        session=FakeSession(response(200, b"old", {"ETag": '"old"'})),
+        step=delete.steps[0],
+    ) == {"state": "pending"}
+    assert files.reconcile(
+        PROFILE,
+        session=FakeSession(response(200, b"changed", {"ETag": '"changed"'})),
+        step=delete.steps[0],
+    ) == {"state": "uncertain"}
+
+
+def test_cli_reconcile_emits_json_and_consumes_a_fully_verified_plan(monkeypatch, capsys):
+    plan = files.plan_write(
+        PROFILE,
+        session=FakeSession(response(404)),
+        href=SCRIPT,
+        content=b"new",
+    )
+    with plans.claim(plan.plan_id):
+        plans.update_progress(
+            plan,
+            0,
+            state="uncertain",
+            exit_code=exits.OUTCOME_UNCERTAIN,
+        )
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    monkeypatch.setattr(
+        cli.session,
+        "Session",
+        lambda profile: FakeSession(response(200, b"new", {"ETag": '"v2"'})),
+    )
+
+    assert cli.main(["plan", "reconcile", plan.plan_id, "--json"]) == exits.OK
+    result = json.loads(capsys.readouterr().out)
+    assert result["state"] == "verified"
+    assert result["complete"] is True
+    with pytest.raises(plans.PlanError) as error:
+        plans.read(plan.plan_id)
+    assert error.value.code == exits.TARGET_NOT_FOUND
 
 def test_collection_deletion_is_refused_during_planning():
     body = multistatus(entry("/remote.php/dav/files/alice/Violentmonkey/", collection=True))
@@ -339,9 +555,9 @@ def test_cli_write_returns_a_frozen_plan_without_sending_put(
 
     assert code == exits.CONFIRMATION_REQUIRED
     rendered = json.loads(capsys.readouterr().out)
-    assert rendered["plan"]["action"] == "files.write"
-    assert rendered["plan"]["payload_bytes"] == len(source.read_bytes())
-    assert "payload" not in rendered["plan"]
+    assert rendered["plan"]["steps"][0]["action"] == "files.write"
+    assert rendered["plan"]["steps"][0]["payload_bytes"] == len(source.read_bytes())
+    assert "payload" not in rendered["plan"]["steps"][0]
     assert [request["method"] for request in transport.requests] == ["PROPFIND"]
 
 

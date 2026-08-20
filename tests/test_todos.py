@@ -72,6 +72,30 @@ class HttpTransport:
         return self.responses.pop(0)
 
 
+def _apply_bundle(plan, transport):
+    with plans.claim(plan.plan_id):
+        return plans.apply(
+            PROFILE,
+            session=transport,
+            plan=plan,
+            dispatchers=cli._dispatchers(),
+        )
+
+
+def _write(**kwargs):
+    payload = kwargs.pop("payload", b"")
+    ttl = kwargs.pop("ttl", plans.DEFAULT_TTL_SECONDS)
+    now = kwargs.pop("now", None)
+    summary = kwargs.pop("summary")
+    return plans.write_bundle(
+        profile=kwargs.pop("profile"),
+        summary=summary,
+        steps=(plans.freeze_step(payload=payload, summary=summary, **kwargs),),
+        ttl=ttl,
+        now=now,
+    )
+
+
 def response(
     status: int,
     body: bytes = b"",
@@ -275,13 +299,13 @@ def test_due_only_creation_has_no_start_and_freezes_a_task_plan(tmp_path, monkey
         now=NOW,
     )
 
-    payload = plans.payload_bytes(plan).decode()
-    assert plan.action == "task.create"
+    payload = plans.payload_bytes(plan.steps[0]).decode()
+    assert plan.steps[0].action == "task.create"
     assert "DUE:20260903T200000Z" in payload
     assert "DTSTART" not in payload
-    assert plan.details["start"] == ""
-    assert plan.details["due"] == "20260903T200000Z"
-    assert plan.as_dict()["payload_bytes"] > 0
+    assert plan.steps[0].details["start"] == ""
+    assert plan.steps[0].details["due"] == "20260903T200000Z"
+    assert plan.as_dict()["steps"][0]["payload_bytes"] > 0
 
 
 def test_create_update_complete_delete_apply_conditionally_and_read_back(tmp_path, monkeypatch):
@@ -293,11 +317,11 @@ def test_create_update_complete_delete_apply_conditionally_and_read_back(tmp_pat
         due=dt.date(2026, 9, 3),
         now=NOW,
     )
-    created = plans.payload_bytes(create_plan)
+    created = plans.payload_bytes(create_plan.steps[0])
     create_transport = FakeSession(
         response(201), response(200, created, {"ETag": '"created"'})
     )
-    result = todos.apply(PROFILE, session=create_transport, plan=create_plan)
+    result = _apply_bundle(create_plan, create_transport)
     assert result["verified"] is True
     assert create_transport.requests[0]["headers"]["If-None-Match"] == "*"
     assert create_transport.requests[1]["method"] == "GET"
@@ -318,7 +342,7 @@ def test_create_update_complete_delete_apply_conditionally_and_read_back(tmp_pat
     update_transport = FakeSession(
         response(204), response(200, updated, {"ETag": '"v2"'})
     )
-    update_result = todos.apply(PROFILE, session=update_transport, plan=update_plan)
+    update_result = _apply_bundle(update_plan, update_transport)
     assert update_result["verified"] is True
     assert update_transport.requests[0]["headers"]["If-Match"] == '"v1"'
     assert update_result["task"]["description"] == "Details"
@@ -329,7 +353,7 @@ def test_create_update_complete_delete_apply_conditionally_and_read_back(tmp_pat
         href=TASK,
         completed=dt.datetime(2026, 8, 20, 13, 0, tzinfo=dt.timezone(dt.timedelta(hours=-3))),
     )
-    complete_payload = plans.payload_bytes(complete_plan)
+    complete_payload = plans.payload_bytes(complete_plan.steps[0])
     assert complete_payload.count(b"STATUS:COMPLETED") == 1
     assert complete_payload.count(b"PERCENT-COMPLETE:100") == 1
     assert b"COMPLETED:20260820T160000Z" in complete_payload
@@ -345,7 +369,7 @@ def test_create_update_complete_delete_apply_conditionally_and_read_back(tmp_pat
     complete_transport = FakeSession(
         response(204), response(200, completed, {"ETag": '"v3"'})
     )
-    complete_result = todos.apply(PROFILE, session=complete_transport, plan=complete_plan)
+    complete_result = _apply_bundle(complete_plan, complete_transport)
     assert complete_result["verified"] is True
     assert [request["method"] for request in complete_transport.requests] == ["PUT", "GET"]
     assert complete_transport.requests[0]["headers"]["If-Match"] == '"v2"'
@@ -356,7 +380,7 @@ def test_create_update_complete_delete_apply_conditionally_and_read_back(tmp_pat
         href=TASK,
     )
     delete_transport = FakeSession(response(204), response(404, url=TASK))
-    delete_result = todos.apply(PROFILE, session=delete_transport, plan=delete_plan)
+    delete_result = _apply_bundle(delete_plan, delete_transport)
     assert delete_result["verified"] == "deleted"
     assert delete_transport.requests[0]["headers"]["If-Match"] == '"v3"'
     assert [request["method"] for request in delete_transport.requests] == ["DELETE", "GET"]
@@ -383,7 +407,7 @@ def test_scope_and_etag_conditions_refuse_before_or_during_writes():
         )
     assert etag_error.value.code == exits.MALFORMED_RESPONSE
 
-    plan = plans.write(
+    plan = _write(
         profile=PROFILE.name,
         action="task.delete",
         href=TASK,
@@ -392,7 +416,7 @@ def test_scope_and_etag_conditions_refuse_before_or_during_writes():
         details={"uid": "child"},
     )
     with pytest.raises(plans.PlanError) as conflict_error:
-        todos.apply(PROFILE, session=FakeSession(response(412)), plan=plan)
+        _apply_bundle(plan, FakeSession(response(412)))
     assert conflict_error.value.code == exits.CONFLICT
 
 
@@ -420,14 +444,16 @@ def test_task_put_redirect_is_refused_and_plan_remains_pending(tmp_path, monkeyp
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
     plan = todos.plan_create(PROFILE, calendar_href=CAL, summary="Created", now=NOW)
     other = CAL + "other.ics"
-    transport = FakeSession(response(307, headers={"Location": other}, url=plan.href))
+    transport = FakeSession(
+        response(307, headers={"Location": other}, url=plan.steps[0].href)
+    )
 
     with pytest.raises(todos.TodoError) as error:
-        todos.apply(PROFILE, session=transport, plan=plan)
+        _apply_bundle(plan, transport)
 
     assert error.value.code == exits.MALFORMED_RESPONSE
     assert [request["method"] for request in transport.requests] == ["PUT"]
-    assert transport.requests[0]["url"] == plan.href
+    assert transport.requests[0]["url"] == plan.steps[0].href
     assert transport.requests[0]["kwargs"]["max_redirects"] == 0
     assert plans.read(plan.plan_id).plan_id == plan.plan_id
 
@@ -439,16 +465,16 @@ def test_task_readback_redirect_is_outcome_uncertain_and_plan_remains_pending(
     plan = todos.plan_create(PROFILE, calendar_href=CAL, summary="Created", now=NOW)
     other = CAL + "other.ics"
     transport = FakeSession(
-        response(201, url=plan.href),
-        response(307, headers={"Location": other}, url=plan.href),
+        response(201, url=plan.steps[0].href),
+        response(307, headers={"Location": other}, url=plan.steps[0].href),
     )
 
     with pytest.raises(todos.TodoError) as error:
-        todos.apply(PROFILE, session=transport, plan=plan)
+        _apply_bundle(plan, transport)
 
     assert error.value.code == exits.OUTCOME_UNCERTAIN
     assert [request["method"] for request in transport.requests] == ["PUT", "GET"]
-    assert all(request["url"] == plan.href for request in transport.requests)
+    assert all(request["url"] == plan.steps[0].href for request in transport.requests)
     assert transport.requests[1]["kwargs"]["max_redirects"] == 0
     assert plans.read(plan.plan_id).plan_id == plan.plan_id
 
@@ -464,7 +490,7 @@ def test_task_delete_keeps_plan_when_exact_href_persists(tmp_path, monkeypatch):
     transport = FakeSession(response(204, url=TASK), response(200, raw, url=TASK))
 
     with pytest.raises(todos.TodoError) as error:
-        todos.apply(PROFILE, session=transport, plan=plan)
+        _apply_bundle(plan, transport)
 
     assert error.value.code == exits.OUTCOME_UNCERTAIN
     assert [request["method"] for request in transport.requests] == ["DELETE", "GET"]
@@ -485,13 +511,15 @@ def test_task_update_readback_compares_unknown_properties_and_keeps_plan(
         changes={"SUMMARY": "New"},
         now=NOW,
     )
-    altered = plans.payload_bytes(plan).replace(b"X-CUSTOM-FIELD:do-not-lose-me\r\n", b"")
+    altered = plans.payload_bytes(plan.steps[0]).replace(
+        b"X-CUSTOM-FIELD:do-not-lose-me\r\n", b""
+    )
     transport = FakeSession(
         response(204, url=TASK), response(200, altered, {"ETag": '"v2"'}, url=TASK)
     )
 
     with pytest.raises(todos.TodoError) as error:
-        todos.apply(PROFILE, session=transport, plan=plan)
+        _apply_bundle(plan, transport)
 
     assert error.value.code == exits.OUTCOME_UNCERTAIN
     assert plans.read(plan.plan_id).plan_id == plan.plan_id
@@ -511,17 +539,16 @@ def test_task_readback_allows_server_timestamps_but_requires_nested_components(
     )
     timestamped = replace_todo_property(
         replace_todo_property(
-            plans.payload_bytes(plan),
+            plans.payload_bytes(plan.steps[0]),
             "DTSTAMP",
             dt.datetime(2026, 8, 20, 13, tzinfo=dt.UTC),
         ),
         "LAST-MODIFIED",
         dt.datetime(2026, 8, 20, 13, 1, tzinfo=dt.UTC),
     )
-    result = todos.apply(
-        PROFILE,
-        session=FakeSession(response(204, url=TASK), response(200, timestamped, url=TASK)),
-        plan=plan,
+    result = _apply_bundle(
+        plan,
+        FakeSession(response(204, url=TASK), response(200, timestamped, url=TASK)),
     )
     assert result["verified"] is True
 
@@ -538,10 +565,9 @@ def test_task_readback_allows_server_timestamps_but_requires_nested_components(
         now=NOW,
     )
     with pytest.raises(todos.TodoError) as error:
-        todos.apply(
-            PROFILE,
-            session=FakeSession(response(204, url=TASK), response(200, missing_alarm, url=TASK)),
-            plan=remaining,
+        _apply_bundle(
+            remaining,
+            FakeSession(response(204, url=TASK), response(200, missing_alarm, url=TASK)),
         )
     assert error.value.code == exits.OUTCOME_UNCERTAIN
     assert plans.read(remaining.plan_id).plan_id == remaining.plan_id
@@ -937,7 +963,7 @@ def test_cli_apply_claims_before_loading_and_dispatching_a_task_plan(monkeypatch
         or SimpleNamespace(plan_id=plan_id, profile="home", action="task.create"),
     )
     monkeypatch.setattr(cli.session, "Session", lambda profile: object())
-    monkeypatch.setattr(todos, "apply", lambda *args, **kwargs: order.append("apply") or {})
+    monkeypatch.setattr(plans, "apply", lambda *args, **kwargs: order.append("apply") or {})
 
     assert cli._run_apply(SimpleNamespace(plan_id="stale", json=True)) == exits.OK
     assert order == ["claim", "read", "apply"]

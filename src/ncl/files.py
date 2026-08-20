@@ -13,7 +13,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
-from . import exits, plans, profiles
+from . import etag, exits, plans, profiles
 from .identity import DAV, _element_name, _status_code
 from .session import Session, SessionError, absolute_url
 
@@ -261,7 +261,9 @@ def stat_resource(
         target,
         headers={"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
         data=_PROPFIND,
+        max_redirects=0,
     )
+    _refuse_redirect(response, action="metadata read", href=target)
     if response.status == 404:
         if missing_ok:
             return None
@@ -289,7 +291,10 @@ def stat_resource(
 def read_file(profile: Any, *, session: Session, href: str) -> tuple[FileRef, bytes]:
     """Read one scoped file and retain its response metadata."""
     target = _scoped(profile, href)
-    response = session.request("GET", target, headers={"Accept": "*/*"})
+    response = session.request(
+        "GET", target, headers={"Accept": "*/*"}, max_redirects=0
+    )
+    _refuse_redirect(response, action="read", href=target)
     if response.status == 404:
         raise FileError(f"no file exists at {target}", exits.TARGET_NOT_FOUND)
     if response.status != 200:
@@ -381,23 +386,27 @@ def plan_write(
             "a collection cannot be replaced with file content",
             exits.UNSUPPORTED_STRUCTURE,
         )
-    if existing is not None and not existing.etag:
-        raise FileError(
-            "the server returned no ETag for this file, so it cannot be replaced conditionally"
-        )
-    return plans.write(
+    existing_etag = ""
+    if existing is not None:
+        existing_etag = _strong_etag(existing.etag, "a file replacement")
+    return plans.write_bundle(
         profile=profile.name,
-        action="files.write",
-        href=target,
-        etag=existing.etag if existing is not None else "",
         summary=_segments(target)[-1],
-        payload=content,
-        content_type=_content_type(content_type),
-        details={
-            "exists": existing is not None,
-            "size": len(content),
-            "sha256": hashlib.sha256(content).hexdigest(),
-        },
+        steps=(
+            plans.freeze_step(
+                action="files.write",
+                href=target,
+                etag=existing_etag,
+                summary=_segments(target)[-1],
+                payload=content,
+                content_type=_content_type(content_type),
+                details={
+                    "exists": existing is not None,
+                    "size": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                },
+            ),
+        ),
     )
 
 
@@ -408,41 +417,111 @@ def plan_delete(profile: Any, *, session: Session, href: str) -> plans.Plan:
     assert existing is not None
     if existing.collection:
         raise FileError("collection deletion is not supported", exits.UNSUPPORTED_STRUCTURE)
-    if not existing.etag:
-        raise FileError(
-            "the server returned no ETag for this file, so it cannot be deleted conditionally"
-        )
-    return plans.write(
+    existing_etag = _strong_etag(existing.etag, "a file deletion")
+    return plans.write_bundle(
         profile=profile.name,
-        action="files.delete",
-        href=target,
-        etag=existing.etag,
         summary=existing.name,
-        details={"size": existing.size},
+        steps=(
+            plans.freeze_step(
+                action="files.delete",
+                href=target,
+                etag=existing_etag,
+                summary=existing.name,
+                details={"size": existing.size},
+            ),
+        ),
     )
 
 
-def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]:
-    """Apply one conditional file mutation and verify its result."""
-    if plan.profile != profile.name:
-        raise plans.PlanError(
-            f"plan {plan.plan_id} was made for profile {plan.profile!r}", exits.USAGE
-        )
-    plans.check_fresh(plan)
-    target = _scoped(profile, plan.href)
+_ACTIONS = {"files.write", "files.delete"}
 
-    if plan.action == "files.write":
-        condition = {"If-Match": plan.etag} if plan.etag else {"If-None-Match": "*"}
+
+def _strong_etag(value: str, operation: str) -> str:
+    candidate = etag.normalize_strong(value)
+    if candidate is None:
+        raise FileError(
+            f"the server returned no strong quoted ETag, so {operation} cannot be conditional",
+            exits.MALFORMED_RESPONSE,
+        )
+    return candidate
+
+
+def validate_step(step: plans.Step) -> None:
+    """Validate file step structure without reading the server."""
+    if step.action not in _ACTIONS:
+        raise plans.PlanError(f"unknown file plan action {step.action!r}", exits.USAGE)
+    body = plans.payload_bytes(step)
+    if step.action == "files.delete":
+        if body:
+            raise plans.PlanError("file deletion steps must not carry a payload", exits.PLAN_STALE)
+        _strong_etag(step.etag, "a file deletion")
+        return
+    _content_type(step.content_type)
+    exists = step.details.get("exists")
+    if not isinstance(exists, bool):
+        raise plans.PlanError("file write steps need an exists classification", exits.PLAN_STALE)
+    if exists:
+        _strong_etag(step.etag, "a file replacement")
+    elif step.etag:
+        raise plans.PlanError("file creations cannot carry an ETag", exits.PLAN_STALE)
+    # Empty files are valid frozen writes; the body only needs to be valid base64.
+    _ = body
+
+
+def _file_target(profile: Any, step: plans.Step) -> str:
+    return _scoped(profile, step.href)
+
+
+def _response_url(response: Any) -> str:
+    return getattr(response, "url", "") or ""
+
+
+def _response_location(response: Any) -> str:
+    header = getattr(response, "header", None)
+    if not callable(header):
+        return ""
+    return header("Location") or ""
+
+
+def _refuse_redirect(response: Any, *, action: str, href: str) -> None:
+    if 300 <= response.status < 400 or _response_location(response):
+        raise FileError(
+            f"the server redirected file {action} at {href}; the target must remain exact",
+            exits.MALFORMED_RESPONSE,
+        )
+    response_url = _response_url(response)
+    if response_url and response_url != href:
+        raise FileError(
+            f"the server answered file {action} for a different href",
+            exits.MALFORMED_RESPONSE,
+        )
+
+
+def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
+    """Execute one frozen file step and verify the exact resource."""
+    validate_step(step)
+    target = _file_target(profile, step)
+    if step.action == "files.write":
+        condition = {"If-Match": step.etag} if step.etag else {"If-None-Match": "*"}
         response = session.request(
             "PUT",
             target,
-            headers={"Content-Type": _content_type(plan.content_type), **condition},
-            data=plans.payload_bytes(plan),
+            headers={"Content-Type": _content_type(step.content_type), **condition},
+            data=plans.payload_bytes(step),
+            max_redirects=0,
         )
-    elif plan.action == "files.delete":
-        response = session.request("DELETE", target, headers={"If-Match": plan.etag})
     else:
-        raise plans.PlanError(f"unknown plan action {plan.action!r}", exits.USAGE)
+        response = session.request(
+            "DELETE",
+            target,
+            headers={"If-Match": step.etag},
+            max_redirects=0,
+        )
+    _refuse_redirect(
+        response,
+        action="write" if step.action == "files.write" else "deletion",
+        href=target,
+    )
 
     if response.status == 412:
         raise plans.PlanError(
@@ -450,31 +529,69 @@ def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]
             "its current state",
             exits.CONFLICT,
         )
-    if response.status == 404 and plan.action == "files.delete":
+    if response.status == 404 and step.action == "files.delete":
         raise FileError(f"no file exists at {target}", exits.TARGET_NOT_FOUND)
     if response.status not in {200, 201, 204}:
         raise FileError(
-            f"the server refused the {plan.action} with status {response.status}",
+            f"the server refused the {step.action} with status {response.status}",
             exits.SERVER_ERROR,
         )
 
-    result: dict[str, Any] = {"action": plan.action, "href": target}
-    if plan.action == "files.delete":
-        if stat_resource(profile, session=session, href=target, missing_ok=True) is not None:
-            raise FileError(
-                f"the server still reports a file at {target} after deletion",
-                exits.OUTCOME_UNCERTAIN,
-            )
-        result["verified"] = "deleted"
-        plans.consume(plan.plan_id)
-        return result
+    try:
+        result: dict[str, Any] = {"action": step.action, "href": target}
+        if step.action == "files.delete":
+            if stat_resource(profile, session=session, href=target, missing_ok=True) is not None:
+                raise FileError(
+                    f"the server still reports a file at {target} after deletion",
+                    exits.OUTCOME_UNCERTAIN,
+                )
+            result["verified"] = "deleted"
+            return result
 
-    stored, content = read_file(profile, session=session, href=target)
-    expected = plans.payload_bytes(plan)
-    result.update({"etag": stored.etag, "size": stored.size, "verified": content == expected})
-    if not result["verified"]:
-        raise FileError(
-            f"the server stored different content at {target}", exits.OUTCOME_UNCERTAIN
+        stored, content = read_file(profile, session=session, href=target)
+        expected = plans.payload_bytes(step)
+        result.update(
+            {"etag": stored.etag, "size": stored.size, "verified": content == expected}
         )
-    plans.consume(plan.plan_id)
-    return result
+        if not result["verified"]:
+            raise FileError(
+                f"the server stored different content at {target}", exits.OUTCOME_UNCERTAIN
+            )
+        return result
+    except Exception as exc:
+        raise FileError(
+            f"the server accepted {step.action}, but its final state could not be verified",
+            exits.OUTCOME_UNCERTAIN,
+        ) from exc
+
+
+def reconcile(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
+    """Read the exact file and classify the frozen file operation."""
+    validate_step(step)
+    target = _file_target(profile, step)
+    try:
+        stored, content = read_file(profile, session=session, href=target)
+    except FileError as exc:
+        if exc.code == exits.TARGET_NOT_FOUND and step.action == "files.write":
+            return {"state": "pending"}
+        if exc.code == exits.TARGET_NOT_FOUND and step.action == "files.delete":
+            return {"state": "verified"}
+        if exc.code == exits.TARGET_NOT_FOUND:
+            return {"state": "uncertain"}
+        raise
+    if step.action == "files.write":
+        if content == plans.payload_bytes(step):
+            return {"state": "verified"}
+        old_etag = etag.normalize_strong(step.etag)
+        current_etag = etag.normalize_strong(stored.etag)
+        if step.details["exists"] and current_etag == old_etag:
+            return {"state": "pending"}
+        return {"state": "uncertain"}
+    old_etag = etag.normalize_strong(step.etag)
+    current_etag = etag.normalize_strong(stored.etag)
+    return {"state": "pending" if current_etag == old_etag else "uncertain"}
+
+
+def apply(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
+    """Execute one step for callers that use the resource module directly."""
+    return execute(profile, session=session, step=step)
