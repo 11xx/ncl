@@ -153,7 +153,10 @@ def build_parser() -> argparse.ArgumentParser:
     cal_list = cal_commands.add_parser("list", help="Discover calendars, with href and scope")
     _add_options(cal_list)
 
-    cal_events = cal_commands.add_parser("events", help="List events overlapping a required window")
+    cal_events = cal_commands.add_parser(
+        "events",
+        help="List events with structured URL/status over a required window",
+    )
     _add_options(cal_events)
     cal_events.add_argument("calendar", help="Calendar href, or an unambiguous display name")
     cal_events.add_argument(
@@ -163,7 +166,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--to", dest="end", required=True, help="End instant, ISO 8601 with an offset"
     )
 
-    cal_show = cal_commands.add_parser("show", help="Read one event by href")
+    cal_show = cal_commands.add_parser(
+        "show", help="Read one event by href, including its structured URL/status"
+    )
     _add_options(cal_show)
     cal_show.add_argument("href", help="Event resource href")
 

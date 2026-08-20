@@ -163,6 +163,21 @@ def test_update_alarm_options_are_mutually_exclusive():
         )
 
 
+def test_calendar_help_explains_projection_and_alarm_modes(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["cal", "update", "--help"])
+    update_help = " ".join(capsys.readouterr().out.split())
+
+    assert "--portable-description" in update_help
+    assert "omission preserves" in update_help
+    assert "--clear-alarms" in update_help
+    assert "mutually exclusive" in update_help
+
+    with pytest.raises(SystemExit):
+        cli.main(["cal", "create", "--help"])
+    assert "deterministic DESCRIPTION block" in capsys.readouterr().out
+
+
 def _description(raw: str | bytes) -> str:
     calendar = icalendar.Calendar.from_ical(raw)
     event = next(item for item in calendar.walk() if item.name == "VEVENT")
