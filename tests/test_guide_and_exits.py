@@ -89,3 +89,12 @@ def test_every_exit_code_has_one_response():
     assert "blind retry" in response
     assert "duplicate" in response
     assert "overwrite" in response
+
+def test_guide_notes_refid_repeatability():
+    text = guide.render()
+    assert "REFID" in text
+    assert "repeatable" in text.lower()
+    assert "RFC 9253" in text
+    # The checkpoint repair made generic VTODO reads accept duplicate REFID
+    # while run validation still requires exactly one parameter-free REFID.
+    assert "Singleton VTODO properties cannot repeat except REFID" in text
