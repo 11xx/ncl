@@ -258,10 +258,16 @@ def _validate_todo(component: Any, *, href: str) -> None:
         duration = _property_value(component, "DURATION")
         if not isinstance(duration, dt.timedelta):
             raise TodoError(f"the task{location} has an invalid DURATION")
+        if duration <= dt.timedelta(0):
+            raise TodoError(f"the task{location} has a non-positive DURATION")
         if due_property is not None:
             raise TodoError(f"the task{location} has both DUE and DURATION")
         if start_property is None:
             raise TodoError(f"the task{location} has DURATION without DTSTART")
+        if _value_kind(start) == "DATE" and duration % dt.timedelta(days=1):
+            raise TodoError(
+                f"the task{location} has a sub-day DURATION with a DATE DTSTART"
+            )
     _validate_boundaries(start, due, href=href, code=exits.MALFORMED_RESPONSE)
 
     completed_property = component.get("COMPLETED")
@@ -299,6 +305,11 @@ def _parse_todo(raw: bytes, *, href: str) -> tuple[icalendar.Calendar, Any]:
     if parsed.name != "VCALENDAR":
         raise TodoError(f"the resource at {href} was not a VCALENDAR")
     todos = [item for item in parsed.walk() if item.name == "VTODO"]
+    direct_todos = [item for item in parsed.subcomponents if item.name == "VTODO"]
+    if len(todos) != len(direct_todos):
+        raise TodoError(
+            f"the resource at {href} has a VTODO nested inside another component"
+        )
     if not todos:
         raise TodoError(
             f"the resource at {href} holds no VTODO",
@@ -582,9 +593,17 @@ def _check_calendar_scope(profile: Any, calendar_href: str) -> None:
 
 
 def _check_response_scope(profile: Any, calendar_href: str, href: str) -> None:
-    if not profiles.in_scope(href, (calendar_href,)):
+    selected_authority, selected_segments = profiles.canonicalize_href(calendar_href)
+    response_authority, response_segments = profiles.canonicalize_href(href)
+    direct_child = (
+        response_authority == selected_authority
+        and len(response_segments) == len(selected_segments) + 1
+        and response_segments[:-1] == selected_segments
+    )
+    if not direct_child:
         raise CalendarError(
-            f"{href} is outside the selected calendar collection {calendar_href}",
+            f"{href} is not a direct child of the selected calendar collection "
+            f"{calendar_href}",
             exits.SCOPE_DENIED,
         )
     if not profiles.in_scope(href, list(profile.calendars)):

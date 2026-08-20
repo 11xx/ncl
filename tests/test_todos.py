@@ -146,6 +146,39 @@ def raw_todo(
     return calendar.to_ical()
 
 
+def raw_nested_vtodo() -> bytes:
+    calendar = icalendar.Calendar()
+    calendar.add("prodid", "-//probe//EN")
+    calendar.add("version", "2.0")
+    event = icalendar.Event()
+    event.add("uid", "event")
+    event.add("dtstamp", NOW)
+    nested = icalendar.Todo()
+    nested.add("uid", "nested")
+    nested.add("summary", "Nested")
+    nested.add("dtstamp", NOW)
+    event.add_component(nested)
+    calendar.add_component(event)
+    return calendar.to_ical()
+
+
+def raw_direct_sibling_event() -> bytes:
+    calendar = icalendar.Calendar.from_ical(raw_todo("sibling", "Task"))
+    event = icalendar.Event()
+    event.add("uid", "sibling-event")
+    event.add("dtstamp", NOW)
+    calendar.add_component(event)
+    return calendar.to_ical()
+
+
+def raw_duration_todo(
+    uid: str, *, start: dt.datetime | dt.date, duration: dt.timedelta
+) -> bytes:
+    return add_todo_property(
+        raw_todo(uid, "Duration", start=start), "DURATION", duration
+    )
+
+
 def report_entry(href: str, raw: bytes, etag: str) -> str:
     return f"""<d:response><d:href>{href}</d:href><d:propstat><d:prop>
       <d:getetag>{etag}</d:getetag><c:calendar-data>{escape(raw.decode())}</c:calendar-data>
@@ -204,9 +237,19 @@ def test_list_uses_one_vtodo_report_and_derives_parent_children_with_filters():
     assert all_tasks[0].children == ("child-a", "child-b")
 
 
-def test_task_list_rejects_report_href_outside_selected_collection(monkeypatch, capsys):
-    leak = "https://cloud.example.invalid/remote.php/dav/calendars/bob/tasks/leak.ics"
-    body = report_body(report_entry(leak, raw_todo("leak", "Leak"), '"v1"'))
+@pytest.mark.parametrize(
+    "href",
+    [
+        CAL,
+        CAL + "nested/task.ics",
+        HOME + "events/task.ics",
+        "https://cloud.example.invalid/remote.php/dav/calendars/bob/tasks/leak.ics",
+    ],
+)
+def test_task_list_rejects_report_href_outside_selected_collection(
+    href, monkeypatch, capsys
+):
+    body = report_body(report_entry(href, raw_todo("leak", "Leak"), '"v1"'))
     transport = FakeSession(response(207, body))
     _patch_cli(monkeypatch, transport, [TASK_CALENDAR])
 
@@ -771,6 +814,80 @@ def _patch_cli(monkeypatch, transport, calendars):
         "list_calendars",
         lambda profile, session, calendar_home: calendars,
     )
+
+
+def _task_list_json(monkeypatch, capsys, raw):
+    transport = FakeSession(
+        response(207, report_body(report_entry(TASK, raw, '"v1"')))
+    )
+    _patch_cli(monkeypatch, transport, [TASK_CALENDAR])
+    code = cli._main(["task", "list", "--json", CAL])
+    return code, json.loads(capsys.readouterr().out), transport
+
+
+@pytest.mark.parametrize(
+    ("label", "raw"),
+    [
+        pytest.param("nested-vtodo", raw_nested_vtodo(), id="nested-vtodo"),
+        pytest.param(
+            "zero-duration",
+            raw_duration_todo(
+                "zero", start=dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC), duration=dt.timedelta(0)
+            ),
+            id="zero-duration",
+        ),
+        pytest.param(
+            "negative-duration",
+            raw_duration_todo(
+                "negative",
+                start=dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
+                duration=dt.timedelta(hours=-1),
+            ),
+            id="negative-duration",
+        ),
+        pytest.param(
+            "date-sub-day-duration",
+            raw_duration_todo(
+                "sub-day",
+                start=dt.date(2026, 9, 1),
+                duration=dt.timedelta(hours=1),
+            ),
+            id="date-sub-day-duration",
+        ),
+    ],
+)
+def test_task_list_rejects_malformed_vtodo_shapes(label, raw, monkeypatch, capsys):
+    code, error, transport = _task_list_json(monkeypatch, capsys, raw)
+
+    assert code == exits.MALFORMED_RESPONSE, label
+    assert error["code"] == exits.MALFORMED_RESPONSE
+    assert [request["method"] for request in transport.requests] == ["REPORT"]
+
+
+def test_task_list_reads_whole_day_duration_with_date_start(monkeypatch, capsys):
+    code, output, transport = _task_list_json(
+        monkeypatch,
+        capsys,
+        raw_duration_todo(
+            "whole-day", start=dt.date(2026, 9, 1), duration=dt.timedelta(days=1)
+        ),
+    )
+
+    assert code == exits.OK
+    assert output["tasks"][0]["uid"] == "whole-day"
+    assert output["tasks"][0]["dtstart"] == "20260901"
+    assert output["tasks"][0]["writable"] is False
+    assert output["tasks"][0]["unsupported"] == ["DURATION"]
+    assert [request["method"] for request in transport.requests] == ["REPORT"]
+
+
+def test_task_list_keeps_direct_sibling_component_readable_but_unwritable(monkeypatch, capsys):
+    code, output, transport = _task_list_json(monkeypatch, capsys, raw_direct_sibling_event())
+
+    assert code == exits.OK
+    assert output["tasks"][0]["writable"] is False
+    assert output["tasks"][0]["unsupported"] == ["VEVENT"]
+    assert [request["method"] for request in transport.requests] == ["REPORT"]
 
 
 def test_cli_json_text_and_distinct_collection_exit_paths(monkeypatch, capsys):

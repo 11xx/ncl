@@ -56,12 +56,14 @@ WORK WITH TASKS
   bounded CalDAV report and derives parent/child UIDs from that response; it
   does not read each task separately. Every response entry must carry an href
   and successful calendar data, and every resource must contain exactly one
-  valid VTODO inside the selected collection and profile allowlist. Missing
-  task properties are shown as empty values. Singleton VTODO properties cannot
-  repeat, DUE and DURATION cannot coexist, and an existing COMPLETED value must
-  be UTC. Duplicate UIDs and parent cycles fail closed as ambiguous; a parent
-  outside the report remains visible by UID rather than being guessed or
-  rejected.
+  VTODO as a direct child of VCALENDAR, with the resource exactly one direct
+  child of the selected collection and inside the profile allowlist. A VTODO
+  nested inside another component is malformed; direct sibling components are
+  readable but named unsupported. Missing task properties are shown as empty
+  values. Singleton VTODO properties cannot repeat, DUE and DURATION cannot
+  coexist, and an existing COMPLETED value must be UTC. Duplicate UIDs and
+  parent cycles fail closed as ambiguous; a parent outside the report remains
+  visible by UID rather than being guessed or rejected.
 
   ncl task create <calendar> --summary S [--start <iso>] [--due <iso>]
   ncl task update <task-href> --summary S
@@ -80,8 +82,9 @@ WORK WITH TASKS
   properties and nested components; only DTSTAMP and LAST-MODIFIED may be
   refreshed by the server. A deletion is verified only when the exact href
   returns 404. Redirects, persistent targets, and uncertain readbacks leave
-  the plan pending. Recurrence, scheduling structures, DURATION, and unsupported
-  sibling components remain readable but are refused for mutation.
+  the plan pending. Recurrence, scheduling structures, positive DURATION, and
+  unsupported sibling components remain readable but are refused for mutation;
+  a DATE DTSTART can use DURATION only in whole days or weeks.
 
 REACH ALLOWLISTED FILES
   ncl files list <collection-href>  List one collection, without recursion.

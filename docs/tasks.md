@@ -17,14 +17,16 @@ ncl task show <task-href>
 `task list` sends one depth-one `calendar-query` REPORT filtered to `VTODO`.
 Status filters are applied to that response, and parent/child relationships
 come from each task's `RELATED-TO;RELTYPE=PARENT` property. The command does
-not issue a request per task. Every REPORT response entry needs an href inside
-the selected collection and profile allowlist, plus successful calendar data.
-Each resource must contain exactly one VTODO with a nonempty UID, valid
-timestamp and modeled value types, an allowed status, priority, and percentage.
-RFC singleton properties cannot repeat, `DUE` and `DURATION` cannot coexist,
-and an existing `COMPLETED` value must be a UTC date-time. Duplicate UIDs and
-parent cycles are ambiguous and fail closed; a parent UID not present in the
-collection remains visible.
+not issue a request per task. Every REPORT response entry needs an href naming
+exactly one direct child resource of the selected collection and profile
+allowlist, plus successful calendar data. Each resource must contain exactly
+one VTODO as a direct child of VCALENDAR, with a nonempty UID, valid timestamp
+and modeled value types, an allowed status, priority, and percentage. A VTODO
+nested inside another component is malformed; direct sibling components remain
+readable and are named as unsupported. RFC singleton properties cannot repeat,
+`DUE` and `DURATION` cannot coexist, and an existing `COMPLETED` value must be
+a UTC date-time. Duplicate UIDs and parent cycles are ambiguous and fail
+closed; a parent UID not present in the collection remains visible.
 `task show` reads exactly the requested href without collection discovery.
 
 Structured output includes href, calendar href, UID, summary, description,
@@ -62,11 +64,13 @@ a single PUT containing `STATUS:COMPLETED`, one UTC completion instant, and
 
 The modeled mutation fields are summary, description, start, due, priority,
 status, percentage, and the parent UID. A due date may be supplied without a
-start. `DURATION` is listed as unsupported: a valid duration-based task remains
-readable but cannot be modified, so its duration is never dropped or combined
-with a due date. Recurrence properties and scheduling properties are listed by
-name and refused before any modeled field is changed. Unsupported sibling
-components remain readable but unwritable. Unknown properties, time zones, and
-nested components survive an unrelated update. List and create first require
+start. `DURATION` is listed as unsupported: a positive duration-based task
+remains readable but cannot be modified, so its duration is never dropped or
+combined with a due date. A task with a DATE `DTSTART` may use only a whole-day
+duration, including a whole number of weeks. Recurrence properties and
+scheduling properties are listed by name and refused before any modeled field
+is changed. Unsupported sibling components remain readable but unwritable.
+Unknown properties, time zones, and supported nested components survive an
+unrelated update. List and create first require
 the resolved collection to advertise `VTODO`; show and mutations address an
 existing task directly, so they do not perform redundant collection discovery.
