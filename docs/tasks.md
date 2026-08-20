@@ -23,8 +23,8 @@ allowlist, plus successful calendar data. Each resource must contain exactly
 one VTODO as a direct child of VCALENDAR, with a nonempty UID, valid timestamp
 and modeled value types, an allowed status, priority, and percentage. A VTODO
 nested inside another component is malformed; direct sibling components remain
-readable and are named as unsupported. RFC singleton properties cannot repeat,
-`DUE` and `DURATION` cannot coexist, and an existing `COMPLETED` value must be
+readable and are named as unsupported. RFC singleton properties cannot repeat except `REFID` (repeatable per RFC 9253,
+validated per-resource for runs), `DUE` and `DURATION` cannot coexist, and an existing `COMPLETED` value must be
 a UTC date-time. Duplicate UIDs and parent cycles are ambiguous and fail
 closed; a parent UID not present in the collection remains visible.
 `task show` reads exactly the requested href without collection discovery.
