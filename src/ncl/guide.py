@@ -36,6 +36,7 @@ FIND A CALENDAR BEFORE NAMING ONE
 
 READ
   ncl cal events <calendar> --from <iso> --to <iso>
+  ncl cal occurrences <calendar> --from <iso> --to <iso>
   ncl cal show <event-href>
 
   The window is required, and times need an explicit UTC offset: a local time
@@ -43,9 +44,11 @@ READ
   other. JSON event references include `url` and `status`, using an empty value
   when the VEVENT property is absent. Human `cal show` displays the URL, while
   a cancelled event is marked in a human listing without putting links on every
-  row. An event carrying structure this release will not rewrite — a recurrence
-  rule or attendees — is listed with what makes it unwritable. It can be read;
-  it cannot be edited here.
+  row. `cal occurrences` expands validated recurring resources in the bounded
+  window and emits the exact reusable `RECURRENCE-ID` wire identity, including
+  whether the item is the master or an override and whether it is cancelled.
+  Generic event references still mark recurrence and scheduling structure as
+  unwritable; only the explicit target modes below may edit a recurring resource.
 
 WORK WITH TASKS
   ncl task list <calendar> [--status <status>]
@@ -132,8 +135,13 @@ REACH ALLOWLISTED FILES
 
 CHANGE NOTHING BY ACCIDENT
   ncl cal create <calendar> --summary S --from <iso> --to <iso>
-  ncl cal update <event-href> --summary S
-  ncl cal delete <event-href>
+  ncl cal update <event-href> --target resource --summary S
+  ncl cal update <event-href> --target series --summary S
+  ncl cal update <event-href> --target occurrence --recurrence-id <wire-id> --summary S
+  ncl cal update <event-href> --target this-and-future --recurrence-id <wire-id> --summary S
+  ncl cal delete <event-href> --target resource|series
+  ncl cal delete <event-href> --target occurrence --recurrence-id <wire-id>
+  ncl cal delete <event-href> --target this-and-future --recurrence-id <wire-id>
   ncl files write <file-href> --from <local-path>
   ncl files delete <file-href>
 
@@ -152,6 +160,13 @@ CHANGE NOTHING BY ACCIDENT
   verified remote effect, and does not describe the bundle as atomic. A plan
   with any verified or uncertain progress does not expire; an untouched plan
   retains its short freshness window.
+
+  Recurrence series updates change only the master and preserve every override.
+  Occurrence updates address the original wire identity, preserve its UID, and
+  create a cancelled exception for occurrence deletion. This-and-future uses a
+  new UID and freezes the future-resource creation first; the preview states
+  that a partial failure can temporarily duplicate future occurrences. Resume
+  and reconcile use the same ordered plan lifecycle as every other mutation.
 
   Creation is conditional on nothing being there; replacement and deletion are
   conditional on the strong ETag read while planning, so a change that landed
@@ -207,6 +222,12 @@ WHAT IT REFUSES
   ships the chosen exit code and remediation alongside the checks it ran.
   Remote credential, server, and malformed-response failures retain their
   actionable codes instead of becoming a generic local failure.
+
+  Scheduling structures remain refused, as do EXRULE, period-valued RDATE,
+  multiple RRULEs, incompatible recurrence value kinds or timezones, RANGE=
+  THISANDFUTURE, recurrence-time shifts, and future partitions whose identity
+  mapping cannot be proven. Attendee and organizer edits are outside this
+  recurrence slice.
 
 Use `ncl <command> --help` for the exact arguments a command accepts.
 """
