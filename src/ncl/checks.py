@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import urllib.parse
+import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,7 +22,97 @@ def _resource_exists(session: Any, href: str) -> bool:
             '<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>'
         ),
     )
-    return response.status in {200, 207}
+    if response.status != 207:
+        return False
+    try:
+        root = ET.fromstring(response.body)
+    except (ET.ParseError, TypeError) as exc:
+        from .identity import IdentityError
+
+        raise IdentityError("the DAV resource response was not valid XML") from exc
+    from .identity import DAV, IdentityError, _element_name, _status_code
+    from .session import SessionError, absolute_url
+
+    if _element_name(root) != (DAV, "multistatus"):
+        raise IdentityError(
+            "the DAV resource response was not a Multi-Status response",
+            exits.MALFORMED_RESPONSE,
+        )
+
+    profile = getattr(session, "profile", None)
+    if profile is not None:
+        try:
+            requested = absolute_url(profile, href)
+        except SessionError as exc:
+            raise IdentityError(exc.message, exc.code) from exc
+    else:
+        requested = href
+
+    def response_href(raw: str) -> str:
+        if profile is not None:
+            try:
+                return absolute_url(profile, raw)
+            except SessionError as exc:
+                raise IdentityError(exc.message, exc.code) from exc
+        if raw == href:
+            return href
+        if raw.startswith("/") and "://" in href:
+            parsed = urllib.parse.urlsplit(href)
+            return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, raw, "", ""))
+        base = href if href.endswith("/") else href.rsplit("/", 1)[0] + "/"
+        return urllib.parse.urljoin(base, raw)
+
+    for entry in root:
+        if _element_name(entry) != (DAV, "response"):
+            continue
+        href_element = next(
+            (item for item in entry if _element_name(item) == (DAV, "href")), None
+        )
+        raw = (href_element.text or "").strip() if href_element is not None else ""
+        if not raw:
+            raise IdentityError(
+                "the DAV resource response omitted a resource href",
+                exits.MALFORMED_RESPONSE,
+            )
+        if response_href(raw) != requested:
+            continue
+
+        direct_status = next(
+            (item for item in entry if _element_name(item) == (DAV, "status")), None
+        )
+        direct_code = _status_code(direct_status.text if direct_status is not None else None)
+        if direct_code is not None:
+            return 200 <= direct_code < 300
+
+        successful = False
+        failed = False
+        for propstat in entry:
+            if _element_name(propstat) != (DAV, "propstat"):
+                continue
+            status = next(
+                (item for item in propstat if _element_name(item) == (DAV, "status")), None
+            )
+            code = _status_code(status.text if status is not None else None)
+            prop = next((item for item in propstat if _element_name(item) == (DAV, "prop")), None)
+            if code is None or prop is None:
+                continue
+            if 200 <= code < 300:
+                successful = True
+            else:
+                failed = True
+        if successful:
+            return True
+        if failed:
+            return False
+        raise IdentityError(
+            "the DAV resource response contained no usable status",
+            exits.MALFORMED_RESPONSE,
+        )
+
+    raise IdentityError(
+        "the DAV resource response omitted the requested resource",
+        exits.MALFORMED_RESPONSE,
+    )
 
 
 @dataclass(frozen=True)
@@ -28,9 +120,15 @@ class Check:
     name: str
     status: str
     detail: str
+    code: int = exits.OK
 
-    def as_dict(self) -> dict[str, str]:
-        return {"name": self.name, "status": self.status, "detail": self.detail}
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "status": self.status,
+            "detail": self.detail,
+            "code": self.code,
+        }
 
 
 @dataclass(frozen=True)
@@ -39,15 +137,18 @@ class Report:
 
     @property
     def exit_code(self) -> int:
-        return (
-            exits.OK
-            if all(check.status != "fail" for check in self.checks)
-            else exits.PRECONDITION_FAILED
-        )
+        for check in self.checks:
+            if check.status == "fail":
+                return check.code or exits.PRECONDITION_FAILED
+        return exits.OK
 
     def as_dict(self) -> dict[str, Any]:
+        code = self.exit_code
         return {
             "checks": [check.as_dict() for check in self.checks],
+            "code": code,
+            "exit_code": code,
+            "remediation": exits.RESPONSE.get(code),
             "response": {str(code): message for code, message in exits.RESPONSE.items()},
         }
 
@@ -66,13 +167,20 @@ def probe_libsecret() -> tuple[bool, str]:
     return secret_store.probe_backend("libsecret")
 
 
-def _check(name: str, status: str, detail: str) -> Check:
-    return Check(name=name, status=status, detail=detail)
+def _check(name: str, status: str, detail: str, code: int = exits.OK) -> Check:
+    if status == "fail" and code == exits.OK:
+        code = exits.PRECONDITION_FAILED
+    return Check(name=name, status=status, detail=detail, code=code)
 
 
 def _run_probe(name: str, probe: Callable[[], tuple[bool, str]]) -> Check:
     passed, detail = probe()
-    return _check(name, "pass" if passed else "fail", detail)
+    return _check(
+        name,
+        "pass" if passed else "fail",
+        detail,
+        exits.OK if passed else exits.CREDENTIAL_STORE_FAILED,
+    )
 
 
 def _skip(name: str, detail: str) -> Check:
@@ -92,11 +200,12 @@ def _run_authenticated(profile: Any, checks: list[Check], *, transport: Any = No
     try:
         login_name = secret_store.get(profile, "login_name")
         app_password = secret_store.get(profile, "app_password")
-    except secret_store.SecretError:
+    except secret_store.SecretError as exc:
         detail = "the secret backend could not read the credential; fix the backend"
+        code = getattr(exc, "code", exits.PRECONDITION_FAILED)
         checks.extend(
             (
-                _check(f"credential:{profile.name}", "fail", detail),
+                _check(f"credential:{profile.name}", "fail", detail, code),
                 _skip(f"principal:{profile.name}", "credential lookup failed"),
                 _skip(f"calendar-home:{profile.name}", "credential lookup failed"),
             )
@@ -135,12 +244,14 @@ def _run_authenticated(profile: Any, checks: list[Check], *, transport: Any = No
         result = identity.discover(profile, session=session)
     except (SessionError, identity.IdentityError) as exc:
         detail = _safe_error_detail(exc)
-        checks.append(_check(f"credential:{profile.name}", "fail", detail))
+        code = getattr(exc, "code", exits.PRECONDITION_FAILED)
+        checks.append(_check(f"credential:{profile.name}", "fail", detail, code))
         checks.append(
             _check(
                 f"principal:{profile.name}",
                 "fail",
                 detail,
+                code,
             )
         )
         checks.append(_skip(f"calendar-home:{profile.name}", "principal discovery failed"))
@@ -164,17 +275,36 @@ def _run_authenticated(profile: Any, checks: list[Check], *, transport: Any = No
         for index, entry in enumerate(entries):
             name = f"remote:{profile.name}:{field}:{index}"
             if field == "calendars" and not identity.in_calendar_home(entry, result.calendar_home):
-                checks.append(_check(name, "fail", "allowlist entry is outside the calendar home"))
+                checks.append(
+                    _check(
+                        name,
+                        "fail",
+                        "allowlist entry is outside the calendar home",
+                        exits.PRECONDITION_FAILED,
+                    )
+                )
                 continue
             try:
                 exists = _resource_exists(session, entry)
             except (SessionError, identity.IdentityError) as exc:
-                checks.append(_check(name, "fail", _safe_error_detail(exc)))
+                checks.append(
+                    _check(
+                        name,
+                        "fail",
+                        _safe_error_detail(exc),
+                        getattr(exc, "code", exits.PRECONDITION_FAILED),
+                    )
+                )
             else:
                 checks.append(
                     _check(name, "pass", "resource exists")
                     if exists
-                    else _check(name, "fail", "resource was not found")
+                    else _check(
+                        name,
+                        "fail",
+                        "resource was not found",
+                        exits.TARGET_NOT_FOUND,
+                    )
                 )
 
 

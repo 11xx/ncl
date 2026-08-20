@@ -248,8 +248,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_options(cal_update)
     cal_update.add_argument("href", help="Event resource href")
     cal_update.add_argument("--summary")
-    cal_update.add_argument("--from", dest="start", help="Start instant, ISO 8601 with an offset")
-    cal_update.add_argument("--to", dest="end", help="End instant, ISO 8601 with an offset")
+    cal_update.add_argument(
+        "--from",
+        dest="start",
+        help="Start instant with an offset, or YYYY-MM-DD for an all-day event",
+    )
+    cal_update.add_argument(
+        "--to",
+        dest="end",
+        help="End instant with an offset, or YYYY-MM-DD for an all-day event",
+    )
     cal_update.add_argument("--description")
     cal_update.add_argument("--location")
     cal_update.add_argument("--priority", type=int, help="1 is highest, 9 is lowest")
@@ -351,7 +359,9 @@ def build_parser() -> argparse.ArgumentParser:
     plan_show = plan_commands.add_parser("show", help="Show one plan in full")
     _add_options(plan_show)
     plan_show.add_argument("plan_id")
-    plan_cancel = plan_commands.add_parser("cancel", help="Discard a plan without applying it")
+    plan_cancel = plan_commands.add_parser(
+        "cancel", help="Discard a plan; --json emits a cancellation object"
+    )
     _add_options(plan_cancel)
     plan_cancel.add_argument("plan_id")
 
@@ -441,6 +451,15 @@ def _moment(value: str, label: str) -> datetime.datetime:
             exits.USAGE,
         )
     return parsed
+
+
+def _boundary_moment(value: str, label: str) -> datetime.datetime | datetime.date:
+    if len(value) == 10 and value[4] == "-" and value[7] == "-":
+        try:
+            return datetime.date.fromisoformat(value)
+        except ValueError as exc:
+            raise events.EventError(f"{label} is not a valid all-day date", exits.USAGE) from exc
+    return _moment(value, label)
 
 
 def _resolved_calendar(profile: Any, transport: session.Session, target: str) -> str:
@@ -537,9 +556,9 @@ def _run_cal(args: argparse.Namespace) -> int:
         if args.summary is not None:
             changes["SUMMARY"] = args.summary
         if args.start is not None:
-            changes["DTSTART"] = _moment(args.start, "--from")
+            changes["DTSTART"] = _boundary_moment(args.start, "--from")
         if args.end is not None:
-            changes["DTEND"] = _moment(args.end, "--to")
+            changes["DTEND"] = _boundary_moment(args.end, "--to")
         if args.description is not None:
             changes["DESCRIPTION"] = args.description
         if args.location is not None:
@@ -601,7 +620,10 @@ def _run_plan(args: argparse.Namespace) -> int:
         return exits.OK
     if args.plan_command == "cancel":
         plans.consume(args.plan_id)
-        render.emit(f"cancelled {args.plan_id}")
+        if args.json:
+            _json({"cancelled": args.plan_id})
+        else:
+            render.emit(f"cancelled {args.plan_id}")
         return exits.OK
     return exits.USAGE
 
@@ -671,8 +693,8 @@ def _run_files(args: argparse.Namespace) -> int:
 
 def _run_apply(args: argparse.Namespace) -> int:
     profile = _selected_profile(args)
-    plan = plans.read(args.plan_id)
-    with plans.claim(plan.plan_id):
+    with plans.claim(args.plan_id):
+        plan = plans.read(args.plan_id)
         transport = session.Session(profile)
         if plan.action.startswith("cal."):
             result = mutate.apply(profile, session=transport, plan=plan)

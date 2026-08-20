@@ -2,12 +2,24 @@ from __future__ import annotations
 
 import json
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 from test_auth import FakeTransport, home_response, principal_response, response
 from test_config import VALID, write_config
 
-from ncl import checks, cli, exits, secrets
+from ncl import checks, cli, exits, identity, secrets
+
+
+def resource_response(href: str):
+    body = (
+        '<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">'
+        f"<d:response><d:href>{href}</d:href>"
+        "<d:propstat><d:prop><d:resourcetype/></d:prop>"
+        "<d:status>HTTP/1.1 200 OK</d:status></d:propstat>"
+        "</d:response></d:multistatus>"
+    ).encode()
+    return response(207, body)
 
 
 def test_broken_config_fails_doctor(tmp_path):
@@ -48,8 +60,8 @@ def test_doctor_authenticated_checks_resolve_identity_and_allowlists(monkeypatch
         [
             principal_response(),
             home_response(),
-            response(207),
-            response(207),
+            resource_response("/remote.php/dav/calendars/alice/"),
+            resource_response("/remote.php/dav/files/alice/work/"),
         ]
     )
 
@@ -95,13 +107,14 @@ def test_doctor_authenticated_remote_failures_fail_with_bounded_details(
             principal_response(),
             home_response(),
             response(remote_status),
-            response(207),
+            resource_response("/remote.php/dav/files/alice/work/"),
         ]
     )
 
     report = checks.run(path, transport=transport)
 
-    assert report.exit_code == exits.PRECONDITION_FAILED
+    expected_code = exits.TARGET_NOT_FOUND if remote_status == 404 else exits.SERVER_ERROR
+    assert report.exit_code == expected_code
     remote = next(check for check in report.checks if check.name == "remote:home:calendars:0")
     assert remote.status == "fail"
     assert expected_detail in remote.detail
@@ -140,6 +153,40 @@ def test_doctor_fails_when_secret_backend_cannot_read(monkeypatch, tmp_path):
     credential = next(check for check in report.checks if check.name == "credential:home")
     assert "no credential" not in credential.detail
     assert "fix the backend" in credential.detail
+
+
+def test_doctor_preserves_credential_rejection_code_and_json_remediation(
+    monkeypatch, tmp_path
+):
+    path = write_config(tmp_path)
+    monkeypatch.setattr(checks, "probe_pass", lambda: (True, "fixture pass"))
+    stored = {"login_name": "alice@example.invalid", "app_password": "fixture-secret"}
+    monkeypatch.setattr(secrets, "get", lambda profile, key: stored.get(key))
+
+    report = checks.run(path, transport=FakeTransport([response(401)]))
+    output = report.as_dict()
+
+    assert report.exit_code == exits.CREDENTIAL_REJECTED
+    assert output["code"] == exits.CREDENTIAL_REJECTED
+    assert output["exit_code"] == exits.CREDENTIAL_REJECTED
+    assert output["remediation"] == exits.RESPONSE[exits.CREDENTIAL_REJECTED]
+    assert all(
+        check.code == exits.CREDENTIAL_REJECTED
+        for check in report.checks
+        if check.status == "fail"
+    )
+
+
+@pytest.mark.parametrize("body", [b"", b"<root/>"])
+def test_resource_existence_rejects_bodyless_or_wrong_root_207(body):
+    session = SimpleNamespace(
+        request=lambda *args, **kwargs: response(207, body),
+    )
+
+    with pytest.raises(identity.IdentityError) as error:
+        checks._resource_exists(session, "/remote.php/dav/files/alice/work/")
+
+    assert getattr(error.value, "code", None) == exits.MALFORMED_RESPONSE
 
 
 def test_doctor_json_contains_checks_and_full_exit_map(monkeypatch, tmp_path, capsys):
