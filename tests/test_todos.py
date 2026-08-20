@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+from types import SimpleNamespace
 from xml.sax.saxutils import escape
 
 import icalendar
 import pytest
 
 from ncl import caldav, cli, exits, plans, todos
+from ncl import session as http_session
 from ncl.caldav import CalendarError
 from ncl.config import Profile
 from ncl.identity import Identity
@@ -52,6 +54,19 @@ class FakeSession:
         self.requests: list[dict] = []
 
     def request(self, method, url, *, headers=None, data=None, **kwargs):
+        self.requests.append(
+            {"method": method, "url": url, "headers": headers, "data": data, "kwargs": kwargs}
+        )
+        assert self.responses, f"unexpected request: {method} {url}"
+        return self.responses.pop(0)
+
+
+class HttpTransport:
+    def __init__(self, *responses: Response):
+        self.responses = list(responses)
+        self.requests: list[dict] = []
+
+    def request(self, method, url, *, headers=None, data=None, timeout=None):
         self.requests.append({"method": method, "url": url, "headers": headers, "data": data})
         assert self.responses, f"unexpected request: {method} {url}"
         return self.responses.pop(0)
@@ -61,8 +76,18 @@ def response(
     status: int,
     body: bytes = b"",
     headers: dict[str, str] | None = None,
+    *,
+    url: str = "",
 ) -> Response:
-    return Response(status, headers or {}, body, CAL)
+    return Response(status, headers or {}, body, url)
+
+
+def replace_todo_property(raw: bytes, name: str, value, *, parameters=None) -> bytes:
+    calendar = icalendar.Calendar.from_ical(raw)
+    todo = next(item for item in calendar.walk() if item.name == "VTODO")
+    todo.pop(name, None)
+    todo.add(name, value, parameters=parameters)
+    return calendar.to_ical()
 
 
 def raw_todo(
@@ -195,7 +220,6 @@ def test_due_only_creation_has_no_start_and_freezes_a_task_plan(tmp_path, monkey
 
 def test_create_update_complete_delete_apply_conditionally_and_read_back(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
-    created = raw_todo("created", "Created", due=dt.date(2026, 9, 3))
     create_plan = todos.plan_create(
         PROFILE,
         calendar_href=CAL,
@@ -203,6 +227,7 @@ def test_create_update_complete_delete_apply_conditionally_and_read_back(tmp_pat
         due=dt.date(2026, 9, 3),
         now=NOW,
     )
+    created = plans.payload_bytes(create_plan)
     create_transport = FakeSession(
         response(201), response(200, created, {"ETag": '"created"'})
     )
@@ -264,10 +289,12 @@ def test_create_update_complete_delete_apply_conditionally_and_read_back(tmp_pat
         session=FakeSession(response(200, completed, {"ETag": '"v3"'})),
         href=TASK,
     )
-    delete_transport = FakeSession(response(204))
+    delete_transport = FakeSession(response(204), response(404, url=TASK))
     delete_result = todos.apply(PROFILE, session=delete_transport, plan=delete_plan)
     assert delete_result["verified"] == "deleted"
     assert delete_transport.requests[0]["headers"]["If-Match"] == '"v3"'
+    assert [request["method"] for request in delete_transport.requests] == ["DELETE", "GET"]
+    assert delete_transport.requests[1]["url"] == TASK
 
 
 def test_scope_and_etag_conditions_refuse_before_or_during_writes():
@@ -303,6 +330,180 @@ def test_scope_and_etag_conditions_refuse_before_or_during_writes():
     assert conflict_error.value.code == exits.CONFLICT
 
 
+def test_task_fetch_refuses_redirect_before_following_it_on_real_session(monkeypatch):
+    other = CAL + "other.ics"
+    transport = HttpTransport(
+        response(307, headers={"Location": other}, url=TASK),
+        response(200, raw_todo("child", "Read me"), {"ETag": '"v1"'}, url=other),
+    )
+    monkeypatch.setattr(
+        http_session.secrets,
+        "get",
+        lambda profile, key: {"login_name": "alice", "app_password": "fixture"}.get(key),
+    )
+
+    with pytest.raises(http_session.SessionError) as error:
+        todos.fetch(PROFILE, session=http_session.Session(PROFILE, transport=transport), href=TASK)
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+    assert [request["method"] for request in transport.requests] == ["GET"]
+    assert transport.requests[0]["url"] == TASK
+
+
+def test_task_put_redirect_is_refused_and_plan_remains_pending(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    plan = todos.plan_create(PROFILE, calendar_href=CAL, summary="Created", now=NOW)
+    other = CAL + "other.ics"
+    transport = FakeSession(response(307, headers={"Location": other}, url=plan.href))
+
+    with pytest.raises(todos.TodoError) as error:
+        todos.apply(PROFILE, session=transport, plan=plan)
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+    assert [request["method"] for request in transport.requests] == ["PUT"]
+    assert transport.requests[0]["url"] == plan.href
+    assert transport.requests[0]["kwargs"]["max_redirects"] == 0
+    assert plans.read(plan.plan_id).plan_id == plan.plan_id
+
+
+def test_task_readback_redirect_is_outcome_uncertain_and_plan_remains_pending(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    plan = todos.plan_create(PROFILE, calendar_href=CAL, summary="Created", now=NOW)
+    other = CAL + "other.ics"
+    transport = FakeSession(
+        response(201, url=plan.href),
+        response(307, headers={"Location": other}, url=plan.href),
+    )
+
+    with pytest.raises(todos.TodoError) as error:
+        todos.apply(PROFILE, session=transport, plan=plan)
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+    assert [request["method"] for request in transport.requests] == ["PUT", "GET"]
+    assert all(request["url"] == plan.href for request in transport.requests)
+    assert transport.requests[1]["kwargs"]["max_redirects"] == 0
+    assert plans.read(plan.plan_id).plan_id == plan.plan_id
+
+
+def test_task_delete_keeps_plan_when_exact_href_persists(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    raw = raw_todo("child", "Old")
+    plan = todos.plan_delete(
+        PROFILE,
+        session=FakeSession(response(200, raw, {"ETag": '"v1"'}, url=TASK)),
+        href=TASK,
+    )
+    transport = FakeSession(response(204, url=TASK), response(200, raw, url=TASK))
+
+    with pytest.raises(todos.TodoError) as error:
+        todos.apply(PROFILE, session=transport, plan=plan)
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+    assert [request["method"] for request in transport.requests] == ["DELETE", "GET"]
+    assert all(request["url"] == TASK for request in transport.requests)
+    assert transport.requests[1]["kwargs"]["max_redirects"] == 0
+    assert plans.read(plan.plan_id).plan_id == plan.plan_id
+
+
+def test_task_update_readback_compares_unknown_properties_and_keeps_plan(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    raw = raw_todo("child", "Old", unknown=True)
+    plan = todos.plan_update(
+        PROFILE,
+        session=FakeSession(response(200, raw, {"ETag": '"v1"'}, url=TASK)),
+        href=TASK,
+        changes={"SUMMARY": "New"},
+        now=NOW,
+    )
+    altered = plans.payload_bytes(plan).replace(b"X-CUSTOM-FIELD:do-not-lose-me\r\n", b"")
+    transport = FakeSession(
+        response(204, url=TASK), response(200, altered, {"ETag": '"v2"'}, url=TASK)
+    )
+
+    with pytest.raises(todos.TodoError) as error:
+        todos.apply(PROFILE, session=transport, plan=plan)
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+    assert plans.read(plan.plan_id).plan_id == plan.plan_id
+
+
+def test_task_readback_allows_server_timestamps_but_requires_nested_components(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    raw = raw_todo("child", "Old", unknown=True, alarm=True)
+    plan = todos.plan_update(
+        PROFILE,
+        session=FakeSession(response(200, raw, {"ETag": '"v1"'}, url=TASK)),
+        href=TASK,
+        changes={"SUMMARY": "New"},
+        now=NOW,
+    )
+    timestamped = replace_todo_property(
+        replace_todo_property(
+            plans.payload_bytes(plan),
+            "DTSTAMP",
+            dt.datetime(2026, 8, 20, 13, tzinfo=dt.UTC),
+        ),
+        "LAST-MODIFIED",
+        dt.datetime(2026, 8, 20, 13, 1, tzinfo=dt.UTC),
+    )
+    result = todos.apply(
+        PROFILE,
+        session=FakeSession(response(204, url=TASK), response(200, timestamped, url=TASK)),
+        plan=plan,
+    )
+    assert result["verified"] is True
+
+    missing_alarm = timestamped.replace(
+        b"BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\n"
+        b"TRIGGER:-PT15M\r\nEND:VALARM\r\n",
+        b"",
+    )
+    remaining = todos.plan_update(
+        PROFILE,
+        session=FakeSession(response(200, raw, {"ETag": '"v1"'}, url=TASK)),
+        href=TASK,
+        changes={"SUMMARY": "New"},
+        now=NOW,
+    )
+    with pytest.raises(todos.TodoError) as error:
+        todos.apply(
+            PROFILE,
+            session=FakeSession(response(204, url=TASK), response(200, missing_alarm, url=TASK)),
+            plan=remaining,
+        )
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+    assert plans.read(remaining.plan_id).plan_id == remaining.plan_id
+
+
+@pytest.mark.parametrize("etag", ["*", 'W/"v1"', "v1"])
+def test_task_update_and_delete_require_strong_quoted_etags(etag):
+    raw = raw_todo("child", "Old")
+
+    with pytest.raises(todos.TodoError) as update_error:
+        todos.plan_update(
+            PROFILE,
+            session=FakeSession(response(200, raw, {"ETag": etag}, url=TASK)),
+            href=TASK,
+            changes={"SUMMARY": "New"},
+        )
+    assert update_error.value.code == exits.MALFORMED_RESPONSE
+
+    with pytest.raises(todos.TodoError) as delete_error:
+        todos.plan_delete(
+            PROFILE,
+            session=FakeSession(response(200, raw, {"ETag": etag}, url=TASK)),
+            href=TASK,
+        )
+    assert delete_error.value.code == exits.MALFORMED_RESPONSE
+    assert plans.listing() == []
+
+
 def test_parent_relation_and_unknown_data_survive_an_unrelated_update():
     rich = raw_todo(
         "child",
@@ -318,6 +519,96 @@ def test_parent_relation_and_unknown_data_survive_an_unrelated_update():
     assert "RELATED-TO;RELTYPE=PARENT:parent" in patched
     assert "RELATED-TO;RELTYPE=SIBLING:sibling" in patched
     assert "BEGIN:VALARM" in patched
+
+
+def test_task_report_entry_without_successful_calendar_data_is_malformed():
+    body = (
+        b'<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">'
+        b"<d:response><d:href>"
+        + TASK.encode()
+        + b"</d:href></d:response></d:multistatus>"
+    )
+
+    with pytest.raises(todos.TodoError) as error:
+        todos.query(PROFILE, session=FakeSession(response(207, body)), calendar_href=CAL)
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("STATUS", "NOT-A-STATUS", "STATUS"),
+        ("PRIORITY", 10, "PRIORITY"),
+        ("PERCENT-COMPLETE", 101, "PERCENT-COMPLETE"),
+    ],
+)
+def test_task_parser_rejects_invalid_scalar_values(name, value, message):
+    raw = replace_todo_property(raw_todo("child", "Bad"), name, value)
+
+    with pytest.raises(todos.TodoError, match=message) as error:
+        todos._describe(raw, calendar_href=CAL, href=TASK, etag='"v1"')
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        raw_todo("child", "Bad").replace(b"UID:child", b"UID:"),
+        replace_todo_property(
+            raw_todo("child", "Bad"),
+            "DTSTAMP",
+            dt.date(2026, 8, 20),
+            parameters={"VALUE": "DATE"},
+        ),
+        replace_todo_property(raw_todo("child", "Bad"), "COMPLETED", dt.date(2026, 8, 20)),
+        replace_todo_property(
+            raw_todo("child", "Bad", start=dt.date(2026, 9, 1), due=dt.date(2026, 9, 3)),
+            "DUE",
+            dt.datetime(2026, 9, 3, tzinfo=dt.UTC),
+        ),
+        replace_todo_property(
+            raw_todo("child", "Bad", start=dt.date(2026, 9, 1), due=dt.date(2026, 9, 3)),
+            "DUE",
+            dt.date(2026, 8, 31),
+        ),
+    ],
+)
+def test_task_parser_rejects_invalid_identity_and_time_shapes(raw):
+    with pytest.raises(todos.TodoError) as error:
+        todos._describe(raw, calendar_href=CAL, href=TASK, etag='"v1"')
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+
+
+def test_task_list_fails_closed_on_duplicate_uids_and_parent_cycles():
+    duplicate_body = report_body(
+        report_entry(CAL + "one.ics", raw_todo("same", "One"), '"one"'),
+        report_entry(CAL + "two.ics", raw_todo("same", "Two"), '"two"'),
+    )
+    with pytest.raises(todos.TodoError) as duplicate:
+        todos.query(PROFILE, session=FakeSession(response(207, duplicate_body)), calendar_href=CAL)
+    assert duplicate.value.code == exits.AMBIGUOUS_TARGET
+
+    cycle_body = report_body(
+        report_entry(CAL + "a.ics", raw_todo("a", "A", parent_uid="b"), '"a"'),
+        report_entry(CAL + "b.ics", raw_todo("b", "B", parent_uid="a"), '"b"'),
+    )
+    with pytest.raises(todos.TodoError) as cycle:
+        todos.query(PROFILE, session=FakeSession(response(207, cycle_body)), calendar_href=CAL)
+    assert cycle.value.code == exits.AMBIGUOUS_TARGET
+
+
+def test_task_list_retains_a_parent_uid_that_is_outside_the_report():
+    body = report_body(
+        report_entry(CAL + "child.ics", raw_todo("child", "Child", parent_uid="outside"), '"v1"')
+    )
+
+    found = todos.query(PROFILE, session=FakeSession(response(207, body)), calendar_href=CAL)
+
+    assert found[0].parent_uid == "outside"
+    assert found[0].children == ()
 
 
 @pytest.mark.parametrize(
@@ -372,3 +663,47 @@ def test_cli_json_text_and_distinct_collection_exit_paths(monkeypatch, capsys):
     assert code == exits.UNSUPPORTED_COLLECTION
     error = json.loads(capsys.readouterr().out)
     assert error["code"] == exits.UNSUPPORTED_COLLECTION
+
+    _patch_cli(monkeypatch, FakeSession(), [EVENT_CALENDAR])
+    code = cli._main(["task", "create", "Events", "--summary", "No", "--json"])
+    error = json.loads(capsys.readouterr().out)
+    assert code == exits.UNSUPPORTED_COLLECTION
+    assert error["code"] == exits.UNSUPPORTED_COLLECTION
+    assert plans.listing() == []
+
+
+def test_cli_apply_claims_before_loading_and_dispatching_a_task_plan(monkeypatch):
+    order: list[str] = []
+
+    class Claim:
+        def __enter__(self):
+            order.append("claim")
+
+        def __exit__(self, *exc_info):
+            return False
+
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    monkeypatch.setattr(plans, "claim", lambda plan_id: Claim())
+    monkeypatch.setattr(
+        plans,
+        "read",
+        lambda plan_id: order.append("read")
+        or SimpleNamespace(plan_id=plan_id, profile="home", action="task.create"),
+    )
+    monkeypatch.setattr(cli.session, "Session", lambda profile: object())
+    monkeypatch.setattr(todos, "apply", lambda *args, **kwargs: order.append("apply") or {})
+
+    assert cli._run_apply(SimpleNamespace(plan_id="stale", json=True)) == exits.OK
+    assert order == ["claim", "read", "apply"]
+
+
+def test_task_help_states_report_and_exact_delete_contracts(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["task", "list", "--help"])
+    list_help = " ".join(capsys.readouterr().out.split())
+    assert "one CalDAV REPORT" in list_help
+
+    with pytest.raises(SystemExit):
+        cli.main(["task", "delete", "--help"])
+    delete_help = " ".join(capsys.readouterr().out.split())
+    assert "exact task href is absent" in delete_help

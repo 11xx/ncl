@@ -7,7 +7,6 @@ from typing import Any
 
 import icalendar
 
-
 # CalDAV servers may refresh these values while storing a resource. Every
 # other property and nested component remains part of the readback invariant.
 SERVER_MANAGED_PROPERTIES = frozenset({"DTSTAMP", "LAST-MODIFIED"})

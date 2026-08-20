@@ -15,10 +15,10 @@ from typing import Any
 
 import icalendar
 
-from . import exits, plans, profiles
+from . import etag, exits, ical_semantics, plans, profiles
 from .caldav import CalendarError, _canonical
 from .identity import CALDAV, DAV, _element_name, _status_code
-from .session import Session
+from .session import Session, SessionError
 
 PRODID = "-//ai-agent-nextcloud//ncl//EN"
 
@@ -146,11 +146,91 @@ def _parent_uid(component: Any) -> tuple[str, int]:
     return parent, count
 
 
+def _property_value(component: Any, name: str) -> Any:
+    property_value = component.get(name)
+    return getattr(property_value, "dt", None) if property_value is not None else None
+
+
+def _value_kind(value: Any) -> str | None:
+    if isinstance(value, dt.datetime):
+        return "DATE-TIME"
+    if isinstance(value, dt.date):
+        return "DATE"
+    return None
+
+
+def _validate_boundaries(
+    start: Any,
+    due: Any,
+    *,
+    href: str,
+    code: int,
+) -> None:
+    location = f" at {href}" if href else ""
+    start_kind = _value_kind(start)
+    due_kind = _value_kind(due)
+    if start is not None and start_kind is None:
+        raise TodoError(f"the task{location} has an invalid DTSTART", code)
+    if due is not None and due_kind is None:
+        raise TodoError(f"the task{location} has an invalid DUE", code)
+    if start is not None and due is not None:
+        if start_kind != due_kind:
+            raise TodoError(
+                f"the task{location} mixes DATE and DATE-TIME DTSTART and DUE values",
+                code,
+            )
+        try:
+            if due <= start:
+                raise TodoError(f"the task{location} is due no later than it starts", code)
+        except TypeError as exc:
+            raise TodoError(
+                f"the task{location} has incomparable DTSTART and DUE values", code
+            ) from exc
+
+
+def _validate_todo(component: Any, *, href: str) -> None:
+    location = f" at {href}" if href else ""
+    uid = component.get("UID")
+    if uid is None or not str(uid).strip():
+        raise TodoError(f"the task{location} has no UID")
+
+    stamp = _property_value(component, "DTSTAMP")
+    if not isinstance(stamp, dt.datetime) or stamp.tzinfo is None:
+        raise TodoError(f"the task{location} has no valid DTSTAMP")
+
+    start = _property_value(component, "DTSTART")
+    due = _property_value(component, "DUE")
+    if component.get("DTSTART") is not None and start is None:
+        raise TodoError(f"the task{location} has an invalid DTSTART")
+    if component.get("DUE") is not None and due is None:
+        raise TodoError(f"the task{location} has an invalid DUE")
+    _validate_boundaries(start, due, href=href, code=exits.MALFORMED_RESPONSE)
+
+    completed_property = component.get("COMPLETED")
+    completed = _property_value(component, "COMPLETED")
+    if completed_property is not None and not isinstance(completed, dt.datetime):
+        raise TodoError(f"the task{location} has an invalid COMPLETED value")
+
+    status = _component_text(component, "STATUS").upper()
+    if status and status not in TODO_STATUSES:
+        raise TodoError(f"the task{location} has an invalid STATUS value")
+
+    priority = _component_integer(component, "PRIORITY")
+    if priority != "" and priority not in PRIORITY_RANGE:
+        raise TodoError(f"the task{location} has an invalid PRIORITY value")
+
+    percent = _component_integer(component, "PERCENT-COMPLETE")
+    if percent != "" and percent not in PERCENT_RANGE:
+        raise TodoError(f"the task{location} has an invalid PERCENT-COMPLETE value")
+
+
 def _parse_todo(raw: bytes, *, href: str) -> tuple[icalendar.Calendar, Any]:
     try:
         parsed = icalendar.Calendar.from_ical(raw)
     except (IndexError, TypeError, ValueError) as exc:
         raise TodoError(f"the task at {href} was not valid iCalendar") from exc
+    if parsed.name != "VCALENDAR":
+        raise TodoError(f"the resource at {href} was not a VCALENDAR")
     todos = [item for item in parsed.walk() if item.name == "VTODO"]
     if not todos:
         raise TodoError(
@@ -162,6 +242,7 @@ def _parse_todo(raw: bytes, *, href: str) -> tuple[icalendar.Calendar, Any]:
             f"the resource at {href} holds more than one VTODO",
             exits.UNSUPPORTED_STRUCTURE,
         )
+    _validate_todo(todos[0], href=href)
     return parsed, todos[0]
 
 
@@ -221,7 +302,7 @@ def _entry_data(entry: ET.Element) -> tuple[str, bytes]:
     if not raw_href:
         raise TodoError("the CalDAV response omitted a task href")
 
-    data = b""
+    data: bytes | None = None
     for propstat in entry:
         if _element_name(propstat) != (DAV, "propstat"):
             continue
@@ -237,11 +318,19 @@ def _entry_data(entry: ET.Element) -> tuple[str, bytes]:
         for element in prop:
             name = _element_name(element)
             if name == (CALDAV, "calendar-data"):
-                data = (element.text or "").encode("utf-8")
-    return raw_href, data if data else b""
+                candidate = (element.text or "").encode("utf-8")
+                if candidate.strip():
+                    data = candidate
+    if data is None:
+        raise TodoError(
+            f"the CalDAV response for {raw_href} contained no successful calendar-data"
+        )
+    return raw_href, data
 
 
 def _validate_status(value: str) -> str:
+    if not isinstance(value, str):
+        raise TodoError(f"status must be one of {', '.join(TODO_STATUSES)}", exits.USAGE)
     normalized = value.upper()
     if normalized not in TODO_STATUSES:
         raise TodoError(
@@ -252,13 +341,13 @@ def _validate_status(value: str) -> str:
 
 
 def _validate_priority(value: int) -> int:
-    if value not in PRIORITY_RANGE:
+    if isinstance(value, bool) or value not in PRIORITY_RANGE:
         raise TodoError(f"priority must be 0 (unspecified) to 9; got {value}", exits.USAGE)
     return value
 
 
 def _validate_percent(value: int) -> int:
-    if value not in PERCENT_RANGE:
+    if isinstance(value, bool) or value not in PERCENT_RANGE:
         raise TodoError(f"percent must be between 0 and 100; got {value}", exits.USAGE)
     return value
 
@@ -294,6 +383,16 @@ def build_todo(
     sequence: int = 0,
 ) -> str:
     """Serialize one VTODO while leaving recurrence and scheduling absent."""
+    if not isinstance(uid, str) or not uid.strip():
+        raise TodoError("task UID must be nonempty", exits.USAGE)
+    stamped_start = _stamp(start) if start is not None else None
+    stamped_due = _stamp(due) if due is not None else None
+    _validate_boundaries(
+        stamped_start,
+        stamped_due,
+        href="",
+        code=exits.USAGE,
+    )
     calendar = icalendar.Calendar()
     calendar.add("prodid", PRODID)
     calendar.add("version", "2.0")
@@ -304,10 +403,10 @@ def build_todo(
     todo.add("sequence", sequence)
     if description:
         todo.add("description", description)
-    if start is not None:
-        todo.add("dtstart", _stamp(start))
-    if due is not None:
-        todo.add("due", _stamp(due))
+    if stamped_start is not None:
+        todo.add("dtstart", stamped_start)
+    if stamped_due is not None:
+        todo.add("due", stamped_due)
     if priority is not None:
         todo.add("priority", _validate_priority(priority))
     if status:
@@ -435,6 +534,7 @@ def query(
     """List tasks with one depth-one VTODO REPORT and no per-task reads."""
     calendar_href = _canonical(profile, calendar_href)
     _check_calendar_scope(profile, calendar_href)
+    normalized = tuple(_validate_status(status) for status in statuses)
     response = session.request(
         "REPORT",
         calendar_href,
@@ -471,6 +571,30 @@ def query(
             )
         )
 
+    by_uid: dict[str, TodoRef] = {}
+    for task in found:
+        if task.uid in by_uid:
+            raise TodoError(
+                f"the task query returned duplicate UID {task.uid!r}",
+                exits.AMBIGUOUS_TARGET,
+            )
+        by_uid[task.uid] = task
+
+    parent_by_uid = {
+        task.uid: task.parent_uid for task in found if task.uid and task.parent_uid
+    }
+    for uid in parent_by_uid:
+        visited: set[str] = set()
+        current = uid
+        while current in parent_by_uid:
+            if current in visited:
+                raise TodoError(
+                    f"the task hierarchy contains a cycle at UID {current!r}",
+                    exits.AMBIGUOUS_TARGET,
+                )
+            visited.add(current)
+            current = parent_by_uid[current]
+
     children: dict[str, list[str]] = {}
     for task in found:
         if task.parent_uid and task.uid:
@@ -479,7 +603,6 @@ def query(
         replace(task, children=tuple(sorted(children.get(task.uid, [])))) for task in found
     ]
 
-    normalized = tuple(_validate_status(status) for status in statuses)
     if normalized:
         wanted = set(normalized)
         found = [task for task in found if task.status in wanted]
@@ -508,10 +631,41 @@ def _entry_etag(entry: ET.Element) -> str:
     return ""
 
 
+def _response_url(response: Any) -> str:
+    return getattr(response, "url", "") or ""
+
+
+def _response_location(response: Any) -> str:
+    header = getattr(response, "header", None)
+    if not callable(header):
+        return ""
+    return header("Location") or ""
+
+
+def _refuse_redirect(response: Any, *, action: str, href: str) -> None:
+    if 300 <= response.status < 400 or _response_location(response):
+        raise TodoError(
+            f"the server redirected task {action} at {href}; the target must remain exact",
+            exits.MALFORMED_RESPONSE,
+        )
+    response_url = _response_url(response)
+    if response_url and response_url != href:
+        raise TodoError(
+            f"the server answered task {action} for a different href",
+            exits.MALFORMED_RESPONSE,
+        )
+
+
 def fetch(profile: Any, *, session: Session, href: str) -> tuple[TodoRef, bytes]:
     """Read exactly one task resource and retain its original bytes."""
     target = _scoped_href(profile, href)
-    response = session.request("GET", target, headers={"Accept": "text/calendar"})
+    response = session.request(
+        "GET",
+        target,
+        headers={"Accept": "text/calendar"},
+        max_redirects=0,
+    )
+    _refuse_redirect(response, action="read", href=target)
     if response.status == 404:
         raise TodoError(f"no task exists at {target}", exits.TARGET_NOT_FOUND)
     if response.status != 200:
@@ -590,12 +744,15 @@ def plan_create(
     )
 
 
-def _require_etag(reference: TodoRef, operation: str) -> None:
-    if not reference.etag:
+def _require_etag(reference: TodoRef, operation: str) -> str:
+    candidate = etag.normalize_strong(reference.etag)
+    if candidate is None:
         raise TodoError(
-            f"the server returned no ETag for this task, so {operation} cannot be made conditional",
+            f"the server returned no strong quoted ETag for this task, so {operation} "
+            "cannot be made conditional",
             exits.MALFORMED_RESPONSE,
         )
+    return candidate
 
 
 def plan_update(
@@ -607,19 +764,19 @@ def plan_update(
     now: dt.datetime | None = None,
 ) -> plans.Plan:
     reference, raw = fetch(profile, session=session, href=href)
-    _require_etag(reference, "an update")
+    strong = _require_etag(reference, "an update")
     payload = patch_todo(raw, changes, now=now)
     updated = _describe(
         payload.encode("utf-8"),
         calendar_href=reference.calendar_href,
         href=reference.href,
-        etag=reference.etag,
+        etag=strong,
     )
     return plans.write(
         profile=profile.name,
         action="task.update",
         href=reference.href,
-        etag=reference.etag,
+        etag=strong,
         summary=updated.summary,
         payload=payload.encode("utf-8"),
         content_type="text/calendar; charset=utf-8",
@@ -635,7 +792,7 @@ def plan_complete(
     completed: dt.datetime | None = None,
 ) -> plans.Plan:
     reference, raw = fetch(profile, session=session, href=href)
-    _require_etag(reference, "a completion")
+    strong = _require_etag(reference, "a completion")
     captured = _stamp_instant(completed or dt.datetime.now(dt.UTC))
     payload = patch_todo(
         raw,
@@ -650,13 +807,13 @@ def plan_complete(
         payload.encode("utf-8"),
         calendar_href=reference.calendar_href,
         href=reference.href,
-        etag=reference.etag,
+        etag=strong,
     )
     return plans.write(
         profile=profile.name,
         action="task.complete",
         href=reference.href,
-        etag=reference.etag,
+        etag=strong,
         summary=updated.summary,
         payload=payload.encode("utf-8"),
         content_type="text/calendar; charset=utf-8",
@@ -666,41 +823,62 @@ def plan_complete(
 
 def plan_delete(profile: Any, *, session: Session, href: str) -> plans.Plan:
     reference, _ = fetch(profile, session=session, href=href)
-    _require_etag(reference, "a deletion")
+    strong = _require_etag(reference, "a deletion")
     return plans.write(
         profile=profile.name,
         action="task.delete",
         href=reference.href,
-        etag=reference.etag,
+        etag=strong,
         summary=reference.summary,
         details=_details(reference),
     )
 
 
-def _matches(reference: TodoRef, plan: plans.Plan) -> bool:
-    expected = {
-        "summary": plan.summary,
-        "description": plan.details.get("description", ""),
-        "start": plan.details.get("start", ""),
-        "due": plan.details.get("due", ""),
-        "completed": plan.details.get("completed", ""),
-        "percent_complete": plan.details.get("percent_complete", ""),
-        "status": plan.details.get("status", ""),
-        "priority": plan.details.get("priority", ""),
-        "parent_uid": plan.details.get("parent_uid", ""),
-    }
-    actual = {
-        "summary": reference.summary,
-        "description": reference.description,
-        "start": reference.dtstart,
-        "due": reference.due,
-        "completed": reference.completed,
-        "percent_complete": reference.percent_complete,
-        "status": reference.status,
-        "priority": reference.priority,
-        "parent_uid": reference.parent_uid,
-    }
-    return actual == expected
+def _verify_deleted(session: Session, href: str) -> None:
+    try:
+        response = session.request(
+            "GET",
+            href,
+            headers={"Accept": "text/calendar"},
+            max_redirects=0,
+        )
+        _refuse_redirect(response, action="post-delete readback", href=href)
+    except (SessionError, TodoError) as exc:
+        raise TodoError(
+            f"the absence of {href} could not be verified after deletion",
+            exits.OUTCOME_UNCERTAIN,
+        ) from exc
+    if response.status == 404:
+        return
+    raise TodoError(
+        f"the server returned status {response.status} while verifying that {href} was deleted",
+        exits.OUTCOME_UNCERTAIN,
+    )
+
+
+def _readback(profile: Any, *, session: Session, plan: plans.Plan) -> TodoRef:
+    try:
+        stored, stored_raw = fetch(profile, session=session, href=plan.href)
+    except (SessionError, TodoError) as exc:
+        raise TodoError(
+            f"the server accepted {plan.action}, but its exact task readback could not be verified",
+            exits.OUTCOME_UNCERTAIN,
+        ) from exc
+    try:
+        matches = ical_semantics.calendar(stored_raw) == ical_semantics.calendar(
+            plans.payload_bytes(plan)
+        )
+    except ValueError as exc:
+        raise TodoError(
+            f"the server accepted {plan.action}, but its task content could not be compared",
+            exits.OUTCOME_UNCERTAIN,
+        ) from exc
+    if not matches:
+        raise TodoError(
+            f"the server stored different semantic task content at {plan.href}",
+            exits.OUTCOME_UNCERTAIN,
+        )
+    return stored
 
 
 def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]:
@@ -716,21 +894,31 @@ def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]
         )
 
     if plan.action == "task.delete":
-        response = session.request("DELETE", plan.href, headers={"If-Match": plan.etag})
+        response = session.request(
+            "DELETE",
+            plan.href,
+            headers={"If-Match": plan.etag},
+            max_redirects=0,
+        )
+        _refuse_redirect(response, action="deletion", href=plan.href)
     elif plan.action == "task.create":
         response = session.request(
             "PUT",
             plan.href,
             headers={"Content-Type": plan.content_type, "If-None-Match": "*"},
             data=plans.payload_bytes(plan),
+            max_redirects=0,
         )
+        _refuse_redirect(response, action="creation", href=plan.href)
     elif plan.action in {"task.update", "task.complete"}:
         response = session.request(
             "PUT",
             plan.href,
             headers={"Content-Type": plan.content_type, "If-Match": plan.etag},
             data=plans.payload_bytes(plan),
+            max_redirects=0,
         )
+        _refuse_redirect(response, action="update", href=plan.href)
     else:
         raise plans.PlanError(f"unknown plan action {plan.action!r}", exits.USAGE)
 
@@ -754,17 +942,14 @@ def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]
         "uid": plan.details.get("uid", ""),
     }
     if plan.action == "task.delete":
+        _verify_deleted(session, plan.href)
         result["verified"] = "deleted"
         plans.consume(plan.plan_id)
         return result
 
-    stored, _ = fetch(profile, session=session, href=plan.href)
+    stored = _readback(profile, session=session, plan=plan)
     result["etag"] = stored.etag
     result["task"] = stored.as_dict()
-    result["verified"] = _matches(stored, plan)
-    if not result["verified"]:
-        raise TodoError(
-            f"the server stored different task fields at {plan.href}", exits.OUTCOME_UNCERTAIN
-        )
+    result["verified"] = True
     plans.consume(plan.plan_id)
     return result

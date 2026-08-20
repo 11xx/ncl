@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 
-
 _STRONG_QUOTED = re.compile(r'^"[\x21\x23-\x7e\x80-\xff]*"$')
 
 

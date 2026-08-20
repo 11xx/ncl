@@ -309,7 +309,11 @@ def build_parser() -> argparse.ArgumentParser:
     task_commands = task.add_subparsers(
         dest="task_command", required=True, metavar="<command>", parser_class=_Parser
     )
-    task_list = task_commands.add_parser("list", help="List tasks from one collection")
+    task_list = task_commands.add_parser(
+        "list",
+        help="List valid tasks with one CalDAV REPORT",
+        description="List valid VTODO resources with one depth-one CalDAV REPORT.",
+    )
     _add_options(task_list)
     task_list.add_argument("calendar", help="Calendar href, or an unambiguous display name")
     task_list.add_argument(
@@ -320,12 +324,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Keep tasks with this status; repeatable",
     )
 
-    task_show = task_commands.add_parser("show", help="Read one task by href")
+    task_show = task_commands.add_parser(
+        "show", help="Read exactly one task href without collection discovery"
+    )
     _add_options(task_show)
     task_show.add_argument("href", help="Task resource href")
 
     task_create = task_commands.add_parser(
-        "create", help="Plan a new task; changes nothing yet"
+        "create", help="Plan a new VTODO in a collection that advertises VTODO"
     )
     _add_options(task_create)
     task_create.add_argument("calendar", help="Calendar href, or an unambiguous display name")
@@ -343,7 +349,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_create.add_argument("--parent", dest="parent_uid", help="Parent task UID")
 
     task_update = task_commands.add_parser(
-        "update", help="Plan a change to one task; changes nothing yet"
+        "update", help="Plan a task change while preserving unmodeled iCalendar data"
     )
     _add_options(task_update)
     task_update.add_argument("href", help="Task resource href")
@@ -361,7 +367,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_update.add_argument("--parent", dest="parent_uid", help="Parent task UID")
 
     task_complete = task_commands.add_parser(
-        "complete", help="Plan one atomic completion; changes nothing yet"
+        "complete", help="Plan one conditional write for atomic task completion"
     )
     _add_options(task_complete)
     task_complete.add_argument("href", help="Task resource href")
@@ -369,7 +375,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--completed", help="Completion instant, ISO 8601 with an explicit offset"
     )
 
-    task_delete = task_commands.add_parser("delete", help="Plan a deletion; changes nothing yet")
+    task_delete = task_commands.add_parser(
+        "delete",
+        help="Plan deletion and verify the exact task href is absent",
+        description="Plan deletion; apply verifies that the exact task href is absent (404).",
+    )
     _add_options(task_delete)
     task_delete.add_argument("href", help="Task resource href")
 
@@ -559,6 +569,15 @@ def _todo_moment(value: str, label: str) -> datetime.datetime | datetime.date:
     if parsed.tzinfo is None:
         raise todos.TodoError(
             f"{label} has no timezone offset; state the offset explicitly", exits.USAGE
+        )
+    return parsed
+
+
+def _todo_instant(value: str, label: str) -> datetime.datetime:
+    parsed = _todo_moment(value, label)
+    if not isinstance(parsed, datetime.datetime):
+        raise todos.TodoError(
+            f"{label} must be an ISO 8601 instant with an explicit offset", exits.USAGE
         )
     return parsed
 
@@ -791,7 +810,7 @@ def _run_task(args: argparse.Namespace) -> int:
         return _emit_plan(plan, args.json)
 
     if args.task_command == "complete":
-        completed = _moment(args.completed, "--completed") if args.completed else None
+        completed = _todo_instant(args.completed, "--completed") if args.completed else None
         plan = todos.plan_complete(
             profile,
             session=transport,
