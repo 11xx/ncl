@@ -241,7 +241,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cal_update.add_argument(
         "--alarm", action="append", dest="alarms",
-        help="Replace reminders, e.g. -PT15M; repeatable",
+        help="Replace reminders with these offsets; repeatable (omission preserves)",
+    )
+    cal_update.add_argument(
+        "--clear-alarms", action="store_true",
+        help="Remove every reminder; mutually exclusive with --alarm",
     )
 
     cal_delete = cal_commands.add_parser("delete", help="Plan a deletion; changes nothing yet")
@@ -453,7 +457,8 @@ def _run_cal(args: argparse.Namespace) -> int:
             _json({"events": [event.as_dict() for event in found]})
         else:
             for event in found:
-                flag = "" if event.writable else f"  [{', '.join(event.unsupported)}]"
+                status = "  [CANCELLED]" if event.status == "CANCELLED" else ""
+                flag = status if event.writable else status + f"  [{', '.join(event.unsupported)}]"
                 render.emit(f"{event.start} .. {event.end}  {event.summary}{flag}")
                 render.emit(f"      {event.href}")
         return exits.OK
@@ -517,8 +522,10 @@ def _run_cal(args: argparse.Namespace) -> int:
             changes["COLOR"] = args.color
         if args.related_to is not None:
             changes["RELATED-TO"] = args.related_to
-        if args.alarms is not None:
-            changes["VALARM"] = args.alarms
+        if args.clear_alarms:
+            changes["VALARM"] = ()
+        elif args.alarms is not None:
+            changes["VALARM"] = tuple(args.alarms)
         if not changes:
             raise events.EventError("no changes were requested", exits.USAGE)
         plan = mutate.plan_update(profile, session=transport, href=args.href, changes=changes)

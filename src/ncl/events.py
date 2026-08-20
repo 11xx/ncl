@@ -49,6 +49,8 @@ class EventRef:
     uid: str
     etag: str
     summary: str
+    url: str
+    status: str
     start: str
     end: str
     all_day: bool
@@ -63,6 +65,8 @@ class EventRef:
             "uid": self.uid,
             "etag": self.etag,
             "summary": self.summary,
+            "url": self.url,
+            "status": self.status,
             "start": self.start,
             "end": self.end,
             "all_day": self.all_day,
@@ -149,6 +153,8 @@ def _describe(raw: bytes, *, calendar_href: str, href: str, etag: str) -> EventR
         uid=_component_text(component, "UID"),
         etag=etag,
         summary=_component_text(component, "SUMMARY"),
+        url=_component_text(component, "URL"),
+        status=_component_text(component, "STATUS"),
         start=_utc(start_value) if start_value is not None else "",
         end=_utc(end_value) if end_value is not None else "",
         all_day=isinstance(start_value, dt.date) and not isinstance(start_value, dt.datetime),

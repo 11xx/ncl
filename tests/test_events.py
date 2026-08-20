@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import datetime as dt
+from types import SimpleNamespace
 
 import pytest
 
-from ncl import events, exits, mutate, plans
+from ncl import cli, events, exits, mutate, plans
 from ncl.caldav import CalendarError
 from ncl.config import Profile
 
@@ -96,6 +97,68 @@ def test_an_event_with_attendees_is_reported_unwritable():
     reference = _ref(WITH_ATTENDEE)
     assert reference.writable is False
     assert set(reference.unsupported) >= {"ORGANIZER", "ATTENDEE"}
+
+
+@pytest.mark.parametrize("status", ["CONFIRMED", "TENTATIVE", "CANCELLED"])
+def test_event_reference_exposes_url_and_each_status(status):
+    raw = RICH.replace(
+        b"END:VEVENT",
+        f"URL:https://example.invalid/event\nSTATUS:{status}\nEND:VEVENT".encode(),
+    )
+    reference = _ref(raw)
+
+    assert reference.url == "https://example.invalid/event"
+    assert reference.status == status
+    assert reference.as_dict()["url"] == "https://example.invalid/event"
+    assert reference.as_dict()["status"] == status
+
+
+def test_event_reference_uses_empty_values_when_url_and_status_are_absent():
+    reference = _ref()
+
+    assert reference.url == ""
+    assert reference.status == ""
+    assert reference.as_dict()["url"] == ""
+    assert reference.as_dict()["status"] == ""
+
+
+def test_cancelled_human_listing_is_marked_without_url_noise(monkeypatch):
+    cancelled = _ref(
+        RICH.replace(
+            b"END:VEVENT",
+            b"URL:https://example.invalid/event\nSTATUS:CANCELLED\nEND:VEVENT",
+        )
+    )
+    output: list[str] = []
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    monkeypatch.setattr(cli.session, "Session", lambda profile: object())
+    monkeypatch.setattr(cli, "_resolved_calendar", lambda profile, transport, target: CAL)
+    monkeypatch.setattr(cli.events, "query", lambda *args, **kwargs: [cancelled])
+    monkeypatch.setattr(cli.render, "emit", lambda value, **kwargs: output.append(value))
+
+    result = cli._run_cal(
+        SimpleNamespace(
+            cal_command="events",
+            profile="home",
+            json=False,
+            calendar=CAL,
+            start="2026-09-01T00:00:00+00:00",
+            end="2026-09-02T00:00:00+00:00",
+        )
+    )
+
+    assert result == exits.OK
+    assert "CANCELLED" in output[0]
+    assert "https://example.invalid/event" not in "\n".join(output)
+
+
+def test_update_alarm_options_are_mutually_exclusive():
+    parser = cli.build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["cal", "update", CAL + "keep-me.ics", "--alarm", "-PT15M", "--clear-alarms"]
+        )
 
 
 def test_an_alarm_does_not_block_editing_because_a_patch_preserves_it():
