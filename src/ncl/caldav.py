@@ -248,3 +248,13 @@ def resolve(calendars: list[Calendar], target: str) -> Calendar:
         f"{len(named)} calendars are named {target!r}; name one by href: {hrefs}",
         exits.AMBIGUOUS_TARGET,
     )
+
+
+def require_component(calendar: Calendar, component: str) -> Calendar:
+    """Require that a resolved collection advertises one component type."""
+    if component not in calendar.components:
+        raise CalendarError(
+            f"calendar {calendar.href} does not advertise {component}",
+            exits.UNSUPPORTED_COLLECTION,
+        )
+    return calendar
