@@ -219,6 +219,21 @@ def test_update_alarm_options_are_mutually_exclusive():
         )
 
 
+def test_cli_accepts_a_separate_negative_alarm_duration():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        ["cal", "update", CAL + "keep-me.ics", "--alarm=-PT15M"]
+    )
+    normalized = cli._normalize_alarm_values(
+        ["cal", "update", CAL + "keep-me.ics", "--alarm", "-PT15M"]
+    )
+    normalized_args = parser.parse_args(normalized)
+
+    assert args.alarms == ["-PT15M"]
+    assert normalized_args.alarms == ["-PT15M"]
+    assert normalized[-1] == "--alarm=-PT15M"
+
+
 def test_calendar_help_explains_projection_and_alarm_modes(capsys):
     with pytest.raises(SystemExit):
         cli.main(["cal", "update", "--help"])

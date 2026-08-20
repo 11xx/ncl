@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -91,6 +92,25 @@ def _add_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--profile", default=argparse.SUPPRESS, help="Select a configured profile"
     )
+
+
+def _normalize_alarm_values(argv: list[str]) -> list[str]:
+    """Keep duration values beginning with ``-`` attached to ``--alarm``."""
+    normalized: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if (
+            token == "--alarm"
+            and index + 1 < len(argv)
+            and argv[index + 1].startswith("-P")
+        ):
+            normalized.append(f"--alarm={argv[index + 1]}")
+            index += 2
+            continue
+        normalized.append(token)
+        index += 1
+    return normalized
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -251,7 +271,10 @@ def build_parser() -> argparse.ArgumentParser:
     alarm_options = cal_update.add_mutually_exclusive_group()
     alarm_options.add_argument(
         "--alarm", action="append", dest="alarms",
-        help="Replace reminders with these offsets; repeatable (omission preserves)",
+        help=(
+            "Replace reminders with these offsets; repeatable (omission preserves), "
+            "e.g. --alarm=-PT15M"
+        ),
     )
     alarm_options.add_argument(
         "--clear-alarms", action="store_true",
@@ -471,7 +494,7 @@ def _run_cal(args: argparse.Namespace) -> int:
             _json({"events": [event.as_dict() for event in found]})
         else:
             for event in found:
-                status = "  [CANCELLED]" if event.status == "CANCELLED" else ""
+                status = "  [CANCELLED]" if event.status.upper() == "CANCELLED" else ""
                 flag = status if event.writable else status + f"  [{', '.join(event.unsupported)}]"
                 render.emit(f"{event.start} .. {event.end}  {event.summary}{flag}")
                 render.emit(f"      {event.href}")
@@ -667,7 +690,7 @@ def _run_apply(args: argparse.Namespace) -> int:
 
 def _main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(_normalize_alarm_values(sys.argv[1:] if argv is None else argv))
     json_output = bool(args.json)
 
     try:
