@@ -81,10 +81,12 @@ CHANGE NOTHING BY ACCIDENT
   semantic iCalendar content. Unknown properties, nested components, boundary
   values, URL, status, and any opted-in portable description must survive as
   planned; only server-managed DTSTAMP and LAST-MODIFIED values may be
-  refreshed. A calendar deletion is
-  established only when the exact href returns 404 after DELETE. A redirect,
-  persistent resource, or malformed readback leaves the plan pending and
-  returns the outcome-uncertain code. Collection deletion is refused.
+  refreshed. Exact event reads and calendar PUT/DELETE requests refuse
+  redirects before following them. A redirect before a mutation reaches a
+  second target is malformed. A calendar deletion is established only when
+  the exact href returns 404 after DELETE. A redirect, persistent resource, or
+  malformed post-write readback leaves the plan pending and returns the
+  outcome-uncertain code. Collection deletion is refused.
 
   This boundary is not authorization. `ncl` cannot tell whether a plan id came
   from whoever read the preview or from the agent that produced it. Where a

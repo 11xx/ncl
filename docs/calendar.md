@@ -56,10 +56,13 @@ projected description must remain as planned. Only server-managed `DTSTAMP` and
 fields may still not show them; the projection only improves plain-text
 interoperability.
 
-A calendar deletion is established only when the exact href returns 404 after
-the DELETE. Redirects, a persistent resource, and malformed or unexpected
-readback are outcome-uncertain; the plan remains pending so the caller can
-reconcile instead of blindly retrying. `cal update --from` and `--to` accept
-`YYYY-MM-DD` when both boundaries are explicitly supplied to convert an event
-between all-day and timed forms; mixed boundary types and non-exclusive
-all-day ends are refused before a plan is written.
+Exact event reads and calendar `PUT`/`DELETE` requests refuse redirects before
+following them. A redirect before a mutation reaches a second target is a
+malformed response. A calendar deletion is established only when the exact
+href returns 404 after the `DELETE`; a redirect, persistent resource, or
+malformed or unexpected post-write readback is outcome-uncertain, and the plan
+remains pending so the caller can reconcile instead of blindly retrying.
+`cal update --from` and `--to` accept `YYYY-MM-DD` when both boundaries are
+explicitly supplied to convert an event between all-day and timed forms; mixed
+boundary types and non-exclusive all-day ends are refused before a plan is
+written.

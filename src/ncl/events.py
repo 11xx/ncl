@@ -139,14 +139,17 @@ def _event_bounds(
         raise EventError(f"the event{location} has no valid DTSTART", code)
 
     end_prop = component.get("DTEND")
-    if end_prop is None:
-        end_prop = component.get("DUE")
+    duration_prop = component.get("DURATION")
+    if component.get("DUE") is not None:
+        raise EventError(f"the event{location} has a VTODO-only DUE property", code)
+    if end_prop is not None and duration_prop is not None:
+        raise EventError(f"the event{location} has both DTEND and DURATION", code)
     end_value = getattr(end_prop, "dt", None) if end_prop is not None else None
     if end_prop is not None and _value_kind(end_value) is None:
         raise EventError(f"the event{location} has an invalid end value", code)
 
-    if end_value is None and component.get("DURATION") is not None:
-        duration = getattr(component.get("DURATION"), "dt", None)
+    if end_value is None and duration_prop is not None:
+        duration = getattr(duration_prop, "dt", None)
         if not isinstance(duration, dt.timedelta):
             raise EventError(f"the event{location} has an invalid DURATION", code)
         try:
@@ -335,18 +338,34 @@ def fetch(profile: Any, *, session: Session, href: str) -> tuple[EventRef, bytes
         raise CalendarError(
             f"{href} is outside this profile's calendar allowlist", exits.SCOPE_DENIED
         )
-    response = session.request("GET", href, headers={"Accept": "text/calendar"})
+    target = _canonical(profile, href)
+    response = session.request(
+        "GET",
+        target,
+        headers={"Accept": "text/calendar"},
+        max_redirects=0,
+    )
+    if 300 <= response.status < 400 or response.header("Location"):
+        raise EventError(
+            f"the server redirected the event at {target}; the resource must remain exact",
+            exits.MALFORMED_RESPONSE,
+        )
+    if response.url and response.url != target:
+        raise EventError(
+            f"the server answered the event at a different href than {target}",
+            exits.MALFORMED_RESPONSE,
+        )
     if response.status == 404:
-        raise EventError(f"no event exists at {href}", exits.TARGET_NOT_FOUND)
+        raise EventError(f"no event exists at {target}", exits.TARGET_NOT_FOUND)
     if response.status != 200:
         raise EventError("the event could not be read", exits.SERVER_ERROR)
     etag = response.header("ETag") or ""
-    calendar_href = href.rsplit("/", 1)[0] + "/"
+    calendar_href = target.rsplit("/", 1)[0] + "/"
     return (
         _describe(
             response.body,
             calendar_href=_canonical(profile, calendar_href),
-            href=_canonical(profile, href),
+            href=target,
             etag=etag.strip(),
         ),
         response.body,

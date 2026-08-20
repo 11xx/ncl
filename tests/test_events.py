@@ -8,6 +8,7 @@ import icalendar
 import pytest
 
 from ncl import cli, events, exits, mutate, plans
+from ncl import session as http_session
 from ncl.caldav import CalendarError
 from ncl.config import Profile
 
@@ -116,6 +117,27 @@ def test_an_event_with_attendees_is_reported_unwritable():
 def test_malformed_stored_events_are_refused_before_exposure(raw):
     with pytest.raises(events.EventError) as error:
         _ref(raw)
+    assert error.value.code == exits.MALFORMED_RESPONSE
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        RICH.replace(
+            b"DTEND;TZID=America/Sao_Paulo:20260901T120000",
+            b"DUE;TZID=America/Sao_Paulo:20260901T120000",
+        ),
+        RICH.replace(
+            b"DTEND;TZID=America/Sao_Paulo:20260901T120000",
+            b"DTEND;TZID=America/Sao_Paulo:20260901T120000\nDURATION:PT1H",
+        ),
+    ],
+    ids=["VTODO-DUE", "DTEND-and-DURATION"],
+)
+def test_vevent_rejects_vtodo_due_and_exclusive_end_conflicts(raw):
+    with pytest.raises(events.EventError) as error:
+        _ref(raw)
+
     assert error.value.code == exits.MALFORMED_RESPONSE
 
 
@@ -495,6 +517,25 @@ class _SequenceEventSession:
         return self.responses.pop(0)
 
 
+class _HttpTransport:
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.requests: list[dict] = []
+
+    def request(self, method, url, *, headers=None, data=None, timeout=None):
+        self.requests.append({"method": method, "url": url, "data": data})
+        return self.responses.pop(0)
+
+
+def _http_response(status, *, body=b"", headers=None):
+    return http_session.Response(
+        status=status,
+        headers=headers or {},
+        body=body,
+        url="",
+    )
+
+
 def test_report_requires_a_multistatus_root():
     session = _SequenceEventSession(_EventResponse(b"<root/>", status=207))
 
@@ -779,6 +820,157 @@ def test_calendar_readback_compares_semantic_content_not_property_order():
         plans.read(plan.plan_id)
 
 
+def _categorised_event() -> bytes:
+    return mutate.build_event(
+        uid="categories@example",
+        summary="Categories",
+        start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+        end=dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
+        categories=("A", "B"),
+    ).encode()
+
+
+def test_calendar_readback_ignores_category_member_order():
+    plan = mutate.plan_update(
+        PROFILE,
+        session=_EventSession(_categorised_event()),
+        href=CAL + "categories.ics",
+        changes={"SUMMARY": "Renamed"},
+    )
+    stored = plans.payload_bytes(plan).replace(b"CATEGORIES:A,B", b"CATEGORIES:B,A")
+    transport = _SequenceEventSession(
+        _EventResponse(b"", status=204),
+        _EventResponse(stored, etag='"v2"'),
+    )
+
+    result = mutate.apply(PROFILE, session=transport, plan=plan)
+
+    assert result["verified"] is True
+    with pytest.raises(plans.PlanError):
+        plans.read(plan.plan_id)
+
+
+def test_calendar_readback_refuses_a_missing_category_member():
+    plan = mutate.plan_update(
+        PROFILE,
+        session=_EventSession(_categorised_event()),
+        href=CAL + "categories.ics",
+        changes={"SUMMARY": "Renamed"},
+    )
+    stored = plans.payload_bytes(plan).replace(b"CATEGORIES:A,B", b"CATEGORIES:A")
+    transport = _SequenceEventSession(
+        _EventResponse(b"", status=204),
+        _EventResponse(stored, etag='"v2"'),
+    )
+
+    with pytest.raises(events.EventError) as error:
+        mutate.apply(PROFILE, session=transport, plan=plan)
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+    assert plans.read(plan.plan_id).plan_id == plan.plan_id
+
+
+def test_calendar_fetch_refuses_redirect_before_following_it(monkeypatch):
+    other = CAL + "other.ics"
+    transport = _HttpTransport(
+        _http_response(307, headers={"Location": other}),
+        _http_response(200, body=RICH, headers={"ETag": '"v1"'}),
+    )
+    monkeypatch.setattr(
+        http_session.secrets,
+        "get",
+        lambda profile, key: {"login_name": "alice", "app_password": "probe"}.get(key),
+    )
+
+    with pytest.raises(http_session.SessionError) as error:
+        events.fetch(
+            PROFILE,
+            session=http_session.Session(PROFILE, transport=transport),
+            href=CAL + "keep-me.ics",
+        )
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+    assert [request["method"] for request in transport.requests] == ["GET"]
+    assert transport.requests[0]["url"] == CAL + "keep-me.ics"
+
+
+@pytest.mark.parametrize("action", ["cal.create", "cal.update"])
+def test_calendar_put_refuses_redirect_before_following_it(action, monkeypatch):
+    if action == "cal.create":
+        plan = mutate.plan_create(
+            PROFILE,
+            calendar_href=CAL,
+            summary="Created",
+            start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+            end=dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
+        )
+        success_status = 201
+    else:
+        plan = mutate.plan_update(
+            PROFILE,
+            session=_EventSession(RICH),
+            href=CAL + "keep-me.ics",
+            changes={"SUMMARY": "Renamed"},
+        )
+        success_status = 204
+    other = CAL + "other.ics"
+    transport = _HttpTransport(
+        _http_response(307, headers={"Location": other}),
+        _http_response(success_status),
+        _http_response(200, body=plans.payload_bytes(plan), headers={"ETag": '"v2"'}),
+    )
+    monkeypatch.setattr(
+        http_session.secrets,
+        "get",
+        lambda profile, key: {"login_name": "alice", "app_password": "probe"}.get(key),
+    )
+
+    with pytest.raises(http_session.SessionError) as error:
+        mutate.apply(
+            PROFILE,
+            session=http_session.Session(PROFILE, transport=transport),
+            plan=plan,
+        )
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+    assert [request["method"] for request in transport.requests] == ["PUT"]
+    assert transport.requests[0]["url"] == plan.href
+    assert plans.read(plan.plan_id).plan_id == plan.plan_id
+
+
+def test_calendar_readback_redirect_is_outcome_uncertain_without_following_it(monkeypatch):
+    plan = mutate.plan_create(
+        PROFILE,
+        calendar_href=CAL,
+        summary="Created",
+        start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+        end=dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
+    )
+    other = CAL + "other.ics"
+    transport = _HttpTransport(
+        _http_response(201),
+        _http_response(307, headers={"Location": other}),
+        _http_response(200, body=plans.payload_bytes(plan), headers={"ETag": '"v2"'}),
+    )
+    monkeypatch.setattr(
+        http_session.secrets,
+        "get",
+        lambda profile, key: {"login_name": "alice", "app_password": "probe"}.get(key),
+    )
+
+    with pytest.raises(events.EventError) as error:
+        mutate.apply(
+            PROFILE,
+            session=http_session.Session(PROFILE, transport=transport),
+            plan=plan,
+        )
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+    assert [request["method"] for request in transport.requests] == ["PUT", "GET"]
+    assert all(request["url"] == plan.href for request in transport.requests)
+    assert plans.read(plan.plan_id).plan_id == plan.plan_id
+
+
 def test_calendar_delete_refuses_redirect_without_following_it():
     plan = mutate.plan_delete(
         PROFILE,
@@ -877,6 +1069,58 @@ def test_all_day_conversion_requires_both_boundaries_and_preserves_exclusive_end
             },
         )
     assert mixed_boundaries.value.code == exits.USAGE
+
+
+def _duration_event(*, all_day: bool = False) -> bytes:
+    raw = RICH.replace(
+        b"DTEND;TZID=America/Sao_Paulo:20260901T120000", b"DURATION:PT1H"
+    )
+    if all_day:
+        raw = raw.replace(
+            b"DTSTART;TZID=America/Sao_Paulo:20260901T110000",
+            b"DTSTART;VALUE=DATE:20260901",
+        ).replace(b"DURATION:PT1H", b"DURATION:P1D")
+    return raw
+
+
+def _event_component(raw: str | bytes):
+    calendar = icalendar.Calendar.from_ical(raw)
+    return next(item for item in calendar.walk() if item.name == "VEVENT")
+
+
+def test_duration_is_preserved_when_only_start_changes():
+    patched = mutate.patch_event(
+        _duration_event(),
+        {"DTSTART": dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC)},
+    )
+    event = _event_component(patched)
+
+    assert event.get("DURATION").dt == dt.timedelta(hours=1)
+    assert "DTEND" not in event
+    assert _ref(patched).end == "20260901T130000Z"
+
+
+@pytest.mark.parametrize("to_all_day", [True, False])
+def test_explicit_end_replaces_duration_during_boundary_conversion(to_all_day):
+    if to_all_day:
+        raw = _duration_event()
+        changes = {
+            "DTSTART": dt.date(2026, 9, 1),
+            "DTEND": dt.date(2026, 9, 2),
+        }
+    else:
+        raw = _duration_event(all_day=True)
+        changes = {
+            "DTSTART": dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+            "DTEND": dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
+        }
+
+    patched = mutate.patch_event(raw, changes)
+    event = _event_component(patched)
+
+    assert "DURATION" not in event
+    assert "DTEND" in event
+    assert _ref(patched).all_day is to_all_day
 
 
 def test_cli_create_and_apply_expose_plan_and_readback_verification(
@@ -1098,6 +1342,43 @@ def test_cli_apply_claims_before_loading_and_dispatching_a_plan(monkeypatch):
 
     assert cli._run_apply(SimpleNamespace(plan_id="stale", json=True)) == exits.OK
     assert order == ["claim", "read", "apply"]
+
+
+@pytest.mark.parametrize("plan_id", ["../escape", "nested/id"])
+def test_cli_apply_rejects_invalid_plan_id_before_creating_a_lock(
+    monkeypatch, capsys, plan_id
+):
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    opened: list[str] = []
+    original_open = plans.os.open
+    monkeypatch.setattr(
+        plans.os,
+        "open",
+        lambda path, *args: (opened.append(str(path)) or original_open(path, *args)),
+    )
+
+    code = cli.main(["apply", plan_id, "--json"])
+    output = json.loads(capsys.readouterr().out)
+
+    assert code == exits.USAGE
+    assert output["code"] == exits.USAGE
+    assert opened == []
+
+
+def test_plan_claim_unlinks_the_lock_before_closing_its_descriptor(monkeypatch):
+    lock_path = plans._directory() / "valid.lock"
+    closed_while_named: list[bool] = []
+    original_close = plans.os.close
+
+    def close(descriptor):
+        closed_while_named.append(lock_path.exists())
+        original_close(descriptor)
+
+    monkeypatch.setattr(plans.os, "close", close)
+    with plans.claim("valid"):
+        assert lock_path.exists()
+
+    assert closed_while_named == [False]
 
 
 def test_cli_apply_reports_locked_and_missing_plans_after_claiming(monkeypatch):

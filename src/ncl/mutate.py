@@ -212,7 +212,7 @@ def _semantic_value(value: Any) -> tuple[Any, ...]:
         return ("duration", typed.total_seconds())
     categories = getattr(value, "cats", None)
     if categories is not None:
-        return ("categories", tuple(str(item) for item in categories))
+        return ("categories", tuple(sorted(str(item) for item in categories)))
     return ("text", str(value))
 
 
@@ -431,6 +431,8 @@ def patch_event(
             event.pop(key, None)
             continue
         value = _boundary(requested, key) if key in {"DTSTART", "DTEND"} else requested
+        if key == "DTEND":
+            event.pop("DURATION", None)
         event.pop(key, None)
         event.add(key, value)
 
@@ -716,7 +718,9 @@ def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]
             plan.href,
             headers={"Content-Type": plan.content_type, "If-None-Match": "*"},
             data=plans.payload_bytes(plan),
+            max_redirects=0,
         )
+        _refuse_redirect(response, action="creation", href=plan.href)
     elif plan.action == "cal.update":
         # Conditional on the ETag observed while planning, so a change that
         # landed in between conflicts instead of being silently overwritten.
@@ -725,7 +729,9 @@ def apply(profile: Any, *, session: Session, plan: plans.Plan) -> dict[str, Any]
             plan.href,
             headers={"Content-Type": plan.content_type, "If-Match": plan.etag},
             data=plans.payload_bytes(plan),
+            max_redirects=0,
         )
+        _refuse_redirect(response, action="update", href=plan.href)
     else:
         raise plans.PlanError(f"unknown plan action {plan.action!r}", exits.USAGE)
 
