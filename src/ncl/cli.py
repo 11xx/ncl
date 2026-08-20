@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+from pathlib import Path
 from typing import Any
 
 from . import (
@@ -11,6 +12,7 @@ from . import (
     checks,
     events,
     exits,
+    files,
     guide,
     identity,
     login,
@@ -95,9 +97,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(
         prog="ncl",
         description=(
-            "ncl — programmatic Nextcloud access for agents: calendars today, other "
-            "Nextcloud apps as they are added. Run `ncl` with no arguments for the "
-            "workflow guide."
+            "ncl — programmatic Nextcloud access for agents over CalDAV and WebDAV. "
+            "Run `ncl` with no arguments for the workflow guide."
         ),
     )
     parser.add_argument("--json", action="store_true", help="Emit JSON")
@@ -247,6 +248,55 @@ def build_parser() -> argparse.ArgumentParser:
     _add_options(cal_delete)
     cal_delete.add_argument("href", help="Event resource href")
 
+    file_commands = commands.add_parser(
+        "files",
+        help="Files over WebDAV",
+        description=(
+            "Scoped Nextcloud files. Resources are addressed by href under a configured "
+            "files root."
+        ),
+    )
+    file_subcommands = file_commands.add_subparsers(
+        dest="files_command", required=True, metavar="<command>", parser_class=_Parser
+    )
+    files_list = file_subcommands.add_parser(
+        "list", help="List one collection without recursion"
+    )
+    _add_options(files_list)
+    files_list.add_argument("href", help="Collection href under an allowlisted files root")
+
+    files_stat = file_subcommands.add_parser("stat", help="Read one resource's metadata")
+    _add_options(files_stat)
+    files_stat.add_argument("href", help="File or collection href")
+
+    files_read = file_subcommands.add_parser("read", help="Read one file")
+    _add_options(files_read)
+    files_read.add_argument("href", help="File href")
+    files_read.add_argument(
+        "--output", help="Write exact bytes to this local path instead of standard output"
+    )
+    files_read.add_argument(
+        "--force", action="store_true", help="Replace an existing --output path"
+    )
+
+    files_write = file_subcommands.add_parser(
+        "write", help="Plan a file creation or replacement; changes nothing yet"
+    )
+    _add_options(files_write)
+    files_write.add_argument("href", help="Destination file href")
+    files_write.add_argument(
+        "--from", dest="source", required=True, help="Local file whose exact bytes to freeze"
+    )
+    files_write.add_argument(
+        "--content-type", default="application/octet-stream", help="Stored media type"
+    )
+
+    files_delete = file_subcommands.add_parser(
+        "delete", help="Plan deletion of one file; changes nothing yet"
+    )
+    _add_options(files_delete)
+    files_delete.add_argument("href", help="File href; collection deletion is refused")
+
     plan = commands.add_parser("plan",
         help="Inspect frozen mutations",
         description=(
@@ -362,10 +412,12 @@ def _emit_plan(plan: Any, json_output: bool) -> int:
     if json_output:
         _json({"plan": plan.as_dict()})
     else:
-        render.emit(f"planned {plan.action}: {plan.summary or plan.uid}")
+        render.emit(f"planned {plan.action}: {plan.summary or plan.href}")
         render.emit(f"  href    {plan.href}")
-        if plan.start:
-            render.emit(f"  when    {plan.start} .. {plan.end}")
+        if plan.details.get("start"):
+            render.emit(
+                f"  when    {plan.details['start']} .. {plan.details.get('end', '')}"
+            )
         render.emit(f"  apply   ncl apply {plan.plan_id}")
         render.emit("  nothing has been changed on the server yet.")
     return exits.CONFIRMATION_REQUIRED
@@ -486,7 +538,7 @@ def _run_plan(args: argparse.Namespace) -> int:
             _json({"plans": [plan.as_dict() for plan in pending]})
         else:
             for plan in pending:
-                render.emit(f"{plan.plan_id}  {plan.action:6} {plan.summary or plan.uid}")
+                render.emit(f"{plan.plan_id}  {plan.action:12} {plan.summary or plan.href}")
         return exits.OK
     if args.plan_command == "show":
         plan = plans.read(args.plan_id)
@@ -503,11 +555,80 @@ def _run_plan(args: argparse.Namespace) -> int:
     return exits.USAGE
 
 
+def _run_files(args: argparse.Namespace) -> int:
+    profile = _selected_profile(args)
+    transport = session.Session(profile)
+
+    if args.files_command == "list":
+        found = files.list_collection(profile, session=transport, href=args.href)
+        if args.json:
+            _json({"files": [reference.as_dict() for reference in found]})
+        else:
+            for reference in found:
+                kind = "d" if reference.collection else "f"
+                size = "-" if reference.size is None else str(reference.size)
+                render.emit(f"{kind} {size:>10}  {reference.name}")
+                render.emit(f"              {reference.href}")
+        return exits.OK
+
+    if args.files_command == "stat":
+        reference = files.stat_resource(profile, session=transport, href=args.href)
+        assert reference is not None
+        if args.json:
+            _json({"file": reference.as_dict()})
+        else:
+            for key, value in reference.as_dict().items():
+                render.emit(f"{key}: {value}")
+        return exits.OK
+
+    if args.files_command == "read":
+        if args.force and not args.output:
+            raise files.FileError("--force requires --output", exits.USAGE)
+        reference, content = files.read_file(profile, session=transport, href=args.href)
+        if args.output:
+            output = files.write_local(args.output, content, force=args.force)
+            result = {"file": reference.as_dict(), "output": str(output)}
+            if args.json:
+                _json(result)
+            else:
+                render.emit(f"wrote {len(content)} bytes to {output}")
+            return exits.OK
+        text = files.text_content(content)
+        if args.json:
+            _json({"file": reference.as_dict(), "content": text})
+        else:
+            render.emit(text, end="")
+        return exits.OK
+
+    if args.files_command == "write":
+        content = Path(args.source).expanduser().read_bytes()
+        plan = files.plan_write(
+            profile,
+            session=transport,
+            href=args.href,
+            content=content,
+            content_type=args.content_type,
+        )
+        return _emit_plan(plan, args.json)
+
+    if args.files_command == "delete":
+        plan = files.plan_delete(profile, session=transport, href=args.href)
+        return _emit_plan(plan, args.json)
+
+    return exits.USAGE
+
+
 def _run_apply(args: argparse.Namespace) -> int:
     profile = _selected_profile(args)
     plan = plans.read(args.plan_id)
     with plans.claim(plan.plan_id):
-        result = mutate.apply(profile, session=session.Session(profile), plan=plan)
+        transport = session.Session(profile)
+        if plan.action.startswith("cal."):
+            result = mutate.apply(profile, session=transport, plan=plan)
+        elif plan.action.startswith("files."):
+            result = files.apply(profile, session=transport, plan=plan)
+        else:
+            raise plans.PlanError(f"unknown plan action {plan.action!r}", exits.USAGE)
     if args.json:
         _json(result)
     else:
@@ -562,6 +683,8 @@ def _main(argv: list[str] | None = None) -> int:
             return _run_whoami(args)
         if args.command == "cal":
             return _run_cal(args)
+        if args.command == "files":
+            return _run_files(args)
         if args.command == "plan":
             return _run_plan(args)
         if args.command == "apply":
@@ -576,6 +699,7 @@ def _main(argv: list[str] | None = None) -> int:
         identity.IdentityError,
         caldav.CalendarError,
         events.EventError,
+        files.FileError,
         plans.PlanError,
     ) as exc:
         return _error(exc, json_output)

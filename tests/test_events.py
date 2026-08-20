@@ -178,15 +178,13 @@ def test_an_expired_plan_is_stale_rather_than_applied(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
     plan = plans.write(
         profile="home",
-        action="create",
-        calendar_href=CAL,
+        action="cal.create",
         href=CAL + "x.ics",
-        uid="x",
         etag="",
         summary="s",
-        start="20260901T110000Z",
-        end="20260901T120000Z",
-        payload="BEGIN:VCALENDAR\nEND:VCALENDAR\n",
+        payload=b"BEGIN:VCALENDAR\nEND:VCALENDAR\n",
+        content_type="text/calendar; charset=utf-8",
+        details={"uid": "x", "start": "20260901T110000Z", "end": "20260901T120000Z"},
         ttl=1,
         now=1000.0,
     )
@@ -199,15 +197,11 @@ def test_a_plan_round_trips_and_is_consumed_once(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
     plan = plans.write(
         profile="home",
-        action="delete",
-        calendar_href=CAL,
+        action="cal.delete",
         href=CAL + "x.ics",
-        uid="x",
         etag='"v1"',
         summary="s",
-        start="",
-        end="",
-        payload="",
+        details={"uid": "x", "start": "", "end": ""},
     )
     assert plans.read(plan.plan_id).etag == '"v1"'
     assert [item.plan_id for item in plans.listing()] == [plan.plan_id]
@@ -222,15 +216,28 @@ def test_a_plan_payload_is_not_echoed_in_its_summary_view(tmp_path, monkeypatch)
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
     plan = plans.write(
         profile="home",
-        action="create",
-        calendar_href=CAL,
+        action="cal.create",
         href=CAL + "x.ics",
-        uid="x",
         etag="",
         summary="s",
-        start="",
-        end="",
-        payload="BEGIN:VCALENDAR\nX-SECRET:zzz\nEND:VCALENDAR\n",
+        payload=b"BEGIN:VCALENDAR\nX-SECRET:zzz\nEND:VCALENDAR\n",
+        content_type="text/calendar; charset=utf-8",
+        details={"uid": "x", "start": "", "end": ""},
     )
     assert "payload" not in plan.as_dict()
     assert plan.as_dict()["payload_bytes"] > 0
+
+
+def test_a_plan_round_trips_arbitrary_bytes(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    plan = plans.write(
+        profile="home",
+        action="files.write",
+        href="https://cloud.example.invalid/remote.php/dav/files/alice/blob",
+        etag="",
+        summary="blob",
+        payload=b"\x00\xff\n",
+        content_type="application/octet-stream",
+    )
+
+    assert plans.payload_bytes(plans.read(plan.plan_id)) == b"\x00\xff\n"

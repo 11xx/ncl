@@ -18,6 +18,8 @@ has to stop after planning and wait to be told to continue.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import fcntl
 import json
 import os
@@ -48,22 +50,20 @@ class Plan:
     plan_id: str
     profile: str
     action: str
-    calendar_href: str
     href: str
-    uid: str
     etag: str
     summary: str
-    start: str
-    end: str
     payload: str
+    content_type: str
+    details: dict[str, Any]
     created_at: float
     expires_at: float
 
     def as_dict(self) -> dict[str, Any]:
         data = asdict(self)
-        # The serialized body is the largest field and is not useful to a
-        # caller deciding whether to apply; the summary and times are.
-        data["payload_bytes"] = len(self.payload.encode("utf-8"))
+        # The serialized body can be large or binary and is not useful to a
+        # caller deciding whether to apply; its exact byte count is.
+        data["payload_bytes"] = len(payload_bytes(self))
         del data["payload"]
         return data
 
@@ -88,14 +88,12 @@ def write(
     *,
     profile: str,
     action: str,
-    calendar_href: str,
     href: str,
-    uid: str,
     etag: str,
     summary: str,
-    start: str,
-    end: str,
-    payload: str,
+    payload: bytes = b"",
+    content_type: str = "",
+    details: dict[str, Any] | None = None,
     ttl: float = DEFAULT_TTL_SECONDS,
     now: float | None = None,
 ) -> Plan:
@@ -105,14 +103,12 @@ def write(
         plan_id=token_source.token_hex(8),
         profile=profile,
         action=action,
-        calendar_href=calendar_href,
         href=href,
-        uid=uid,
         etag=etag,
         summary=summary,
-        start=start,
-        end=end,
-        payload=payload,
+        payload=base64.b64encode(payload).decode("ascii"),
+        content_type=content_type,
+        details=dict(details or {}),
         created_at=created,
         expires_at=created + ttl,
     )
@@ -126,6 +122,16 @@ def write(
     except OSError as exc:
         raise PlanError("the plan could not be stored", exits.PRECONDITION_FAILED) from exc
     return plan
+
+
+def payload_bytes(plan: Plan) -> bytes:
+    """Return the exact frozen request body from a private plan."""
+    try:
+        return base64.b64decode(plan.payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise PlanError(
+            f"plan {plan.plan_id} has an invalid payload", exits.PLAN_STALE
+        ) from exc
 
 
 def read(plan_id: str) -> Plan:
