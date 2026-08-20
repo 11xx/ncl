@@ -248,11 +248,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--related-to", action="append", dest="related_to",
         help="Replace the UIDs this event belongs with; repeatable",
     )
-    cal_update.add_argument(
+    alarm_options = cal_update.add_mutually_exclusive_group()
+    alarm_options.add_argument(
         "--alarm", action="append", dest="alarms",
         help="Replace reminders with these offsets; repeatable (omission preserves)",
     )
-    cal_update.add_argument(
+    alarm_options.add_argument(
         "--clear-alarms", action="store_true",
         help="Remove every reminder; mutually exclusive with --alarm",
     )

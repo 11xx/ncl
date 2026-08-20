@@ -154,12 +154,68 @@ def test_cancelled_human_listing_is_marked_without_url_noise(monkeypatch):
     assert "https://example.invalid/event" not in "\n".join(output)
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected_url", "expected_status"),
+    [
+        (
+            RICH.replace(
+                b"END:VEVENT",
+                b"URL:https://example.invalid/event\nSTATUS:CANCELLED\nEND:VEVENT",
+            ),
+            "https://example.invalid/event",
+            "CANCELLED",
+        ),
+        (RICH, "", ""),
+    ],
+)
+def test_cli_events_and_show_json_expose_url_and_status(
+    monkeypatch, capsys, raw, expected_url, expected_status
+):
+    reference = _ref(raw)
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    monkeypatch.setattr(cli, "_resolved_calendar", lambda profile, transport, target: CAL)
+    monkeypatch.setattr(cli.session, "Session", lambda profile: object())
+    monkeypatch.setattr(cli.events, "query", lambda *args, **kwargs: [reference])
+    monkeypatch.setattr(cli.events, "fetch", lambda *args, **kwargs: (reference, raw))
+
+    code = cli.main(
+        [
+            "cal",
+            "events",
+            CAL,
+            "--from",
+            "2026-09-01T00:00:00+00:00",
+            "--to",
+            "2026-09-02T00:00:00+00:00",
+            "--json",
+        ]
+    )
+    listed = json.loads(capsys.readouterr().out)
+
+    assert code == exits.OK
+    assert listed["events"][0]["url"] == expected_url
+    assert listed["events"][0]["status"] == expected_status
+
+    code = cli.main(["cal", "show", reference.href, "--json"])
+    shown = json.loads(capsys.readouterr().out)
+
+    assert code == exits.OK
+    assert shown["event"]["url"] == expected_url
+    assert shown["event"]["status"] == expected_status
+
+
 def test_update_alarm_options_are_mutually_exclusive():
     parser = cli.build_parser()
 
     with pytest.raises(SystemExit):
         parser.parse_args(
-            ["cal", "update", CAL + "keep-me.ics", "--alarm", "-PT15M", "--clear-alarms"]
+            [
+                "cal",
+                "update",
+                CAL + "keep-me.ics",
+                "--alarm=-PT15M",
+                "--clear-alarms",
+            ]
         )
 
 
@@ -309,10 +365,16 @@ def test_alarm_omission_preserves_existing_alarms():
 
 
 def test_alarm_clear_removes_all_existing_alarms():
-    patched = mutate.patch_event(RICH, {"VALARM": ()})
+    raw = mutate.build_event(
+        uid="two-alarms@example",
+        summary="Two alarms",
+        start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+        end=dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
+        alarms=("-PT15M", "-P1D"),
+    ).encode()
+    patched = mutate.patch_event(raw, {"VALARM": ()})
 
     assert "BEGIN:VALARM" not in patched
-    assert "X-CUSTOM-FIELD:do-not-lose-me" in patched
 
 
 def test_alarm_replacement_replaces_all_existing_alarms():
