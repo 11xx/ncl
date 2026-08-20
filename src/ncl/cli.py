@@ -456,7 +456,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_options(plan_cancel)
     plan_cancel.add_argument("plan_id")
 
-    apply_command = commands.add_parser("apply", help="Execute a frozen plan, once")
+    apply_command = commands.add_parser("apply", help="Execute or resume a frozen plan")
     _add_options(apply_command)
     apply_command.add_argument("plan_id")
 
