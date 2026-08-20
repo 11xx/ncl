@@ -545,7 +545,8 @@ def _resource_occurrences(
     lookback = _duration(resource.master)
     widened_start = start - max(lookback, dt.timedelta(days=1))
     widened = _window_wire(widened_start, resource.model)
-    candidates = list(_rule_between(resource.model, widened, window_end))
+    candidates = [resource.model.start]
+    candidates.extend(_rule_between(resource.model, widened, window_end))
     candidates.extend(resource.model.rdates)
     candidates.extend(item[0] for item in resource.override_by_key.values())
     if len(candidates) > MAX_EXPANSIONS:
@@ -1097,6 +1098,8 @@ def _split_model(
     old_exdates = tuple(item for item in model.exdates if item.key < cut.key)
     new_exdates = tuple(item for item in model.exdates if item.key >= cut.key)
     if model.rrule is None:
+        if cut.key < model.start.key:
+            raise _error("this-and-future cannot split before the master DTSTART")
         old_rule = None
         new_rule = None
         old_keys = {model.start.key, *(item.key for item in old_rdates)}
