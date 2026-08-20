@@ -537,24 +537,32 @@ def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, An
             exits.SERVER_ERROR,
         )
 
-    result: dict[str, Any] = {"action": step.action, "href": target}
-    if step.action == "files.delete":
-        if stat_resource(profile, session=session, href=target, missing_ok=True) is not None:
-            raise FileError(
-                f"the server still reports a file at {target} after deletion",
-                exits.OUTCOME_UNCERTAIN,
-            )
-        result["verified"] = "deleted"
-        return result
+    try:
+        result: dict[str, Any] = {"action": step.action, "href": target}
+        if step.action == "files.delete":
+            if stat_resource(profile, session=session, href=target, missing_ok=True) is not None:
+                raise FileError(
+                    f"the server still reports a file at {target} after deletion",
+                    exits.OUTCOME_UNCERTAIN,
+                )
+            result["verified"] = "deleted"
+            return result
 
-    stored, content = read_file(profile, session=session, href=target)
-    expected = plans.payload_bytes(step)
-    result.update({"etag": stored.etag, "size": stored.size, "verified": content == expected})
-    if not result["verified"]:
-        raise FileError(
-            f"the server stored different content at {target}", exits.OUTCOME_UNCERTAIN
+        stored, content = read_file(profile, session=session, href=target)
+        expected = plans.payload_bytes(step)
+        result.update(
+            {"etag": stored.etag, "size": stored.size, "verified": content == expected}
         )
-    return result
+        if not result["verified"]:
+            raise FileError(
+                f"the server stored different content at {target}", exits.OUTCOME_UNCERTAIN
+            )
+        return result
+    except Exception as exc:
+        raise FileError(
+            f"the server accepted {step.action}, but its final state could not be verified",
+            exits.OUTCOME_UNCERTAIN,
+        ) from exc
 
 
 def reconcile(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:

@@ -7,7 +7,7 @@ import pytest
 
 from ncl import cli, exits, files, plans
 from ncl.config import Profile
-from ncl.session import Response
+from ncl.session import Response, SessionError
 
 PROFILE = Profile(
     "home",
@@ -52,14 +52,17 @@ def failed_entry(href: str, status: str = "HTTP/1.1 404 Not Found") -> str:
 
 
 class FakeSession:
-    def __init__(self, *responses: Response):
+    def __init__(self, *responses: Response | Exception):
         self.responses = list(responses)
         self.requests: list[dict] = []
 
     def request(self, method, url, *, headers=None, data=None, **kwargs):
         self.requests.append({"method": method, "url": url, "headers": headers, "data": data})
         assert self.responses, f"unexpected request: {method} {url}"
-        return self.responses.pop(0)
+        outcome = self.responses.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
 
 
 def _apply_bundle(plan, transport):
@@ -304,7 +307,97 @@ def test_apply_keeps_a_plan_when_readback_differs():
     with pytest.raises(files.FileError) as error:
         _apply_bundle(plan, transport)
     assert error.value.code == exits.OUTCOME_UNCERTAIN
+    assert isinstance(error.value.__cause__, files.FileError)
     assert plans.read(plan.plan_id).plan_id == plan.plan_id
+
+
+def test_apply_keeps_request_failure_classification_before_acceptance(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    plan = files.plan_write(
+        PROFILE,
+        session=FakeSession(response(404)),
+        href=SCRIPT,
+        content=b"new",
+    )
+    transport = FakeSession(
+        SessionError("the configured origin was unreachable", exits.UNREACHABLE)
+    )
+
+    with pytest.raises(SessionError) as error:
+        _apply_bundle(plan, transport)
+
+    assert error.value.code == exits.UNREACHABLE
+    stored = plans.read(plan.plan_id)
+    assert stored.progress[0].state == "pending"
+    assert stored.progress[0].exit_code == exits.UNREACHABLE
+    assert stored.expires_at is not None
+
+
+def test_cli_apply_marks_an_unreachable_put_readback_uncertain_and_blocks_retry(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    plan = files.plan_write(
+        PROFILE,
+        session=FakeSession(response(404)),
+        href=SCRIPT,
+        content=b"new",
+    )
+    first = FakeSession(
+        response(201, url=plan.steps[0].href),
+        SessionError("the configured origin was unreachable", exits.UNREACHABLE),
+    )
+    second = FakeSession()
+    transports = iter((first, second))
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    monkeypatch.setattr(cli.session, "Session", lambda profile: next(transports))
+
+    assert cli.main(["apply", plan.plan_id, "--json"]) == exits.OUTCOME_UNCERTAIN
+    first_result = json.loads(capsys.readouterr().out)
+    assert first_result["code"] == exits.OUTCOME_UNCERTAIN
+    stored = plans.read(plan.plan_id)
+    assert stored.progress[0].state == "uncertain"
+    assert stored.progress[0].exit_code == exits.OUTCOME_UNCERTAIN
+    assert stored.expires_at is None
+    assert [request["method"] for request in first.requests] == ["PUT", "GET"]
+
+    assert cli.main(["apply", plan.plan_id, "--json"]) == exits.OUTCOME_UNCERTAIN
+    second_result = json.loads(capsys.readouterr().out)
+    assert second_result["code"] == exits.OUTCOME_UNCERTAIN
+    assert second.requests == []
+
+
+def test_cli_apply_marks_a_post_delete_readback_failure_uncertain_and_blocks_retry(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    plan = files.plan_delete(
+        PROFILE,
+        session=FakeSession(response(207, multistatus(entry(SCRIPT)))),
+        href=SCRIPT,
+    )
+    first = FakeSession(
+        response(204, url=plan.steps[0].href),
+        SessionError("the configured origin was unreachable", exits.UNREACHABLE),
+    )
+    second = FakeSession()
+    transports = iter((first, second))
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    monkeypatch.setattr(cli.session, "Session", lambda profile: next(transports))
+
+    assert cli.main(["apply", plan.plan_id, "--json"]) == exits.OUTCOME_UNCERTAIN
+    first_result = json.loads(capsys.readouterr().out)
+    assert first_result["code"] == exits.OUTCOME_UNCERTAIN
+    stored = plans.read(plan.plan_id)
+    assert stored.progress[0].state == "uncertain"
+    assert stored.progress[0].exit_code == exits.OUTCOME_UNCERTAIN
+    assert stored.expires_at is None
+    assert [request["method"] for request in first.requests] == ["DELETE", "PROPFIND"]
+
+    assert cli.main(["apply", plan.plan_id, "--json"]) == exits.OUTCOME_UNCERTAIN
+    second_result = json.loads(capsys.readouterr().out)
+    assert second_result["code"] == exits.OUTCOME_UNCERTAIN
+    assert second.requests == []
 
 
 def test_delete_is_conditional_and_verified_missing():
