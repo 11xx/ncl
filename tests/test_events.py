@@ -334,10 +334,25 @@ def test_update_alarm_options_are_mutually_exclusive():
 def test_cli_accepts_a_separate_negative_alarm_duration():
     parser = cli.build_parser()
     args = parser.parse_args(
-        ["cal", "update", CAL + "keep-me.ics", "--alarm=-PT15M"]
+        [
+            "cal",
+            "update",
+            CAL + "keep-me.ics",
+            "--target",
+            "resource",
+            "--alarm=-PT15M",
+        ]
     )
     normalized = cli._normalize_alarm_values(
-        ["cal", "update", CAL + "keep-me.ics", "--alarm", "-PT15M"]
+        [
+            "cal",
+            "update",
+            CAL + "keep-me.ics",
+            "--target",
+            "resource",
+            "--alarm",
+            "-PT15M",
+        ]
     )
     normalized_args = parser.parse_args(normalized)
 
@@ -645,6 +660,7 @@ def test_malformed_portable_block_refuses_before_a_plan_is_written(description):
             PROFILE,
             session=_EventSession(raw),
             href=CAL + "keep-me.ics",
+            target="resource",
             changes={"SUMMARY": "No"},
             portable_description=True,
         )
@@ -735,6 +751,7 @@ def test_update_plan_and_apply_verify_changed_structured_fields_and_projection()
         PROFILE,
         session=_EventSession(initial),
         href=CAL + "update.ics",
+        target="resource",
         changes={"URL": "https://example.invalid/new", "STATUS": "CANCELLED"},
         portable_description=True,
     )
@@ -763,6 +780,7 @@ def test_update_and_delete_planning_reject_non_strong_etags(etag):
             PROFILE,
             session=TaggedSession(RICH),
             href=CAL + "keep-me.ics",
+            target="resource",
             changes={"SUMMARY": "No"},
         )
     assert update_error.value.code == exits.MALFORMED_RESPONSE
@@ -772,6 +790,7 @@ def test_update_and_delete_planning_reject_non_strong_etags(etag):
             PROFILE,
             session=TaggedSession(RICH),
             href=CAL + "keep-me.ics",
+            target="resource",
         )
     assert delete_error.value.code == exits.MALFORMED_RESPONSE
     assert plans.listing() == []
@@ -788,6 +807,7 @@ def test_update_refuses_a_vevent_with_an_extra_vtodo_before_writing_a_plan():
             PROFILE,
             session=_EventSession(raw),
             href=CAL + "keep-me.ics",
+            target="resource",
             changes={"SUMMARY": "No"},
         )
 
@@ -817,6 +837,7 @@ def test_calendar_readback_keeps_unknown_nested_and_end_content(alter):
         PROFILE,
         session=_EventSession(RICH),
         href=CAL + "keep-me.ics",
+        target="resource",
         changes={"SUMMARY": "Renamed"},
     )
     altered = alter(plans.payload_bytes(plan.steps[0]))
@@ -837,6 +858,7 @@ def test_calendar_readback_compares_semantic_content_not_property_order():
         PROFILE,
         session=_EventSession(RICH),
         href=CAL + "keep-me.ics",
+        target="resource",
         changes={"SUMMARY": "Renamed"},
     )
     lines = plans.payload_bytes(plan.steps[0]).decode("utf-8").splitlines(keepends=True)
@@ -872,6 +894,7 @@ def test_calendar_readback_ignores_category_member_order():
         PROFILE,
         session=_EventSession(_categorised_event()),
         href=CAL + "categories.ics",
+        target="resource",
         changes={"SUMMARY": "Renamed"},
     )
     stored = plans.payload_bytes(plan.steps[0]).replace(b"CATEGORIES:A,B", b"CATEGORIES:B,A")
@@ -892,6 +915,7 @@ def test_calendar_readback_refuses_a_missing_category_member():
         PROFILE,
         session=_EventSession(_categorised_event()),
         href=CAL + "categories.ics",
+        target="resource",
         changes={"SUMMARY": "Renamed"},
     )
     stored = plans.payload_bytes(plan.steps[0]).replace(b"CATEGORIES:A,B", b"CATEGORIES:A")
@@ -947,6 +971,7 @@ def test_calendar_put_refuses_redirect_before_following_it(action, monkeypatch):
             PROFILE,
             session=_EventSession(RICH),
             href=CAL + "keep-me.ics",
+            target="resource",
             changes={"SUMMARY": "Renamed"},
         )
         success_status = 204
@@ -1009,6 +1034,7 @@ def test_calendar_delete_refuses_redirect_without_following_it():
         PROFILE,
         session=_EventSession(RICH),
         href=CAL + "keep-me.ics",
+        target="resource",
     )
     transport = _SequenceEventSession(
         _EventResponse(
@@ -1031,6 +1057,7 @@ def test_calendar_delete_keeps_plan_when_exact_href_persists():
         PROFILE,
         session=_EventSession(RICH),
         href=CAL + "keep-me.ics",
+        target="resource",
     )
     transport = _SequenceEventSession(
         _EventResponse(b"", status=204),
@@ -1050,6 +1077,7 @@ def test_calendar_delete_consumes_only_after_exact_href_returns_404():
         PROFILE,
         session=_EventSession(RICH),
         href=CAL + "keep-me.ics",
+        target="resource",
     )
     transport = _SequenceEventSession(
         _EventResponse(b"", status=204),
@@ -1512,6 +1540,8 @@ def test_update_priority_range_is_validated_before_a_plan_is_written(
             "cal",
             "update",
             CAL + "keep-me.ics",
+            "--target",
+            "resource",
             "--priority",
             str(priority),
             "--json",
