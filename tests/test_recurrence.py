@@ -265,6 +265,30 @@ def test_expansion_refuses_safety_ceiling_instead_of_silently_truncating(monkeyp
         )
 
 
+def test_occurrence_discovery_merges_repeatable_rdates_and_exdates_without_duplicates():
+    raw = SERIES.replace(
+        b"EXDATE:20260922T090000Z\r\n",
+        b"RDATE:20260904T090000Z,20260915T090000Z\r\n"
+        b"RDATE:20260918T090000Z\r\n"
+        b"EXDATE:20260922T090000Z\r\n",
+    )
+    found = recurrence.occurrences(
+        PROFILE,
+        session=_report_transport(raw),
+        calendar_href=CAL,
+        start=dt.datetime(2026, 9, 1, tzinfo=dt.UTC),
+        end=dt.datetime(2026, 9, 30, tzinfo=dt.UTC),
+    )
+
+    assert [item.recurrence_id for item in found] == [
+        "20260901T090000Z",
+        "20260908T090000Z",
+        "20260904T090000Z",
+        "20260915T090000Z",
+        "20260918T090000Z",
+    ]
+
+
 @pytest.mark.parametrize(
     ("label", "replacement"),
     [
@@ -360,6 +384,31 @@ def test_occurrence_discovery_emits_tzid_and_date_wire_id_forms():
     assert date_found[0].effective_start == "20260901"
 
 
+def test_cli_occurrences_renders_exact_wire_identity_json(monkeypatch, capsys):
+    transport = _report_transport()
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    monkeypatch.setattr(cli, "_resolved_calendar", lambda profile, session, target: CAL)
+    monkeypatch.setattr(cli.session, "Session", lambda profile: transport)
+
+    code = cli.main(
+        [
+            "cal",
+            "occurrences",
+            CAL,
+            "--from",
+            "2026-09-01T00:00:00+00:00",
+            "--to",
+            "2026-09-30T00:00:00+00:00",
+            "--json",
+        ]
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert code == exits.OK
+    assert output["occurrences"][1]["recurrence_id"] == "20260908T090000Z"
+    assert output["occurrences"][1]["source"] == "override"
+
+
 def test_required_targets_and_safe_resource_refusal(monkeypatch):
     monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
     monkeypatch.setattr(cli.session, "Session", lambda profile: object())
@@ -401,6 +450,18 @@ def test_occurrence_report_ignores_ordinary_resources_but_validates_recurring_on
 
     assert found
     assert {item.href for item in found} == {RESOURCE}
+
+
+def test_occurrence_discovery_rejects_an_override_only_resource():
+    raw = SERIES.replace(MASTER, b"")
+    with pytest.raises(recurrence.RecurrenceError, match="exactly one"):
+        recurrence.occurrences(
+            PROFILE,
+            session=_report_transport(raw),
+            calendar_href=CAL,
+            start=dt.datetime(2026, 9, 1, tzinfo=dt.UTC),
+            end=dt.datetime(2026, 9, 30, tzinfo=dt.UTC),
+        )
 
 
 def test_series_update_is_master_only_and_preserves_override_component_bytes():
@@ -508,6 +569,42 @@ def test_this_and_future_update_uses_new_uid_new_first_order_and_exact_headers()
     assert [request["method"] for request in transport.requests] == ["PUT", "GET", "PUT", "GET"]
     assert transport.requests[0]["headers"]["If-None-Match"] == "*"
     assert transport.requests[2]["headers"]["If-Match"] == '"v1"'
+
+
+def test_this_and_future_keeps_a_proven_simple_until_partition():
+    raw = SERIES.replace(
+        b"RRULE:FREQ=WEEKLY;COUNT=4",
+        b"RRULE:FREQ=WEEKLY;UNTIL=20260922T090000Z",
+    )
+    plan = mutate.plan_update(
+        PROFILE,
+        session=Transport(Response(200, raw, etag='"v1"')),
+        href=RESOURCE,
+        target="this-and-future",
+        recurrence_id="20260915T090000Z",
+        changes={"SUMMARY": "Future title"},
+    )
+
+    old_payload = plans.payload_bytes(plan.steps[1])
+    new_payload = plans.payload_bytes(plan.steps[0])
+    assert b"RRULE:FREQ=WEEKLY;UNTIL=20260908T090000Z\r\n" in old_payload
+    assert b"RRULE:FREQ=WEEKLY;UNTIL=20260922T090000Z\r\n" in new_payload
+
+
+def test_this_and_future_refuses_an_unbounded_complex_rrule_partition():
+    raw = SERIES.replace(
+        b"RRULE:FREQ=WEEKLY;COUNT=4",
+        b"RRULE:FREQ=WEEKLY;BYDAY=MO,WE",
+    ).replace(MOVED_OVERRIDE, b"").replace(FUTURE_OVERRIDE, b"")
+    with pytest.raises(recurrence.RecurrenceError, match="cannot prove"):
+        recurrence.plan_update(
+            PROFILE,
+            session=Transport(Response(200, raw, etag='"v1"')),
+            href=RESOURCE,
+            target="this-and-future",
+            recurrence_id="20260909T090000Z",
+            changes={"SUMMARY": "Future title"},
+        )
 
 
 def test_this_and_future_partial_failure_resumes_without_recreating_new_resource():

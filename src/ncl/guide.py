@@ -225,9 +225,9 @@ WHAT IT REFUSES
 
   Scheduling structures remain refused, as do EXRULE, period-valued RDATE,
   multiple RRULEs, incompatible recurrence value kinds or timezones, RANGE=
-  THISANDFUTURE, recurrence-time shifts, and future partitions whose identity
-  mapping cannot be proven. Attendee and organizer edits are outside this
-  recurrence slice.
+  THISANDFUTURE, recurrence-time shifts, complex or unbounded future
+  partitions whose identity mapping cannot be proven. Attendee and organizer
+  edits are outside this recurrence slice.
 
 Use `ncl <command> --help` for the exact arguments a command accepts.
 """

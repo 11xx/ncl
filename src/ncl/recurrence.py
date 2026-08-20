@@ -26,6 +26,7 @@ from .caldav import CalendarError, _canonical
 from .session import Session
 
 RECURRENCE_PROPERTIES = frozenset({"RRULE", "RDATE", "EXDATE", "EXRULE"})
+RECURRENCE_MARKERS = RECURRENCE_PROPERTIES | frozenset({"RECURRENCE-ID"})
 SCHEDULING_PROPERTIES = frozenset({"ORGANIZER", "ATTENDEE"})
 TARGETS = frozenset({"series", "occurrence", "this-and-future"})
 MAX_EXPANSIONS = 10_000
@@ -388,6 +389,17 @@ def _series_model(master: Any) -> _SeriesModel:
         raise _error("the resource is not recurring", exits.UNSUPPORTED_STRUCTURE)
     if rrule is not None:
         try:
+            parts = dict(_rrule_parts(rrule))
+            if {"COUNT", "UNTIL"} <= parts.keys():
+                raise _error("an RRULE cannot contain both COUNT and UNTIL")
+            if "COUNT" in parts and (
+                not parts["COUNT"].isdigit() or int(parts["COUNT"]) <= 0
+            ):
+                raise _error("the RRULE COUNT must be a positive integer")
+            if "INTERVAL" in parts and (
+                not parts["INTERVAL"].isdigit() or int(parts["INTERVAL"]) <= 0
+            ):
+                raise _error("the RRULE INTERVAL must be a positive integer")
             rrulestr(f"RRULE:{rrule}", dtstart=_rule_datetime(start))
         except (TypeError, ValueError, OverflowError) as exc:
             raise _error("the RRULE could not be expanded safely") from exc
@@ -1034,6 +1046,33 @@ def _wire_until(value: WireId, original_text: str) -> str:
     return value.value.strftime("%Y%m%dT%H%M%S")
 
 
+def _rule_values(start: WireId, rrule: str | None) -> tuple[WireId, ...]:
+    if rrule is None:
+        return ()
+    model = _SeriesModel(start, rrule, (), ())
+    return _rule_between(model, start, None)
+
+
+def _prove_rule_partition(
+    model: _SeriesModel,
+    cut: WireId,
+    old_rule: str | None,
+    new_rule: str | None,
+) -> tuple[tuple[WireId, ...], int]:
+    original = _rule_values(model.start, model.rrule)
+    try:
+        position = next(index for index, item in enumerate(original) if item.key == cut.key)
+    except StopIteration as exc:
+        raise _error("the RRULE partition did not contain its requested cut") from exc
+    old_values = _rule_values(model.start, old_rule)
+    new_values = _rule_values(cut, new_rule)
+    if tuple(item.key for item in old_values) != tuple(item.key for item in original[:position]):
+        raise _error("this-and-future cannot prove the old RRULE partition")
+    if tuple(item.key for item in new_values) != tuple(item.key for item in original[position:]):
+        raise _error("this-and-future cannot prove the new RRULE partition")
+    return original, position
+
+
 def _split_model(
     model: _SeriesModel, cut: WireId
 ) -> tuple[
@@ -1080,6 +1119,9 @@ def _split_model(
             raise _error("the recurrence target is outside the RRULE COUNT")
         old_rule = _rrule_with(model.rrule, count=old_count) if old_count else None
         new_rule = _rrule_with(model.rrule, count=new_count)
+        _, proven_position = _prove_rule_partition(model, cut, old_rule, new_rule)
+        if proven_position != position:
+            raise _error("this-and-future cannot prove the RRULE COUNT position")
         old_keys = {item.key for item in base if item.key < cut.key}
         old_keys.update(item.key for item in old_rdates)
         if old_rule is None and model.start.key == cut.key and old_rdates:
@@ -1087,8 +1129,11 @@ def _split_model(
         return old_rule, new_rule, old_rdates, new_rdates, old_exdates, new_exdates, bool(old_keys)
 
     frequency = parts.get("FREQ", "").upper()
-    unsupported_partition = {"BYSETPOS", "BYWEEKNO", "BYMONTH", "BYMONTHDAY"}
-    if frequency not in {"DAILY", "WEEKLY"} or unsupported_partition & parts.keys():
+    if frequency not in {"DAILY", "WEEKLY"} or not set(parts) <= {
+        "FREQ",
+        "INTERVAL",
+        "UNTIL",
+    }:
         raise _error("this-and-future cannot prove the RRULE partition")
     previous = [item for item in base if item.key < cut.key]
     old_rule = (
@@ -1097,6 +1142,8 @@ def _split_model(
         else None
     )
     new_rule = model.rrule
+    if "UNTIL" in parts:
+        _prove_rule_partition(model, cut, old_rule, new_rule)
     old_keys = {item.key for item in previous}
     old_keys.update(item.key for item in old_rdates)
     if old_rule is None and model.start.key == cut.key and old_rdates:
@@ -1474,7 +1521,7 @@ def occurrences(
     for href, etag_value, raw in resources:
         parsed = _parse_calendar(raw)
         direct = _direct_events(raw, parsed)
-        if not any(_property_names(component) & RECURRENCE_PROPERTIES for component, _ in direct):
+        if not any(_property_names(component) & RECURRENCE_MARKERS for component, _ in direct):
             continue
         resource = _validate_resource(
             raw,

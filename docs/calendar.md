@@ -44,8 +44,10 @@ exception; it does not rewrite `EXDATE`.
 This-and-future creates a new-UID future resource rather than using
 `RANGE=THISANDFUTURE`. The recurrence set is partitioned only when the
 generated identities prove the old and new sets equivalent; `COUNT` is split
-by generated position, and safe daily/weekly `UNTIL` partitions retain their
-rule semantics. DTSTART/DTEND shifts requested by the caller are refused.
+by generated position, finite rule partitions are checked against their
+generated identities, and only simple unbounded daily/weekly rules retain
+their semantics. Complex or otherwise unprovable rule partitions are refused.
+DTSTART/DTEND shifts requested by the caller are refused.
 Future overrides are remapped to the new UID while retaining their original
 identities and explicit properties. The plan creates the future resource with
 `If-None-Match: *` before conditionally updating or deleting the old resource;
