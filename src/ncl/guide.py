@@ -47,6 +47,27 @@ READ
   rule or attendees — is listed with what makes it unwritable. It can be read;
   it cannot be edited here.
 
+WORK WITH TASKS
+  ncl task list <calendar> [--status <status>]
+  ncl task show <task-href>
+
+  Tasks are VTODO components in a calendar collection. The selected collection
+  must advertise VTODO, and a status filter can be repeated. Listing makes one
+  bounded CalDAV report and derives parent/child UIDs from that response; it
+  does not read each task separately. Missing task properties are shown as
+  empty values.
+
+  ncl task create <calendar> --summary S [--start <iso>] [--due <iso>]
+  ncl task update <task-href> --summary S
+  ncl task complete <task-href>
+  ncl task delete <task-href>
+
+  Task writes use the same plan/apply boundary as calendar writes. A due date
+  does not require a start. Completion is one conditional write that sets
+  STATUS to COMPLETED, records COMPLETED, and sets PERCENT-COMPLETE to 100.
+  Recurrence and scheduling structures are named and refused before mutation;
+  other unmodeled data is preserved.
+
 REACH ALLOWLISTED FILES
   ncl files list <collection-href>  List one collection, without recursion.
   ncl files stat <resource-href>    Read size, mtime, media type, and ETag.
