@@ -439,8 +439,19 @@ def test_update_refuses_ambiguous_or_unsupported_bundles_before_plan_write(bad_h
     assert plans.listing() == []
 
 
-@pytest.mark.parametrize("property_name", ["RRULE", "ATTENDEE"])
-def test_update_refuses_recurrence_and_scheduling_structure(property_name):
+@pytest.mark.parametrize(
+    ("property_name", "value"),
+    [
+        ("RRULE", {"FREQ": ["WEEKLY"]}),
+        ("RDATE", START + dt.timedelta(days=7)),
+        ("EXDATE", START + dt.timedelta(days=7)),
+        ("EXRULE", {"FREQ": ["WEEKLY"]}),
+        ("RECURRENCE-ID", START),
+        ("ATTENDEE", "mailto:someone@example.invalid"),
+        ("ORGANIZER", "mailto:someone@example.invalid"),
+    ],
+)
+def test_update_refuses_recurrence_and_scheduling_structure(property_name, value):
     create = _create_plan()
     resources = _resources(create)
     plans.consume(create.plan_id)
@@ -448,10 +459,7 @@ def test_update_refuses_recurrence_and_scheduling_structure(property_name):
     raw = resources[travel_href][0]
     calendar = icalendar.Calendar.from_ical(raw)
     event = next(item for item in calendar.walk() if item.name == "VEVENT")
-    if property_name == "RRULE":
-        event.add("RRULE", {"FREQ": ["WEEKLY"]})
-    else:
-        event.add("ATTENDEE", "mailto:someone@example.invalid")
+    event.add(property_name, value)
     resources[travel_href] = (calendar.to_ical(), '"v1"')
 
     with pytest.raises(events.EventError) as error:

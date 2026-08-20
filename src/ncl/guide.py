@@ -88,13 +88,13 @@ WORK WITH TASKS
   a DATE DTSTART can use DURATION only in whole days or weeks.
 
 PLAN APPOINTMENT TRAVEL
-  ncl cal appointment create <calendar> --summary S --from <iso> --to <iso> \
-    --origin O --destination D --mode M --route-estimate <duration> \
-    --on-site-buffer <duration> --stop-wait-margin <duration> \
+  ncl cal appointment create <calendar> --summary S --from <iso> --to <iso> \\
+    --origin O --destination D --mode M --route-estimate <duration> \\
+    --on-site-buffer <duration> --stop-wait-margin <duration> \\
     --preparation-duration <duration> [--route-url U]
-  ncl cal appointment update <appointment-href> <travel-href> <preparation-href> \
-    --from <iso> --to <iso> --origin O --destination D --mode M \
-    --route-estimate <duration> --on-site-buffer <duration> \
+  ncl cal appointment update <appointment-href> <travel-href> <preparation-href> \\
+    --from <iso> --to <iso> --origin O --destination D --mode M \\
+    --route-estimate <duration> --on-site-buffer <duration> \\
     --stop-wait-margin <duration> --preparation-duration <duration>
 
   These commands freeze one three-step bundle in appointment, travel,

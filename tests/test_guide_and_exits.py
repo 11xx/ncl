@@ -50,6 +50,22 @@ def test_guide_is_nonempty_and_names_only_registered_commands():
     assert mentioned, "the guide names no commands at all"
 
 
+def test_bare_cli_preserves_multiline_appointment_examples(capsys):
+    assert cli.main([]) == exits.OK
+
+    rendered = capsys.readouterr().out
+    assert (
+        "ncl cal appointment create <calendar> --summary S --from <iso> --to <iso> \\\n"
+        "    --origin O --destination D --mode M --route-estimate <duration> \\\n"
+        in rendered
+    )
+    assert (
+        "ncl cal appointment update <appointment-href> <travel-href> <preparation-href> \\\n"
+        "    --from <iso> --to <iso> --origin O --destination D --mode M \\\n"
+        in rendered
+    )
+
+
 def test_top_level_help_describes_resumable_plan_application(capsys):
     with pytest.raises(SystemExit) as error:
         cli.main(["--help"])

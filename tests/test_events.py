@@ -191,13 +191,26 @@ def test_all_day_end_is_exclusive():
     assert reference.end == "20260902"
 
 
-def test_recurrence_override_is_marked_recurring():
+@pytest.mark.parametrize(
+    ("property_name", "value"),
+    [
+        ("RRULE", "FREQ=WEEKLY"),
+        ("RDATE", "20260908T110000Z"),
+        ("EXDATE", "20260908T110000Z"),
+        ("EXRULE", "FREQ=WEEKLY"),
+        ("RECURRENCE-ID", "20260901T110000Z"),
+    ],
+)
+def test_recurrence_structure_is_marked_recurring(property_name, value):
     raw = RICH.replace(
         b"DTSTAMP:20260817T120000Z",
-        b"DTSTAMP:20260817T120000Z\nRECURRENCE-ID:20260901T110000Z",
+        f"DTSTAMP:20260817T120000Z\n{property_name}:{value}".encode(),
     )
 
-    assert _ref(raw).recurring is True
+    reference = _ref(raw)
+
+    assert reference.recurring is True
+    assert property_name in reference.unsupported
 
 
 @pytest.mark.parametrize("status", ["CONFIRMED", "TENTATIVE", "CANCELLED"])
