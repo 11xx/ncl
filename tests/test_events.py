@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from types import SimpleNamespace
 
+import icalendar
 import pytest
 
 from ncl import cli, events, exits, mutate, plans
@@ -159,6 +161,339 @@ def test_update_alarm_options_are_mutually_exclusive():
         parser.parse_args(
             ["cal", "update", CAL + "keep-me.ics", "--alarm", "-PT15M", "--clear-alarms"]
         )
+
+
+def _description(raw: str | bytes) -> str:
+    calendar = icalendar.Calendar.from_ical(raw)
+    event = next(item for item in calendar.walk() if item.name == "VEVENT")
+    return str(event.get("DESCRIPTION")) if event.get("DESCRIPTION") is not None else ""
+
+
+def _build_portable(**kwargs) -> str:
+    start = dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC)
+    end = dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC)
+    return mutate.build_event(
+        uid="portable@example",
+        summary="Appointment",
+        start=start,
+        end=end,
+        portable_description=True,
+        **kwargs,
+    )
+
+
+def test_portable_description_projects_url_only():
+    description = _description(_build_portable(url="https://example.invalid/event"))
+
+    assert description == (
+        "--- ncl portable fields ---\n"
+        "URL: https://example.invalid/event\n"
+        "--- end ncl portable fields ---"
+    )
+
+
+def test_portable_description_projects_location_only():
+    description = _description(_build_portable(location="Room 3"))
+
+    assert description == (
+        "--- ncl portable fields ---\n"
+        "LOCATION: Room 3\n"
+        "--- end ncl portable fields ---"
+    )
+
+
+def test_portable_description_projects_all_fields_in_stable_order():
+    description = _description(
+        _build_portable(
+            location="Room 3",
+            url="https://example.invalid/event",
+            status="cancelled",
+            categories=("WORK", "TRAVEL"),
+            priority=1,
+            busy=True,
+            classification="private",
+            alarms=("-PT15M", "-P1D"),
+        )
+    )
+    labels = [
+        "LOCATION:",
+        "URL:",
+        "STATUS:",
+        "CATEGORIES:",
+        "PRIORITY:",
+        "TRANSP:",
+        "CLASS:",
+        "VALARM TRIGGER:",
+        "VALARM TRIGGER:",
+    ]
+
+    assert [description.index(label) for label in labels] == sorted(
+        description.index(label) for label in labels
+    )
+    assert "STATUS: CANCELLED" in description
+    assert "CATEGORIES: WORK, TRAVEL" in description
+    assert "TRANSP: OPAQUE" in description
+    assert "CLASS: PRIVATE" in description
+
+
+def test_portable_description_is_idempotent_and_removes_stale_values():
+    original = _build_portable(
+        description="Travel instructions.",
+        location="Old room",
+        url="https://example.invalid/old",
+        status="confirmed",
+    )
+    updated = mutate.patch_event(
+        original.encode(),
+        {"LOCATION": "New room", "URL": "https://example.invalid/new", "STATUS": None},
+        portable_description=True,
+        now=dt.datetime(2026, 9, 1, tzinfo=dt.UTC),
+    )
+    repeated = mutate.patch_event(
+        updated.encode(),
+        {},
+        portable_description=True,
+        now=dt.datetime(2026, 9, 1, tzinfo=dt.UTC),
+    )
+
+    assert _description(updated) == _description(repeated)
+    assert _description(updated).startswith("Travel instructions.\n\n")
+    assert "Old room" not in _description(updated)
+    assert "https://example.invalid/old" not in _description(updated)
+    assert "LOCATION: New room" in _description(updated)
+    assert "URL: https://example.invalid/new" in _description(updated)
+    assert "STATUS:" not in _description(updated)
+    assert _description(updated).count(mutate.PORTABLE_START) == 1
+    assert _description(updated).count(mutate.PORTABLE_END) == 1
+
+
+def test_portable_description_preserves_authored_prose_and_unknown_structure():
+    raw = RICH.replace(
+        b"LOCATION:Somewhere",
+        b"LOCATION:Somewhere\nDESCRIPTION:Bring the printed ticket.",
+    )
+    projected = mutate.patch_event(
+        raw,
+        {"SUMMARY": "Renamed"},
+        portable_description=True,
+        now=dt.datetime(2026, 9, 1, tzinfo=dt.UTC),
+    )
+
+    assert "Bring the printed ticket." in _description(projected)
+    assert "X-CUSTOM-FIELD:do-not-lose-me" in projected
+    assert "VTIMEZONE" in projected
+    assert "BEGIN:VALARM" in projected
+    assert "TRIGGER:-PT15M" in projected
+
+
+def test_alarm_omission_preserves_existing_alarms():
+    patched = mutate.patch_event(RICH, {"SUMMARY": "Renamed"})
+
+    assert patched.count("BEGIN:VALARM") == 1
+    assert "TRIGGER:-PT15M" in patched
+
+
+def test_alarm_clear_removes_all_existing_alarms():
+    patched = mutate.patch_event(RICH, {"VALARM": ()})
+
+    assert "BEGIN:VALARM" not in patched
+    assert "X-CUSTOM-FIELD:do-not-lose-me" in patched
+
+
+def test_alarm_replacement_replaces_all_existing_alarms():
+    patched = mutate.patch_event(RICH, {"VALARM": ("-P1D", "-PT5M")})
+
+    assert patched.count("BEGIN:VALARM") == 2
+    assert "TRIGGER:-PT15M" not in patched
+    assert "TRIGGER:-P1D" in patched
+    assert "TRIGGER:-PT5M" in patched
+
+
+class _EventResponse:
+    def __init__(self, body: bytes, *, status: int = 200, etag: str = '"v1"'):
+        self.body = body
+        self.status = status
+        self.etag = etag
+
+    def header(self, name: str) -> str:
+        return self.etag if name == "ETag" else ""
+
+
+class _EventSession:
+    def __init__(self, body: bytes):
+        self.body = body
+
+    def request(self, method, url, *, headers=None, data=None, **kwargs):
+        assert method == "GET"
+        return _EventResponse(self.body)
+
+
+class _SequenceEventSession:
+    def __init__(self, *responses: _EventResponse):
+        self.responses = list(responses)
+        self.requests: list[dict] = []
+
+    def request(self, method, url, *, headers=None, data=None, **kwargs):
+        self.requests.append({"method": method, "url": url, "headers": headers, "data": data})
+        return self.responses.pop(0)
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "--- ncl portable fields ---\n--- ncl portable fields ---\n--- end ncl portable fields ---",
+        "--- end ncl portable fields ---\n--- ncl portable fields ---",
+        "--- ncl portable fields ---\nold text",
+        "old text\n--- end ncl portable fields ---",
+    ],
+)
+def test_malformed_portable_block_refuses_before_a_plan_is_written(description):
+    raw = mutate.build_event(
+        uid="malformed@example",
+        summary="Malformed",
+        start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+        end=dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
+        description=description,
+    ).encode()
+
+    with pytest.raises(events.EventError) as error:
+        mutate.plan_update(
+            PROFILE,
+            session=_EventSession(raw),
+            href=CAL + "keep-me.ics",
+            changes={"SUMMARY": "No"},
+            portable_description=True,
+        )
+
+    assert error.value.code == exits.USAGE
+    assert plans.listing() == []
+
+
+def test_plain_update_does_not_project_a_description_without_opt_in():
+    raw = mutate.build_event(
+        uid="plain@example",
+        summary="Plain",
+        start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+        end=dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
+        description="Authored prose.",
+        url="https://example.invalid/old",
+    ).encode()
+
+    patched = mutate.patch_event(raw, {"URL": "https://example.invalid/new"})
+
+    assert _description(patched) == "Authored prose."
+    assert mutate.PORTABLE_START not in _description(patched)
+
+
+def test_create_plan_and_apply_verify_url_status_and_portable_description():
+    plan = mutate.plan_create(
+        PROFILE,
+        calendar_href=CAL,
+        summary="Created",
+        start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+        end=dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
+        description="Authored prose.",
+        url="https://example.invalid/created",
+        status="cancelled",
+        portable_description=True,
+    )
+    stored = plans.payload_bytes(plan)
+    transport = _SequenceEventSession(
+        _EventResponse(b"", status=201),
+        _EventResponse(stored, etag='"v2"'),
+    )
+
+    result = mutate.apply(PROFILE, session=transport, plan=plan)
+
+    assert [request["method"] for request in transport.requests] == ["PUT", "GET"]
+    assert result["url"] == "https://example.invalid/created"
+    assert result["status"] == "CANCELLED"
+    assert result["portable_description_verified"] is True
+    assert result["verified"] is True
+    with pytest.raises(plans.PlanError):
+        plans.read(plan.plan_id)
+
+
+def test_update_plan_and_apply_verify_changed_structured_fields_and_projection():
+    initial = mutate.build_event(
+        uid="update@example",
+        summary="Updated",
+        start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+        end=dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
+        description="Authored prose.",
+        url="https://example.invalid/old",
+        status="confirmed",
+    ).encode()
+    plan = mutate.plan_update(
+        PROFILE,
+        session=_EventSession(initial),
+        href=CAL + "update.ics",
+        changes={"URL": "https://example.invalid/new", "STATUS": "CANCELLED"},
+        portable_description=True,
+    )
+    stored = plans.payload_bytes(plan)
+    transport = _SequenceEventSession(
+        _EventResponse(b"", status=204),
+        _EventResponse(stored, etag='"v2"'),
+    )
+
+    result = mutate.apply(PROFILE, session=transport, plan=plan)
+
+    assert result["url"] == "https://example.invalid/new"
+    assert result["status"] == "CANCELLED"
+    assert result["portable_description_verified"] is True
+    assert result["verified"] is True
+
+
+def test_cli_create_and_apply_expose_plan_and_readback_verification(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    monkeypatch.setattr(cli, "_resolved_calendar", lambda profile, transport, target: CAL)
+    monkeypatch.setattr(cli.session, "Session", lambda profile: _SequenceEventSession())
+
+    code = cli.main(
+        [
+            "cal",
+            "create",
+            CAL,
+            "--summary",
+            "CLI event",
+            "--from",
+            "2026-09-01T11:00:00+00:00",
+            "--to",
+            "2026-09-01T12:00:00+00:00",
+            "--url",
+            "https://example.invalid/cli",
+            "--status",
+            "cancelled",
+            "--portable-description",
+            "--json",
+        ]
+    )
+    planned = json.loads(capsys.readouterr().out)
+    plan = plans.read(planned["plan"]["plan_id"])
+
+    assert code == exits.CONFIRMATION_REQUIRED
+    assert planned["plan"]["action"] == "cal.create"
+    assert "URL: https://example.invalid/cli" in _description(plans.payload_bytes(plan))
+    assert "STATUS: CANCELLED" in _description(plans.payload_bytes(plan))
+
+    stored = plans.payload_bytes(plan)
+    monkeypatch.setattr(
+        cli.session,
+        "Session",
+        lambda profile: _SequenceEventSession(
+            _EventResponse(b"", status=201), _EventResponse(stored, etag='"v2"')
+        ),
+    )
+    code = cli.main(["apply", plan.plan_id, "--json"])
+    applied = json.loads(capsys.readouterr().out)
+
+    assert code == exits.OK
+    assert applied["url"] == "https://example.invalid/cli"
+    assert applied["status"] == "CANCELLED"
+    assert applied["portable_description_verified"] is True
 
 
 def test_an_alarm_does_not_block_editing_because_a_patch_preserves_it():

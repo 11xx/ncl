@@ -213,6 +213,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--alarm", action="append", default=[], dest="alarms",
         help="Reminder offset, e.g. -PT15M or -P1D; repeatable",
     )
+    cal_create.add_argument(
+        "--portable-description", action="store_true",
+        help="Project structured fields into a deterministic DESCRIPTION block",
+    )
     cal_update = cal_commands.add_parser(
         "update", help="Plan a change to one event; changes nothing yet"
     )
@@ -246,6 +250,10 @@ def build_parser() -> argparse.ArgumentParser:
     cal_update.add_argument(
         "--clear-alarms", action="store_true",
         help="Remove every reminder; mutually exclusive with --alarm",
+    )
+    cal_update.add_argument(
+        "--portable-description", action="store_true",
+        help="Regenerate the deterministic DESCRIPTION compatibility block",
     )
 
     cal_delete = cal_commands.add_parser("delete", help="Plan a deletion; changes nothing yet")
@@ -491,6 +499,7 @@ def _run_cal(args: argparse.Namespace) -> int:
             color=args.color,
             related_to=tuple(args.related_to),
             alarms=tuple(args.alarms),
+            portable_description=args.portable_description,
         )
         return _emit_plan(plan, args.json)
 
@@ -526,9 +535,15 @@ def _run_cal(args: argparse.Namespace) -> int:
             changes["VALARM"] = ()
         elif args.alarms is not None:
             changes["VALARM"] = tuple(args.alarms)
-        if not changes:
+        if not changes and not args.portable_description:
             raise events.EventError("no changes were requested", exits.USAGE)
-        plan = mutate.plan_update(profile, session=transport, href=args.href, changes=changes)
+        plan = mutate.plan_update(
+            profile,
+            session=transport,
+            href=args.href,
+            changes=changes,
+            portable_description=args.portable_description,
+        )
         return _emit_plan(plan, args.json)
 
     if args.cal_command == "delete":
