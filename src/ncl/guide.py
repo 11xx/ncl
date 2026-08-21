@@ -63,11 +63,11 @@ WORK WITH TASKS
   child of the selected collection and inside the profile allowlist. A VTODO
   nested inside another component is malformed; direct sibling components are
   readable but named unsupported. Missing task properties are shown as empty
-  values. Singleton VTODO properties cannot repeat except REFID (repeatable
-per RFC 9253, validated per-resource for runs), DUE and DURATION cannot
-  coexist, and an existing COMPLETED value must be UTC. Duplicate UIDs and
-  parent cycles fail closed as ambiguous; a parent outside the report remains
-  visible by UID rather than being guessed or rejected.
+  values. Singleton VTODO properties cannot repeat except REFID, which is
+  repeatable per RFC 9253 and is validated per resource for runs. DUE and
+  DURATION cannot coexist, and an existing COMPLETED value must be UTC.
+  Duplicate UIDs and parent cycles fail closed as ambiguous; a parent outside
+  the report remains visible by UID rather than being guessed or rejected.
 
   ncl task create <calendar> --summary S [--start <iso>] [--due <iso>]
   ncl task update <task-href> --summary S
