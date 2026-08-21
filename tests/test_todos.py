@@ -662,6 +662,19 @@ def test_task_parser_rejects_duplicate_vtodo_singletons(name, value):
     assert error.value.code == exits.MALFORMED_RESPONSE
 
 
+def test_refid_is_repeatable_for_reads_but_refused_for_generic_mutation():
+    raw = add_todo_property(raw_todo("run-step", "Checkpoint"), "REFID", "run")
+    raw = add_todo_property(raw, "REFID", "run")
+
+    reference = todos._describe(raw, calendar_href=CAL, href=TASK, etag='"v1"')
+
+    assert reference.unsupported == ("REFID",)
+    assert reference.writable is False
+    with pytest.raises(todos.TodoError) as error:
+        todos.patch_todo(raw, {"SUMMARY": "No mutation"})
+    assert error.value.code == exits.UNSUPPORTED_STRUCTURE
+
+
 def test_task_parser_rejects_duplicate_duration():
     raw = raw_todo(
         "duration",

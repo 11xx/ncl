@@ -116,6 +116,7 @@ class Dispatcher:
     validate: Callable[[Step], None]
     execute: Callable[..., dict[str, Any]]
     reconcile: Callable[..., dict[str, Any]]
+    validate_bundle: Callable[[tuple[Step, ...]], None] | None = None
 
 
 def _directory() -> Path:
@@ -483,9 +484,20 @@ def _validate_for_lifecycle(
         check_fresh(plan)
     # Validate the complete action set before asking any resource module to
     # execute a request. This is what makes an unknown later step harmless.
+    selected: list[Dispatcher] = []
+    grouped: dict[int, list[Step]] = {}
     for step in plan.steps:
         dispatcher = _dispatcher(step, dispatchers)
         dispatcher.validate(step)
+        identity = id(dispatcher)
+        if identity not in grouped:
+            selected.append(dispatcher)
+            grouped[identity] = []
+        grouped[identity].append(step)
+
+    for dispatcher in selected:
+        if dispatcher.validate_bundle is not None:
+            dispatcher.validate_bundle(tuple(grouped[id(dispatcher)]))
 
 
 def _exception_code(exc: Exception) -> int:

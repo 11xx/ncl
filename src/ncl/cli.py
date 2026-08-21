@@ -23,6 +23,7 @@ from . import (
     profiles,
     recurrence,
     render,
+    runs,
     secrets,
     session,
     todos,
@@ -516,6 +517,101 @@ def build_parser() -> argparse.ArgumentParser:
     _add_options(task_delete)
     task_delete.add_argument("href", help="Task resource href")
 
+    task_run = task_commands.add_parser(
+        "run",
+        help="Ordered checkpoint runs stored as standard VTODO graphs",
+        description=(
+            "Checkpoint runs use one VTODO manifest and standard FIRST, PARENT, "
+            "NEXT, GAP, and REFID properties."
+        ),
+    )
+    run_commands = task_run.add_subparsers(
+        dest="run_command", required=True, metavar="<command>", parser_class=_Parser
+    )
+
+    run_create = run_commands.add_parser(
+        "create", help="Plan a new ordered run; changes nothing yet"
+    )
+    _add_options(run_create)
+    run_create.add_argument("calendar", help="Calendar href, or an unambiguous display name")
+    run_create.add_argument("--summary", required=True)
+    run_create.add_argument(
+        "--step", action="append", required=True, help="Checkpoint summary; repeatable"
+    )
+    run_create.add_argument(
+        "--gap",
+        action="append",
+        help="Nonnegative lag between adjacent checkpoints, or unknown; repeatable",
+    )
+
+    run_list = run_commands.add_parser(
+        "list", help="List validated runs with one CalDAV REPORT"
+    )
+    _add_options(run_list)
+    run_list.add_argument("calendar", help="Calendar href, or an unambiguous display name")
+
+    run_show = run_commands.add_parser(
+        "show", help="Read one run root and all members with one CalDAV REPORT"
+    )
+    _add_options(run_show)
+    run_show.add_argument("root_href", help="Run root VTODO href")
+
+    run_add = run_commands.add_parser(
+        "add", help="Plan one checkpoint insertion; changes nothing yet"
+    )
+    _add_options(run_add)
+    run_add.add_argument("root_href", help="Run root VTODO href")
+    run_add.add_argument("--summary", required=True)
+    insertion = run_add.add_mutually_exclusive_group()
+    insertion.add_argument("--before", help="Insert before this exact checkpoint href")
+    insertion.add_argument("--after", help="Insert after this exact checkpoint href")
+    run_add.add_argument("--gap-before", help="Lag from predecessor, or unknown")
+    run_add.add_argument("--gap-after", help="Lag to successor, or unknown")
+
+    run_reorder = run_commands.add_parser(
+        "reorder", help="Plan a complete checkpoint order; changes nothing yet"
+    )
+    _add_options(run_reorder)
+    run_reorder.add_argument("root_href", help="Run root VTODO href")
+    run_reorder.add_argument(
+        "--step", action="append", required=True, help="Checkpoint href in final order; repeatable"
+    )
+    run_reorder.add_argument(
+        "--gap",
+        action="append",
+        help="Nonnegative lag between adjacent checkpoints, or unknown; repeatable",
+    )
+
+    run_edit = run_commands.add_parser(
+        "edit", help="Plan a modeled content/time/priority edit; changes nothing yet"
+    )
+    _add_options(run_edit)
+    run_edit.add_argument("href", help="Run root or checkpoint VTODO href")
+    run_edit.add_argument("--summary")
+    run_edit.add_argument("--description")
+    run_edit.add_argument("--start", help="Start date or ISO 8601 instant with an offset")
+    run_edit.add_argument("--due", help="Due date or ISO 8601 instant with an offset")
+    run_edit.add_argument("--priority", type=int, help="0 is unspecified; 1 is highest")
+
+    run_done = run_commands.add_parser(
+        "done", help="Plan one conditional completion transition"
+    )
+    _add_options(run_done)
+    run_done.add_argument("href", help="Checkpoint VTODO href")
+    run_done.add_argument("--at", help="Completion instant, ISO 8601 with an explicit offset")
+
+    run_skip = run_commands.add_parser(
+        "skip", help="Plan one conditional cancellation transition"
+    )
+    _add_options(run_skip)
+    run_skip.add_argument("href", help="Checkpoint VTODO href")
+
+    run_not_yet = run_commands.add_parser(
+        "not-yet", help="Plan a checkpoint reset to NEEDS-ACTION"
+    )
+    _add_options(run_not_yet)
+    run_not_yet.add_argument("href", help="Checkpoint VTODO href")
+
     file_commands = commands.add_parser(
         "files",
         help="Files over WebDAV",
@@ -757,10 +853,61 @@ def _emit_plan(plan: Any, json_output: bool) -> int:
     return exits.CONFIRMATION_REQUIRED
 
 
+def _emit_run_graph(graph: runs.RunGraph, *, json_output: bool, many: bool = False) -> int:
+    value = graph.as_dict()
+    if json_output:
+        _json({"runs": [value]} if many else {"run": value})
+        return exits.OK
+    render.emit(f"run: {graph.root.reference.summary}")
+    render.emit(f"root: {graph.root.href}")
+    render.emit(f"current: {graph.current_uid or 'none'}")
+    render.emit(
+        f"position: {graph.current_index + 1 if graph.current_index is not None else 'none'}"
+    )
+    for index, (step, gap) in enumerate(
+        zip(graph.steps, (*graph.gaps, None), strict=True), start=1
+    ):
+        gap_text = "" if gap is None and index == len(graph.steps) else (gap or "unknown")
+        render.emit(f"  {index}. {step.status:12} {step.reference.summary}")
+        render.emit(f"      {step.href}")
+        if gap_text:
+            render.emit(f"      gap-to-next: {gap_text}")
+    return exits.OK
+
+
+def _emit_run_plan(value: Any, *, json_output: bool) -> int:
+    if isinstance(value, plans.Plan):
+        code = _emit_plan(value, json_output)
+        if not json_output and any(
+            step.details.get("out_of_order") is True for step in value.steps
+        ):
+            render.emit(
+                "  note: this transition is out of order; current remains the "
+                "earliest nonterminal checkpoint."
+            )
+        return code
+    if json_output:
+        _json(value.as_dict())
+    else:
+        result = value.as_dict()
+        render.emit("no changes planned")
+        render.emit(result.get("reason", "the requested run state is already current"))
+        if "run" in result:
+            run = result["run"]
+            render.emit(f"current: {run.get('current_uid') or 'none'}")
+    return exits.OK
+
+
 def _dispatchers() -> dict[str, plans.Dispatcher]:
     return {
         "cal.": plans.Dispatcher(mutate.validate_step, mutate.execute, mutate.reconcile),
         "task.": plans.Dispatcher(todos.validate_step, todos.execute, todos.reconcile),
+        "run.": plans.Dispatcher(
+            runs.validate_step,
+            runs.execute,
+            runs.reconcile,
+            runs.validate_bundle,
+        ),
         "files.": plans.Dispatcher(files.validate_step, files.execute, files.reconcile),
     }
 
@@ -984,7 +1131,98 @@ def _run_cal(args: argparse.Namespace) -> int:
     return exits.USAGE
 
 
+def _run_task_run(args: argparse.Namespace) -> int:
+    profile = _selected_profile(args)
+    transport = session.Session(profile)
+
+    if args.run_command in {"create", "list"}:
+        collection = _resolved_component(profile, transport, args.calendar, "VTODO")
+        if args.run_command == "list":
+            found = runs.list_runs(
+                profile,
+                session=transport,
+                calendar_href=collection.href,
+                collection_writable=not collection.read_only,
+            )
+            if args.json:
+                _json({"runs": runs.as_list(found)})
+            else:
+                for graph in found:
+                    _emit_run_graph(graph, json_output=False, many=True)
+            return exits.OK
+        plan = runs.plan_create(
+            profile,
+            calendar_href=collection.href,
+            summary=args.summary,
+            step_summaries=args.step,
+            gaps=args.gap,
+        )
+        return _emit_run_plan(plan, json_output=args.json)
+
+    if args.run_command == "show":
+        graph = runs.show_run(profile, session=transport, root_href=args.root_href)
+        return _emit_run_graph(graph, json_output=args.json)
+
+    if args.run_command == "add":
+        plan = runs.plan_add(
+            profile,
+            session=transport,
+            root_href=args.root_href,
+            summary=args.summary,
+            before=args.before,
+            after=args.after,
+            gap_before=(args.gap_before if args.gap_before is not None else runs.MISSING),
+            gap_after=(args.gap_after if args.gap_after is not None else runs.MISSING),
+        )
+        return _emit_run_plan(plan, json_output=args.json)
+
+    if args.run_command == "reorder":
+        plan = runs.plan_reorder(
+            profile,
+            session=transport,
+            root_href=args.root_href,
+            step_hrefs=args.step,
+            gaps=args.gap,
+        )
+        return _emit_run_plan(plan, json_output=args.json)
+
+    if args.run_command == "edit":
+        changes: dict[str, Any] = {}
+        if args.summary is not None:
+            changes["SUMMARY"] = args.summary
+        if args.description is not None:
+            changes["DESCRIPTION"] = args.description
+        if args.start is not None:
+            changes["DTSTART"] = _todo_moment(args.start, "--start")
+        if args.due is not None:
+            changes["DUE"] = _todo_moment(args.due, "--due")
+        if args.priority is not None:
+            changes["PRIORITY"] = args.priority
+        plan = runs.plan_edit(
+            profile,
+            session=transport,
+            href=args.href,
+            changes=changes,
+        )
+        return _emit_run_plan(plan, json_output=args.json)
+
+    if args.run_command in {"done", "skip", "not-yet"}:
+        at = _todo_instant(args.at, "--at") if args.run_command == "done" and args.at else None
+        plan = runs.plan_transition(
+            profile,
+            session=transport,
+            href=args.href,
+            transition=args.run_command,
+            at=at,
+        )
+        return _emit_run_plan(plan, json_output=args.json)
+
+    return exits.USAGE
+
+
 def _run_task(args: argparse.Namespace) -> int:
+    if args.task_command == "run":
+        return _run_task_run(args)
     profile = _selected_profile(args)
     transport = session.Session(profile)
 

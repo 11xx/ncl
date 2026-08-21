@@ -23,8 +23,8 @@ allowlist, plus successful calendar data. Each resource must contain exactly
 one VTODO as a direct child of VCALENDAR, with a nonempty UID, valid timestamp
 and modeled value types, an allowed status, priority, and percentage. A VTODO
 nested inside another component is malformed; direct sibling components remain
-readable and are named as unsupported. RFC singleton properties cannot repeat,
-`DUE` and `DURATION` cannot coexist, and an existing `COMPLETED` value must be
+readable and are named as unsupported. RFC singleton properties cannot repeat except `REFID` (repeatable per RFC 9253,
+validated per-resource for runs), `DUE` and `DURATION` cannot coexist, and an existing `COMPLETED` value must be
 a UTC date-time. Duplicate UIDs and parent cycles are ambiguous and fail
 closed; a parent UID not present in the collection remains visible.
 `task show` reads exactly the requested href without collection discovery.
@@ -86,3 +86,71 @@ Unknown properties, time zones, and supported nested components survive an
 unrelated update. List and create first require
 the resolved collection to advertise `VTODO`; show and mutations address an
 existing task directly, so they do not perform redundant collection discovery.
+
+## Ordered checkpoint runs
+
+```text
+ncl task run create <calendar> --summary "Errand" --step "Leave" --step "Arrive"
+ncl task run list <calendar>
+ncl task run show <root-href>
+ncl task run add <root-href> --summary "Collect" --after <step-href>
+ncl task run reorder <root-href> --step <step-href> --step <step-href>
+ncl task run edit <root-or-step-href> --summary "Updated"
+ncl task run done <step-href> [--at <iso>]
+ncl task run skip <step-href>
+ncl task run not-yet <step-href>
+```
+
+A run is a rooted standard iCalendar graph in one allowlisted VTODO
+collection. The root is a manifest with the run summary and one
+`RELATED-TO;RELTYPE=FIRST;VALUE=UID` relation. Each checkpoint carries the
+root UID in `REFID`, exactly one `RELATED-TO;RELTYPE=PARENT;VALUE=UID`, and at
+most one forward `RELATED-TO;RELTYPE=NEXT;VALUE=UID` relation. A `NEXT` edge
+may carry a nonnegative `GAP` duration; an absent gap is reported as
+`unknown`. The root has no aggregate status, percentage, or completion time.
+
+`run list` performs one depth-one VTODO REPORT and returns every validated
+root in the selected collection. `run show` derives the collection from the
+root href and validates that root and all members from one report. Both refuse
+duplicate or missing UIDs and edges, wrong or repeated parent relations,
+branches, cycles, disconnected members, mismatched `REFID`, URI or invalid
+relation parameters, malformed checkpoint state, cross-collection targets,
+recurrence or scheduling data, and unsupported sibling/nested structures. The
+current checkpoint is derived as the first ordered checkpoint whose status is
+neither `COMPLETED` nor `CANCELLED`; it becomes null when all checkpoints are
+terminal. A root is never followed through guessed checkpoint hrefs.
+
+Create writes checkpoints in chain order and the root last. Add writes the new
+checkpoint, changed neighboring edge resources, and the root last when FIRST
+changes. Reorder writes changed checkpoint edges in final order and the root
+last when FIRST changes. Every write is an ordinary ordered frozen plan with
+strong ETags for existing resources, exact conditional headers, semantic
+readback, resumable progress, and the same uncertainty/reconcile behavior as
+other task writes. The complete graph is validated before any apply request.
+Insertion gaps must be explicit when a predecessor or successor exists;
+`reorder --gap` has exactly one entry per adjacent pair when supplied.
+
+Authoring is available only while every checkpoint is `NEEDS-ACTION` (an
+absent status has that meaning). `edit` changes only ordinary summary,
+description, start, due, and priority fields. It cannot change UID, REFID,
+relationships, status, percentage, or completion. Once execution starts,
+add, reorder, and edit are refused. There is no run deletion, offline queue,
+automatic `IN-PROCESS` transition, appointment change, recurrence/scheduling
+edit, WebDAV operation, or client-visibility guarantee.
+
+`done` accepts `NEEDS-ACTION` or `IN-PROCESS`, writes `COMPLETED`, one UTC
+completion instant, and 100 percent. `skip` writes `CANCELLED`, removes
+`COMPLETED`, and preserves a percentage below 100. `not-yet` accepts
+`IN-PROCESS`, writes `NEEDS-ACTION` and zero percent, and removes
+`COMPLETED`; it is an idempotent no-op for an already `NEEDS-ACTION`
+checkpoint. Terminal transitions conflict. Done and skip may be out of order,
+and the plan reports that fact while current position remains derived from
+the earliest nonterminal checkpoint.
+
+Run relationships and `REFID` are standard data, not private `X-` properties.
+Unknown properties and supported nested alarms that the run contract does not
+own are retained by content, edge, and state edits. Ordinary `task update`,
+`task complete`, and `task delete` refuse REFID-bearing VTODOs so generic CRUD
+cannot bypass run integrity. These relationships are stored and validated;
+this documentation does not claim that a Nextcloud web or mobile client
+displays their order without a live server/client probe.

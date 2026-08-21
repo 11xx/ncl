@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime as dt
 import secrets as token_source
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -43,12 +44,14 @@ UNSUPPORTED_PROPERTIES = (
     "SCHEDULE-AGENT",
     "SCHEDULE-FORCE-SEND",
     "SCHEDULE-STATUS",
+    "REFID",
 )
 
 # RFC 5545 VTODO properties in the required and optional singleton groups.
 # Repeatable properties such as ATTENDEE, RELATED-TO, and RSTATUS are not in
 # this set. RRULE is deliberately absent: RFC 5545 says it SHOULD NOT repeat,
 # rather than making a repeated RRULE malformed by cardinality alone.
+# REFID is deliberately absent because RFC 9253 permits zero or more values.
 VTODO_SINGLETON_PROPERTIES = frozenset(
     {
         "CLASS",
@@ -125,6 +128,14 @@ class TodoRef:
             "unsupported": list(self.unsupported),
             "children": list(self.children),
         }
+
+
+@dataclass(frozen=True)
+class TodoResource:
+    """One validated VTODO and the bytes returned with its report entry."""
+
+    reference: TodoRef
+    raw: bytes
 
 
 def _component_text(component: Any, name: str) -> str:
@@ -457,12 +468,20 @@ def build_todo(
     status: str = "",
     percent_complete: int | None = None,
     parent_uid: str = "",
+    refid: str = "",
+    related_to: tuple[tuple[str, Mapping[str, Any]], ...] = (),
     now: dt.datetime | None = None,
     sequence: int = 0,
 ) -> str:
-    """Serialize one VTODO while leaving recurrence and scheduling absent."""
+    """Serialize one VTODO while leaving recurrence and scheduling absent.
+
+    ``refid`` and ``related_to`` are standard iCalendar extensions used by
+    structured task resources. Ordinary tasks leave both at their defaults.
+    """
     if not isinstance(uid, str) or not uid.strip():
         raise TodoError("task UID must be nonempty", exits.USAGE)
+    if refid and (not isinstance(refid, str) or not refid.strip()):
+        raise TodoError("task REFID must be nonempty", exits.USAGE)
     stamped_start = _stamp(start) if start is not None else None
     stamped_due = _stamp(due) if due is not None else None
     _validate_boundaries(
@@ -479,6 +498,8 @@ def build_todo(
     todo.add("summary", summary)
     todo.add("dtstamp", _stamp_instant(now or dt.datetime.now(dt.UTC)))
     todo.add("sequence", sequence)
+    if refid:
+        todo.add("refid", refid)
     if description:
         todo.add("description", description)
     if stamped_start is not None:
@@ -493,12 +514,21 @@ def build_todo(
         todo.add("percent-complete", _validate_percent(percent_complete))
     if parent_uid:
         todo.add("related-to", parent_uid, parameters={"RELTYPE": "PARENT"})
+    for target, parameters in related_to:
+        if not isinstance(target, str) or not target.strip():
+            raise TodoError("task relation target must be nonempty", exits.USAGE)
+        todo.add("related-to", target, parameters=dict(parameters))
     calendar.add_component(todo)
     return calendar.to_ical().decode("utf-8")
 
 
 def _todo_for_mutation(raw: bytes) -> tuple[icalendar.Calendar, Any]:
     parsed, component = _parse_todo(raw, href="the stored resource")
+    if "REFID" in component:
+        raise TodoError(
+            "this task carries REFID and can only be changed through `task run`",
+            exits.UNSUPPORTED_STRUCTURE,
+        )
     unsupported = _unsupported(component, parsed)
     _, parent_count = _parent_uid(component)
     if parent_count > 1:
@@ -621,18 +651,16 @@ def _scoped_href(profile: Any, href: str) -> str:
     return target
 
 
-def query(
+def query_resources(
     profile: Any,
     *,
     session: Session,
     calendar_href: str,
-    statuses: tuple[str, ...] = (),
     collection_writable: bool | None = None,
-) -> list[TodoRef]:
-    """List tasks with one depth-one VTODO REPORT and no per-task reads."""
+) -> list[TodoResource]:
+    """Read every VTODO in one depth-one report, retaining its original bytes."""
     calendar_href = _canonical(profile, calendar_href)
     _check_calendar_scope(profile, calendar_href)
-    normalized = tuple(_validate_status(status) for status in statuses)
     response = session.request(
         "REPORT",
         calendar_href,
@@ -651,7 +679,7 @@ def query(
     if _element_name(root) != (DAV, "multistatus"):
         raise TodoError("the task query response was not a Multi-Status response")
 
-    found: list[TodoRef] = []
+    found: list[TodoResource] = []
     for entry in root:
         if _element_name(entry) != (DAV, "response"):
             continue
@@ -661,23 +689,47 @@ def query(
         href = _canonical(profile, raw_href)
         _check_response_scope(profile, calendar_href, href)
         found.append(
-            _describe(
-                data,
-                calendar_href=calendar_href,
-                href=href,
-                etag=_entry_etag(entry),
-                collection_writable=collection_writable,
+            TodoResource(
+                reference=_describe(
+                    data,
+                    calendar_href=calendar_href,
+                    href=href,
+                    etag=_entry_etag(entry),
+                    collection_writable=collection_writable,
+                ),
+                raw=data,
             )
         )
 
     by_uid: dict[str, TodoRef] = {}
-    for task in found:
+    for resource in found:
+        task = resource.reference
         if task.uid in by_uid:
             raise TodoError(
                 f"the task query returned duplicate UID {task.uid!r}",
                 exits.AMBIGUOUS_TARGET,
             )
         by_uid[task.uid] = task
+    return found
+
+
+def query(
+    profile: Any,
+    *,
+    session: Session,
+    calendar_href: str,
+    statuses: tuple[str, ...] = (),
+    collection_writable: bool | None = None,
+) -> list[TodoRef]:
+    """List tasks with one depth-one VTODO REPORT and no per-task reads."""
+    normalized = tuple(_validate_status(status) for status in statuses)
+    resources = query_resources(
+        profile,
+        session=session,
+        calendar_href=calendar_href,
+        collection_writable=collection_writable,
+    )
+    found = [resource.reference for resource in resources]
 
     parent_by_uid = {
         task.uid: task.parent_uid for task in found if task.uid and task.parent_uid
@@ -863,6 +915,14 @@ def _require_strong_etag(value: str, operation: str) -> str:
     return candidate
 
 
+def _reject_run_resource(reference: TodoRef, operation: str) -> None:
+    if "REFID" in reference.unsupported:
+        raise TodoError(
+            f"ordinary task {operation} refuses REFID-bearing resources; use `task run`",
+            exits.UNSUPPORTED_STRUCTURE,
+        )
+
+
 def plan_update(
     profile: Any,
     *,
@@ -872,6 +932,7 @@ def plan_update(
     now: dt.datetime | None = None,
 ) -> plans.Plan:
     reference, raw = fetch(profile, session=session, href=href)
+    _reject_run_resource(reference, "mutation")
     strong = _require_etag(reference, "an update")
     payload = patch_todo(raw, changes, now=now)
     updated = _describe(
@@ -905,6 +966,7 @@ def plan_complete(
     completed: dt.datetime | None = None,
 ) -> plans.Plan:
     reference, raw = fetch(profile, session=session, href=href)
+    _reject_run_resource(reference, "completion")
     strong = _require_etag(reference, "a completion")
     captured = _stamp_instant(completed or dt.datetime.now(dt.UTC))
     payload = patch_todo(
@@ -941,6 +1003,7 @@ def plan_complete(
 
 def plan_delete(profile: Any, *, session: Session, href: str) -> plans.Plan:
     reference, _ = fetch(profile, session=session, href=href)
+    _reject_run_resource(reference, "deletion")
     strong = _require_etag(reference, "a deletion")
     return plans.write_bundle(
         profile=profile.name,

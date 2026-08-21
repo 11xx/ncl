@@ -63,10 +63,11 @@ WORK WITH TASKS
   child of the selected collection and inside the profile allowlist. A VTODO
   nested inside another component is malformed; direct sibling components are
   readable but named unsupported. Missing task properties are shown as empty
-  values. Singleton VTODO properties cannot repeat, DUE and DURATION cannot
-  coexist, and an existing COMPLETED value must be UTC. Duplicate UIDs and
-  parent cycles fail closed as ambiguous; a parent outside the report remains
-  visible by UID rather than being guessed or rejected.
+  values. Singleton VTODO properties cannot repeat except REFID, which is
+  repeatable per RFC 9253 and is validated per resource for runs. DUE and
+  DURATION cannot coexist, and an existing COMPLETED value must be UTC.
+  Duplicate UIDs and parent cycles fail closed as ambiguous; a parent outside
+  the report remains visible by UID rather than being guessed or rejected.
 
   ncl task create <calendar> --summary S [--start <iso>] [--due <iso>]
   ncl task update <task-href> --summary S
@@ -122,6 +123,43 @@ PLAN APPOINTMENT TRAVEL
   unmentioned event data survive. Apply uses the ordinary resumable lifecycle:
   each exact PUT is followed by a readback, verified steps are skipped on
   resume, and an uncertain step blocks later steps until reconciliation.
+
+ORDERED CHECKPOINT RUNS
+  ncl task run create <calendar> --summary S --step A --step B
+  ncl task run list <calendar>
+  ncl task run show <root-href>
+  ncl task run add <root-href> --summary S [--before STEP-HREF | --after STEP-HREF]
+  ncl task run reorder <root-href> --step STEP-HREF --step STEP-HREF
+  ncl task run edit <root-or-step-href> --summary S
+  ncl task run done|skip|not-yet <step-href>
+
+  A run is one manifest VTODO and a linear chain of checkpoint VTODOs in the
+  same allowlisted collection. The manifest and every checkpoint carry the
+  same standard `REFID`: the manifest UID. `FIRST`, `PARENT`, and `NEXT`
+  relations use explicit `VALUE=UID`; an optional nonnegative `GAP` belongs
+  only to `NEXT`. Listing and showing validate the whole graph from one
+  depth-one report and derive the current checkpoint as the first one whose
+  status is neither `COMPLETED` nor `CANCELLED`.
+
+  Create, add, reorder, and edit are ordinary plans. Creation writes the
+  checkpoints in chain order and the manifest last; insertion writes the new
+  checkpoint before changed edge resources and the manifest last when FIRST
+  changes; reorder writes changed edges in final order and the manifest last
+  when needed. Authoring is refused once any checkpoint has left
+  `NEEDS-ACTION`. There is no run deletion, offline queue, or automatic
+  `IN-PROCESS` transition.
+
+  `done`, `skip`, and `not-yet` are also frozen plans. Done records one UTC
+  completion instant and 100 percent; skip cancels without a completion
+  timestamp; not-yet returns an in-process checkpoint to NEEDS-ACTION and is a
+  no-op when it is already there. Terminal transitions conflict, while done
+  and skip may be recorded out of order and report that fact. An ordinary task
+  update, completion, or deletion refuses a VTODO carrying REFID; use the run
+  commands to preserve the graph.
+
+  These standard relationships are stored and validated as data. The guide
+  does not promise that a Nextcloud web or mobile client displays their order;
+  that depends on a live server and client probe.
 
 REACH ALLOWLISTED FILES
   ncl files list <collection-href>  List one collection, without recursion.
