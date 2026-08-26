@@ -196,7 +196,11 @@ class PassBackend:
         """
         if shutil.which(self.executable) is None:
             return BackendState(UNAVAILABLE, "pass is not installed")
-        result = _run([self.executable, "ls"])
+        try:
+            result = _run([self.executable, "ls"])
+        except SecretError:
+            # A diagnostic that raises has failed at the one thing it is for.
+            return BackendState(MISCONFIGURED, "pass did not respond")
         if result.returncode == 0:
             return BackendState(READY, "pass is installed and its store is initialised")
         return BackendState(
@@ -293,9 +297,14 @@ class LibsecretBackend:
         """
         if shutil.which(self.executable) is None:
             return BackendState(UNAVAILABLE, "secret-tool is not installed")
-        result = _run(
-            [self.executable, "lookup", *self._attributes(_INSPECT_PROFILE, RECORD_KEY)]
-        )
+        try:
+            result = _run(
+                [self.executable, "lookup", *self._attributes(_INSPECT_PROFILE, RECORD_KEY)]
+            )
+        except SecretError:
+            # A locked collection can sit on an unlock prompt until `_run` times
+            # out. That is a store waiting to be unlocked, not a broken one.
+            return BackendState(LOCKED, "Secret Service did not answer; unlock the keyring")
         if result.returncode == 0 or (result.returncode == 1 and not result.stderr.strip()):
             return BackendState(READY, "Secret Service answered a lookup")
         detail = result.stderr.strip().lower()

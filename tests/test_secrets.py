@@ -352,3 +352,29 @@ def test_a_failed_round_trip_removes_its_value_and_names_no_secret(monkeypatch):
     probe_value = written[0].strip()
     assert probe_value not in state.detail
     assert not any(probe_value in effect for effect in state.side_effects)
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected"),
+    [
+        (secrets.PassBackend(), secrets.MISCONFIGURED),
+        (secrets.LibsecretBackend(), secrets.LOCKED),
+    ],
+)
+def test_a_backend_that_does_not_respond_is_reported_not_raised(
+    monkeypatch, backend, expected
+):
+    """`doctor` must survive the backend it exists to report on."""
+
+    def _timeout(command, *, input_text=None):
+        raise secrets.SecretError("the secret backend did not complete the request")
+
+    monkeypatch.setattr(secrets, "_run", _timeout)
+    monkeypatch.setattr(secrets.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    state = backend.inspect()
+
+    assert state.state == expected
+    assert state.usable is False
+    # The round trip stops at the same reading rather than writing anyway.
+    assert backend.round_trip().state == expected
