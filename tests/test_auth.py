@@ -28,6 +28,14 @@ PROFILE = Profile(
     files_roots=("/remote.php/dav/files/alice/work/",),
 )
 SENTINEL = "fixture-secret"
+CREDENTIAL_REPRESENTATIONS = tuple(
+    render.credential_representations("alice", SENTINEL).values()
+)
+SPLIT_REPRESENTATIONS = [
+    (representation, split)
+    for representation in CREDENTIAL_REPRESENTATIONS
+    for split in range(1, len(representation))
+]
 
 
 @pytest.fixture(autouse=True)
@@ -973,6 +981,133 @@ def test_cli_replaces_untyped_exception_text_with_catalogued_message(capsys):
     assert "Unexpected failure" in rendered.err
 
 
+def _register_credential_representations(monkeypatch) -> None:
+    monkeypatch.setattr(render, "_SECRETS", set(CREDENTIAL_REPRESENTATIONS))
+
+
+@pytest.mark.parametrize(
+    ("representation", "split"),
+    SPLIT_REPRESENTATIONS,
+    ids=[
+        f"representation-{index}-split-{split}"
+        for index, representation in enumerate(CREDENTIAL_REPRESENTATIONS)
+        for split in range(1, len(representation))
+    ],
+)
+def test_standard_stream_redacts_representation_split_across_writes(
+    monkeypatch, representation, split
+):
+    output = io.StringIO()
+    _register_credential_representations(monkeypatch)
+    monkeypatch.setattr(sys, "stdout", output)
+
+    with render.redacted_standard_streams():
+        sys.stdout.write(representation[:split])
+        sys.stdout.write(representation[split:])
+
+    assert representation not in output.getvalue()
+    assert "[redacted]" in output.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("representation", "split"),
+    SPLIT_REPRESENTATIONS,
+    ids=[
+        f"representation-{index}-split-{split}"
+        for index, representation in enumerate(CREDENTIAL_REPRESENTATIONS)
+        for split in range(1, len(representation))
+    ],
+)
+def test_standard_stream_redacts_representation_split_across_writelines(
+    monkeypatch, representation, split
+):
+    output = io.StringIO()
+    _register_credential_representations(monkeypatch)
+    monkeypatch.setattr(sys, "stdout", output)
+
+    with render.redacted_standard_streams():
+        assert sys.stdout.writelines((representation[:split], representation[split:])) is None
+
+    assert representation not in output.getvalue()
+    assert "[redacted]" in output.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("representation", "split"),
+    SPLIT_REPRESENTATIONS,
+    ids=[
+        f"representation-{index}-split-{split}"
+        for index, representation in enumerate(CREDENTIAL_REPRESENTATIONS)
+        for split in range(1, len(representation))
+    ],
+)
+def test_standard_stream_redacts_representation_split_across_mixed_writes(
+    monkeypatch, representation, split
+):
+    output = io.StringIO()
+    _register_credential_representations(monkeypatch)
+    monkeypatch.setattr(sys, "stdout", output)
+
+    with render.redacted_standard_streams():
+        sys.stdout.write(representation[:split])
+        assert sys.stdout.writelines((representation[split:],)) is None
+
+    assert representation not in output.getvalue()
+    assert "[redacted]" in output.getvalue()
+
+
+def test_standard_stream_flush_does_not_leak_split_secret(monkeypatch):
+    output = io.StringIO()
+    _register_credential_representations(monkeypatch)
+    monkeypatch.setattr(sys, "stdout", output)
+    split = 1
+
+    with render.redacted_standard_streams():
+        sys.stdout.write(SENTINEL[:split])
+        sys.stdout.flush()
+        sys.stdout.write(SENTINEL[split:])
+
+    assert SENTINEL not in output.getvalue()
+    assert "[redacted]" in output.getvalue()
+
+
+def test_standard_stream_preserves_non_secret_text_ending_in_secret_prefix(monkeypatch):
+    output = io.StringIO()
+    _register_credential_representations(monkeypatch)
+    monkeypatch.setattr(sys, "stdout", output)
+    value = f"ordinary text {SENTINEL[:-1]}"
+
+    with render.redacted_standard_streams():
+        sys.stdout.write(value)
+
+    assert output.getvalue() == value
+
+
+def test_standard_stream_write_returns_consumed_argument_length(monkeypatch):
+    output = io.StringIO()
+    _register_credential_representations(monkeypatch)
+    monkeypatch.setattr(sys, "stdout", output)
+
+    with render.redacted_standard_streams():
+        assert sys.stdout.write(SENTINEL) == len(SENTINEL)
+
+    assert output.getvalue() == "[redacted]"
+
+
+def test_standard_stream_redacts_secret_split_across_three_writes(monkeypatch):
+    output = io.StringIO()
+    _register_credential_representations(monkeypatch)
+    monkeypatch.setattr(sys, "stdout", output)
+
+    with render.redacted_standard_streams():
+        sys.stdout.write(SENTINEL[:1])
+        sys.stdout.write(SENTINEL[1:-1])
+        sys.stdout.write(SENTINEL[-1:])
+
+    assert SENTINEL not in output.getvalue()
+    assert output.getvalue() == "[redacted]"
+
+
 def _echo_principal_response() -> Response:
     return response(
         207,
@@ -1235,3 +1370,115 @@ def test_logout_requires_successful_ocs_revocation_envelope(monkeypatch, body):
 
     assert error.value.code == exits.REVOCATION_FAILED
     assert stored == {}
+
+
+def test_standard_stream_redacts_a_secret_completed_by_the_marker_seam(monkeypatch):
+    """Replacing one secret must not assemble another out of the marker.
+
+    `[redacted]` ends in a bracket, so a registered value beginning with one can
+    be completed by the marker that replaced its neighbour.
+    """
+    output = io.StringIO()
+    monkeypatch.setattr(render, "_SECRETS", {"ab", "]XYZ"})
+    monkeypatch.setattr(sys, "stdout", output)
+
+    with render.redacted_standard_streams():
+        sys.stdout.write("a")
+        sys.stdout.write("bXYZ")
+        sys.stdout.write("abXYZ")
+
+    assert "]XYZ" not in output.getvalue()
+    assert "ab" not in output.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("representation", "split"), SPLIT_REPRESENTATIONS, ids=str
+)
+def test_standard_stream_flush_between_halves_never_leaks(monkeypatch, representation, split):
+    output = io.StringIO()
+    _register_credential_representations(monkeypatch)
+    monkeypatch.setattr(sys, "stdout", output)
+
+    with render.redacted_standard_streams():
+        sys.stdout.write(representation[:split])
+        sys.stdout.flush()
+        sys.stdout.write(representation[split:])
+
+    rendered = output.getvalue()
+    assert not any(value in rendered for value in CREDENTIAL_REPRESENTATIONS)
+    assert "[redacted]" in rendered
+
+
+@pytest.mark.parametrize(
+    ("representation", "split"), SPLIT_REPRESENTATIONS, ids=str
+)
+def test_standard_error_stream_redacts_across_write_boundaries(
+    monkeypatch, representation, split
+):
+    output = io.StringIO()
+    _register_credential_representations(monkeypatch)
+    monkeypatch.setattr(sys, "stderr", output)
+
+    with render.redacted_standard_streams():
+        sys.stderr.write(representation[:split])
+        sys.stderr.write(representation[split:])
+
+    rendered = output.getvalue()
+    assert not any(value in rendered for value in CREDENTIAL_REPRESENTATIONS)
+    assert "[redacted]" in rendered
+
+
+def test_pending_text_is_released_and_streams_restored_when_the_body_raises(monkeypatch):
+    output = io.StringIO()
+    _register_credential_representations(monkeypatch)
+    original = sys.stdout
+    monkeypatch.setattr(sys, "stdout", output)
+
+    with pytest.raises(ValueError), render.redacted_standard_streams():
+        sys.stdout.write(f"kept {SENTINEL[:-1]}")
+        raise ValueError("body")
+
+    assert output.getvalue() == f"kept {SENTINEL[:-1]}"
+    assert sys.stdout is output
+    assert sys.stdout is not original
+
+
+def test_streams_are_restored_even_when_the_final_drain_fails(monkeypatch):
+    class _Refusing(io.StringIO):
+        def write(self, value):
+            raise OSError("stream closed")
+
+    _register_credential_representations(monkeypatch)
+    refusing = _Refusing()
+    monkeypatch.setattr(sys, "stdout", refusing)
+
+    with pytest.raises(OSError), render.redacted_standard_streams():
+        sys.stdout.write(SENTINEL[:-1])
+
+    assert sys.stdout is refusing
+
+
+def test_a_registered_set_that_never_settles_suppresses_the_text_entirely(monkeypatch):
+    """Failing closed beats emitting the part of a value that did settle."""
+    output = io.StringIO()
+    # Each replacement rebuilds a match out of the marker's own characters, so
+    # the text never reaches a fixed point.
+    monkeypatch.setattr(render, "_SECRETS", {"q", "ted]"})
+    monkeypatch.setattr(sys, "stdout", output)
+
+    with render.redacted_standard_streams():
+        sys.stdout.write("q")
+
+    assert "ted]" not in output.getvalue()
+    assert output.getvalue() == ""
+
+
+def test_a_real_credential_set_settles_without_suppressing_ordinary_text(monkeypatch):
+    output = io.StringIO()
+    _register_credential_representations(monkeypatch)
+    monkeypatch.setattr(sys, "stdout", output)
+
+    with render.redacted_standard_streams():
+        sys.stdout.write(f"profile alice used {SENTINEL} just now")
+
+    assert output.getvalue() == "profile alice used [redacted] just now"

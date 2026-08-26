@@ -31,24 +31,84 @@ def credential_representations(login_name: str, app_password: str) -> dict[str, 
     }
 
 
+#: Replacing a secret can complete another one at the seam, because the marker
+#: contributes characters of its own: with `ab` and `]xy` both registered,
+#: `abxy` becomes `[redacted]xy`, which contains `]xy` in full. Replacement
+#: therefore runs to a fixed point rather than once.
+#: Only a registered value overlapping the marker's own characters can need a
+#: second pass, and a real credential — an application password, a `user:pass`
+#: pair, its base64 form, or that form behind `Basic ` — contains no bracket and
+#: settles on the first. The allowance is for contrived sets; text that has not
+#: settled by then is suppressed rather than emitted in part.
+_REDACTION_PASSES = 8
+
+
 def _redact_text(value: str) -> str:
-    for secret in sorted(_SECRETS, key=len, reverse=True):
-        value = value.replace(secret, _MARKER)
-    return value
+    for _ in range(_REDACTION_PASSES):
+        replaced = value
+        for secret in sorted(_SECRETS, key=len, reverse=True):
+            replaced = replaced.replace(secret, _MARKER)
+        if replaced == value:
+            return value
+        value = replaced
+    # Text only fails to settle when a registered value is itself part of the
+    # marker, and then the marker discloses it too. Nothing can be written.
+    return ""
+
+
+def _held_prefix_length(value: str) -> int:
+    """How many trailing characters could still turn into a registered secret.
+
+    A secret split across two writes is invisible to a per-write replacement, so
+    the wrapper keeps back the longest suffix that is a proper prefix of some
+    registered value and reconsiders it once the next write arrives.
+    """
+    if not _SECRETS:
+        return 0
+    longest = max(len(secret) for secret in _SECRETS)
+    for length in range(min(longest - 1, len(value)), 0, -1):
+        suffix = value[len(value) - length:]
+        if any(secret.startswith(suffix) and len(secret) > length for secret in _SECRETS):
+            return length
+    return 0
 
 
 class _RedactingTextStream:
+    """A text stream whose redaction spans write boundaries.
+
+    Held text is never released on flush: by construction it is a proper prefix
+    of a registered secret, so draining it early is exactly the leak this exists
+    to close. It is at most one character short of the longest secret, and it
+    reaches the wrapped stream when the wrapper exits.
+    """
+
     def __init__(self, stream: Any) -> None:
         self._stream = stream
+        self._pending = ""
 
     def write(self, value: str) -> int:
-        return self._stream.write(_redact_text(value))
+        redacted = _redact_text(self._pending + value)
+        held = _held_prefix_length(redacted)
+        keep = len(redacted) - held
+        self._pending = redacted[keep:]
+        if keep:
+            self._stream.write(redacted[:keep])
+        # The text-stream contract counts the characters of the argument that
+        # were consumed, which redaction changes the length of but not the fate.
+        return len(value)
 
     def writelines(self, values: Any) -> None:
-        self._stream.writelines(_redact_text(value) for value in values)
+        for value in values:
+            self.write(value)
 
     def flush(self) -> None:
         self._stream.flush()
+
+    def drain(self) -> None:
+        """Release held text, which holds no complete secret."""
+        if self._pending:
+            self._stream.write(_redact_text(self._pending))
+            self._pending = ""
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._stream, name)
@@ -59,13 +119,20 @@ def redacted_standard_streams():
     """Redact text written through stdout and stderr for one CLI invocation."""
     stdout = sys.stdout
     stderr = sys.stderr
-    sys.stdout = _RedactingTextStream(stdout)
-    sys.stderr = _RedactingTextStream(stderr)
+    wrapped = (_RedactingTextStream(stdout), _RedactingTextStream(stderr))
+    sys.stdout, sys.stderr = wrapped
     try:
         yield
     finally:
-        sys.stdout = stdout
-        sys.stderr = stderr
+        # Restoration is not conditional on the drain succeeding: a stream that
+        # fails to accept its last write must not also leave the process with a
+        # wrapper standing in for its own stdout.
+        try:
+            for stream in wrapped:
+                stream.drain()
+        finally:
+            sys.stdout = stdout
+            sys.stderr = stderr
 
 
 def _redact(value: Any) -> Any:

@@ -56,8 +56,17 @@ The authenticated request boundary registers the application password, the
 `user:password` pair, its base64 encoding, and its Basic-auth form. Structured
 output is recursively redacted, and the CLI wraps its standard text streams so
 `argparse`, direct `print` calls, and library text writers pass through the same
-redaction. Raw file-descriptor and binary-buffer writes remain prohibited by
-project discipline rather than intercepted by the stream wrapper.
+redaction. The wrapper matches within a write and across
+write boundaries alike, so a value broken in two by a buffered writer is still
+redacted; text that merely ends inside a credential prefix is held only until
+the rest of the output arrives, and is released unchanged when the invocation
+finishes. Replacement repeats until the text stops changing, because the
+replacement marker contributes characters that could otherwise complete a
+second registered value at the seam. Text that never stops changing — possible
+only when a registered value is itself part of the marker, which then discloses
+it too — is dropped rather than written in part. Raw
+file-descriptor and binary-buffer writes remain prohibited by project discipline
+rather than intercepted by the stream wrapper.
 
 The resulting credential does not expire, is revocable on its own from the
 account's security settings with a visible last-used timestamp, and carries no
