@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 from test_config import write_config
 
-from ncl import checks, cli, exits, identity, login, render, secrets, session
+from ncl import cli, exits, identity, login, render, secrets, session
 from ncl.config import Profile
 from ncl.session import Response, Session, SessionError
 
@@ -1218,7 +1218,9 @@ def test_public_cli_auth_commands_redact_registered_credential(
     )
     monkeypatch.setattr(render, "_SECRETS", set())
     monkeypatch.setattr(secrets, "probe", lambda profile: True)
-    monkeypatch.setattr(checks, "probe_pass", lambda: (True, "fixture pass"))
+    from test_doctor import fixture_backend
+
+    fixture_backend(monkeypatch)
     # This drives the real `login` command, which would otherwise open a tab in
     # whoever is running the suite. The conftest guard turns that into a
     # failure; recording the URL is what the test actually needs.

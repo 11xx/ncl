@@ -1,6 +1,8 @@
-"""The credential record: one item per profile, decoded strictly or not at all."""
+"""The credential record, and what a backend check does and does not touch."""
 
 from __future__ import annotations
+
+from types import SimpleNamespace
 
 import pytest
 
@@ -198,3 +200,181 @@ def test_a_record_survives_values_json_would_have_to_escape(monkeypatch):
 def test_an_unsupported_backend_key_is_refused(monkeypatch):
     with pytest.raises(secrets.SecretError):
         secrets._check_key("something-else")
+
+
+class _Commands:
+    """A `_run` that records every backend command and answers by prefix."""
+
+    def __init__(self, answers: dict[tuple[str, ...], tuple[int, str, str]]) -> None:
+        self.answers = answers
+        self.commands: list[list[str]] = []
+
+    def __call__(self, command, *, input_text=None):
+        self.commands.append(list(command))
+        for prefix, (code, out, err) in self.answers.items():
+            if tuple(command[: len(prefix)]) == prefix:
+                return SimpleNamespace(returncode=code, stdout=out, stderr=err)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    @property
+    def mutations(self) -> list[list[str]]:
+        """Commands that change the store, which inspection must never issue."""
+        changing = {"insert", "rm", "store", "clear"}
+        return [command for command in self.commands if changing.intersection(command)]
+
+
+@pytest.mark.parametrize(
+    ("backend", "listing", "expected"),
+    [
+        (secrets.PassBackend(), ("pass", "ls"), secrets.READY),
+        (secrets.LibsecretBackend(), ("secret-tool", "lookup"), secrets.READY),
+    ],
+)
+def test_inspection_answers_without_changing_the_store(
+    monkeypatch, backend, listing, expected
+):
+    runner = _Commands({listing: (0, "", "")})
+    monkeypatch.setattr(secrets, "_run", runner)
+    monkeypatch.setattr(secrets.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    state = backend.inspect()
+
+    assert state.state == expected
+    assert state.round_tripped is False
+    assert state.side_effects == ()
+    assert runner.mutations == []
+
+
+@pytest.mark.parametrize(
+    "backend", [secrets.PassBackend(), secrets.LibsecretBackend()]
+)
+def test_a_missing_binary_is_unavailable_rather_than_a_failed_round_trip(
+    monkeypatch, backend
+):
+    runner = _Commands({})
+    monkeypatch.setattr(secrets, "_run", runner)
+    monkeypatch.setattr(secrets.shutil, "which", lambda name: None)
+
+    state = backend.inspect()
+
+    assert state.state == secrets.UNAVAILABLE
+    assert runner.commands == []
+    # An absent binary is not a store that failed: nothing was asked of it.
+    assert backend.round_trip().state == secrets.UNAVAILABLE
+
+
+def test_an_uninitialised_password_store_is_misconfigured(monkeypatch):
+    runner = _Commands({("pass", "ls"): (1, "", "Error: password store is empty.")})
+    monkeypatch.setattr(secrets, "_run", runner)
+    monkeypatch.setattr(secrets.shutil, "which", lambda name: "/usr/bin/pass")
+
+    state = secrets.PassBackend().inspect()
+
+    assert state.state == secrets.MISCONFIGURED
+    assert "pass init" in state.detail
+    assert runner.mutations == []
+
+
+def test_a_locked_secret_service_is_locked_rather_than_misconfigured(monkeypatch):
+    runner = _Commands(
+        {("secret-tool", "lookup"): (1, "", "the collection is locked and could not be unlocked")}
+    )
+    monkeypatch.setattr(secrets, "_run", runner)
+    monkeypatch.setattr(secrets.shutil, "which", lambda name: "/usr/bin/secret-tool")
+
+    state = secrets.LibsecretBackend().inspect()
+
+    assert state.state == secrets.LOCKED
+    assert runner.mutations == []
+
+
+def test_an_absent_credential_is_not_an_unusable_backend(monkeypatch):
+    """An empty successful lookup means the service works and holds nothing."""
+    runner = _Commands({("secret-tool", "lookup"): (1, "", "")})
+    monkeypatch.setattr(secrets, "_run", runner)
+    monkeypatch.setattr(secrets.shutil, "which", lambda name: "/usr/bin/secret-tool")
+
+    assert secrets.LibsecretBackend().inspect().state == secrets.READY
+
+
+@pytest.mark.parametrize(
+    ("backend", "listing"),
+    [
+        (secrets.PassBackend(), ("pass", "ls")),
+        (secrets.LibsecretBackend(), ("secret-tool", "lookup")),
+    ],
+)
+def test_a_round_trip_states_the_effects_it_had(monkeypatch, backend, listing):
+    runner = _Commands({listing: (0, "", "")})
+    stored: dict[str, str] = {}
+
+    def _run(command, *, input_text=None):
+        runner(command, input_text=input_text)
+        if "insert" in command or "store" in command:
+            stored["value"] = (input_text or "").rstrip("\n")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "show" in command or command[1] == "lookup":
+            return SimpleNamespace(returncode=0, stdout=stored.get("value", ""), stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(secrets, "_run", _run)
+    monkeypatch.setattr(secrets.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    state = backend.round_trip()
+
+    assert state.usable
+    assert state.round_tripped is True
+    assert state.side_effects
+    assert runner.mutations, "a round trip must actually write"
+
+
+def test_a_failed_round_trip_removes_its_value_and_names_no_secret(monkeypatch):
+    runner = _Commands({("pass", "ls"): (0, "", "")})
+    written: list[str] = []
+
+    def _run(command, *, input_text=None):
+        runner(command, input_text=input_text)
+        if "insert" in command:
+            written.append(input_text or "")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "show" in command:
+            # The store accepted the value and returned something else.
+            return SimpleNamespace(returncode=0, stdout="not-what-was-stored\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(secrets, "_run", _run)
+    monkeypatch.setattr(secrets.shutil, "which", lambda name: "/usr/bin/pass")
+
+    state = secrets.PassBackend().round_trip()
+
+    assert state.state == secrets.MISCONFIGURED
+    assert any("rm" in command for command in runner.commands), "residue must be removed"
+    probe_value = written[0].strip()
+    assert probe_value not in state.detail
+    assert not any(probe_value in effect for effect in state.side_effects)
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected"),
+    [
+        (secrets.PassBackend(), secrets.MISCONFIGURED),
+        (secrets.LibsecretBackend(), secrets.LOCKED),
+    ],
+)
+def test_a_backend_that_does_not_respond_is_reported_not_raised(
+    monkeypatch, backend, expected
+):
+    """`doctor` must survive the backend it exists to report on."""
+
+    def _timeout(command, *, input_text=None):
+        raise secrets.SecretError("the secret backend did not complete the request")
+
+    monkeypatch.setattr(secrets, "_run", _timeout)
+    monkeypatch.setattr(secrets.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    state = backend.inspect()
+
+    assert state.state == expected
+    assert state.usable is False
+    # The round trip stops at the same reading rather than writing anyway.
+    assert backend.round_trip().state == expected

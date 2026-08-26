@@ -18,6 +18,32 @@ from typing import Any
 
 from . import exits
 
+#: What an inspection concluded, without writing anything. The states are
+#: separate because the remedies are: an absent binary is installed, a locked
+#: store is unlocked, an uninitialised one is set up, and only a round trip can
+#: say whether a store that looks ready can actually keep a credential.
+UNAVAILABLE = "unavailable"
+LOCKED = "locked"
+MISCONFIGURED = "misconfigured"
+READY = "ready"
+
+
+@dataclass(frozen=True)
+class BackendState:
+    """What was learned about a backend, and how it was learned."""
+
+    state: str
+    detail: str
+    #: True only when a value was actually stored and removed again.
+    round_tripped: bool = False
+    #: Effects the caller's store has already taken on, named rather than
+    #: discovered afterwards in a commit log.
+    side_effects: tuple[str, ...] = ()
+
+    @property
+    def usable(self) -> bool:
+        return self.state == READY
+
 
 class SecretError(RuntimeError):
     """A secret backend could not complete an operation."""
@@ -55,6 +81,10 @@ def _run(command: list[str], *, input_text: str | None = None) -> subprocess.Com
 #: longer reads cannot outlive the account it belonged to.
 RECORD_KEY = "credential"
 _SUPERSEDED_KEYS = ("app_password", "login_name")
+
+#: A profile name nothing stores under, so inspecting cannot find a credential
+#: and cannot be mistaken for a lookup of one.
+_INSPECT_PROFILE = "inspect-only"
 
 RECORD_VERSION = 1
 _RECORD_FIELDS = ("version", "login_name", "app_password")
@@ -156,9 +186,41 @@ class PassBackend:
         if result.returncode != 0:
             raise SecretError("the pass backend could not remove the credential")
 
-    def probe(self) -> tuple[bool, str]:
+    def inspect(self) -> BackendState:
+        """Report what the store looks like, writing nothing.
+
+        A password store backed by Git turns every insertion and removal into a
+        commit, so a diagnostic that round-trips by default writes history the
+        caller never asked for. Listing is enough to separate an absent binary
+        from an uninitialised store from one that is ready to be tried.
+        """
         if shutil.which(self.executable) is None:
-            return False, "pass binary is not installed"
+            return BackendState(UNAVAILABLE, "pass is not installed")
+        try:
+            result = _run([self.executable, "ls"])
+        except SecretError:
+            # A diagnostic that raises has failed at the one thing it is for.
+            return BackendState(MISCONFIGURED, "pass did not respond")
+        if result.returncode == 0:
+            return BackendState(READY, "pass is installed and its store is initialised")
+        return BackendState(
+            MISCONFIGURED,
+            "pass is installed but its store did not list; run `pass init`",
+        )
+
+    def round_trip(self) -> BackendState:
+        """Store, read back, and remove one value, saying what that cost.
+
+        This is the only check that proves a store can keep a credential, and
+        the only one that changes it. Nothing calls it implicitly.
+        """
+        state = self.inspect()
+        if not state.usable:
+            return state
+        effects = (
+            "wrote and removed one entry under ncl/, which a Git-backed store "
+            "records as two commits",
+        )
         profile = f"probe-{token_source.token_hex(12)}"
         key = RECORD_KEY
         value = token_source.token_urlsafe(24)
@@ -167,14 +229,26 @@ class PassBackend:
             self.set(profile, key, value)
             stored = True
             if self.get(profile, key) != value:
-                return False, "pass could not return the stored probe value"
+                return BackendState(
+                    MISCONFIGURED,
+                    "pass did not return the value it stored",
+                    side_effects=effects,
+                )
             self.delete(profile, key)
             stored = False
-            return True, "pass stored, returned, and removed a probe value"
+            return BackendState(
+                READY,
+                "pass stored, returned, and removed a value",
+                round_tripped=True,
+                side_effects=effects,
+            )
         except SecretError:
-            return False, "pass could not round-trip a probe value"
+            return BackendState(
+                MISCONFIGURED, "pass could not round-trip a value", side_effects=effects
+            )
         finally:
             if stored:
+                # The value itself is never named, only the path that may hold it.
                 with suppress(SecretError):
                     self.delete(profile, key)
 
@@ -215,9 +289,37 @@ class LibsecretBackend:
         if result.returncode != 0:
             raise SecretError("the libsecret backend could not remove the credential")
 
-    def probe(self) -> tuple[bool, str]:
+    def inspect(self) -> BackendState:
+        """Report whether Secret Service answers, writing nothing.
+
+        A lookup for attributes nothing carries is the read-only question: the
+        service answers it with an empty success, an unreachable one fails.
+        """
         if shutil.which(self.executable) is None:
-            return False, "secret-tool binary is not installed"
+            return BackendState(UNAVAILABLE, "secret-tool is not installed")
+        try:
+            result = _run(
+                [self.executable, "lookup", *self._attributes(_INSPECT_PROFILE, RECORD_KEY)]
+            )
+        except SecretError:
+            # A locked collection can sit on an unlock prompt until `_run` times
+            # out. That is a store waiting to be unlocked, not a broken one.
+            return BackendState(LOCKED, "Secret Service did not answer; unlock the keyring")
+        if result.returncode == 0 or (result.returncode == 1 and not result.stderr.strip()):
+            return BackendState(READY, "Secret Service answered a lookup")
+        detail = result.stderr.strip().lower()
+        if "lock" in detail or "dismissed" in detail or "prompt" in detail:
+            return BackendState(LOCKED, "Secret Service is locked; unlock the login keyring")
+        return BackendState(
+            MISCONFIGURED, "secret-tool is installed but Secret Service did not answer"
+        )
+
+    def round_trip(self) -> BackendState:
+        """Store, read back, and remove one value, saying what that cost."""
+        state = self.inspect()
+        if not state.usable:
+            return state
+        effects = ("wrote and removed one Secret Service item labelled `ncl credential`",)
         profile = f"probe-{token_source.token_hex(12)}"
         key = RECORD_KEY
         value = token_source.token_urlsafe(24)
@@ -226,12 +328,25 @@ class LibsecretBackend:
             self.set(profile, key, value)
             stored = True
             if self.get(profile, key) != value:
-                return False, "Secret Service could not return the stored probe value"
+                return BackendState(
+                    MISCONFIGURED,
+                    "Secret Service did not return the value it stored",
+                    side_effects=effects,
+                )
             self.delete(profile, key)
             stored = False
-            return True, "Secret Service stored, returned, and removed a probe value"
+            return BackendState(
+                READY,
+                "Secret Service stored, returned, and removed a value",
+                round_tripped=True,
+                side_effects=effects,
+            )
         except SecretError:
-            return False, "Secret Service could not round-trip a probe value"
+            return BackendState(
+                MISCONFIGURED,
+                "Secret Service could not round-trip a value",
+                side_effects=effects,
+            )
         finally:
             if stored:
                 with suppress(SecretError):
@@ -262,19 +377,34 @@ def delete(profile: Any, key: str) -> None:
     _backend(profile).delete(profile, key)
 
 
-def probe(profile: Any | None = None) -> bool:
-    """Return whether the profile's backend can round-trip a throwaway value."""
-    backend = _backend(profile) if profile is not None else PassBackend()
-    return backend.probe()[0]
-
-
-def probe_backend(name: str) -> tuple[bool, str]:
-    """Return the detailed result used by doctor for a configured backend."""
+def inspect_backend(name: str) -> BackendState:
+    """Report a backend's state without storing or removing anything."""
     if name == "pass":
-        return PassBackend().probe()
+        return PassBackend().inspect()
     if name == "libsecret":
-        return LibsecretBackend().probe()
-    return False, "unsupported secret backend"
+        return LibsecretBackend().inspect()
+    return BackendState(MISCONFIGURED, "unsupported secret backend")
+
+
+def round_trip_backend(name: str) -> BackendState:
+    """Prove a backend can keep a value, by storing and removing one."""
+    if name == "pass":
+        return PassBackend().round_trip()
+    if name == "libsecret":
+        return LibsecretBackend().round_trip()
+    return BackendState(MISCONFIGURED, "unsupported secret backend")
+
+
+def probe(profile: Any | None = None) -> bool:
+    """Prove the profile's backend can keep the credential about to be issued.
+
+    Login Flow v2 returns the application password exactly once, so this is the
+    one place a real round trip is load-bearing rather than diagnostic: an
+    unusable store discovered afterwards costs a second trip through consent and
+    leaves an application password nobody holds.
+    """
+    backend = _backend(profile) if profile is not None else PassBackend()
+    return backend.round_trip().usable
 
 
 def load_credential(profile: Any) -> Credential | None:

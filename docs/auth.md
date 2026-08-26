@@ -57,6 +57,20 @@ run `ncl login` again. An entry written under the layout this replaced is not a
 credential and is not mistaken for one; `ncl logout` removes it along with the
 record so a password the tool no longer reads cannot outlive its account.
 
+A backend check and a backend proof are different questions, and `ncl doctor`
+answers only the first by default. Inspection asks whether the tool is installed
+and whether its store answers, and writes nothing — which matters most for a
+Git-backed password store, where an insertion and a removal are two commits the
+caller never asked a diagnostic to make. `ncl doctor --probe-secret-store` opts
+into the round trip, says so in its help, and reports the effects it had.
+Each result names which question it answered, so an inspection is never read as
+a proof. `ncl login` keeps the real round trip regardless: Login Flow v2 returns
+the application password exactly once, so a store that turns out to be unusable
+afterwards costs a second trip through browser consent and leaves an application
+password nobody holds. A probe that fails part-way removes what it wrote,
+best-effort, and names the path that may still hold something without ever
+naming the value.
+
 Secret backends distinguish an absent entry from an unusable backend. `pass`
 reports absence with its explicit “not in the password store” result, while
 Secret Service reports it with an empty successful lookup. Decryption,

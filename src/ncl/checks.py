@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import urllib.parse
 import xml.etree.ElementTree as ET
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -153,18 +152,18 @@ class Report:
         }
 
 
-def probe_pass() -> tuple[bool, str]:
-    """Check that pass can store, retrieve, and clear a value."""
+def inspect_backend(name: str):
+    """Report a backend's state without storing or removing anything."""
     from . import secrets as secret_store
 
-    return secret_store.probe_backend("pass")
+    return secret_store.inspect_backend(name)
 
 
-def probe_libsecret() -> tuple[bool, str]:
-    """Verify that Secret Service can store, retrieve, and clear a value."""
+def round_trip_backend(name: str):
+    """Prove a backend can keep a value, by storing and removing one."""
     from . import secrets as secret_store
 
-    return secret_store.probe_backend("libsecret")
+    return secret_store.round_trip_backend(name)
 
 
 def _check(name: str, status: str, detail: str, code: int = exits.OK) -> Check:
@@ -173,13 +172,18 @@ def _check(name: str, status: str, detail: str, code: int = exits.OK) -> Check:
     return Check(name=name, status=status, detail=detail, code=code)
 
 
-def _run_probe(name: str, probe: Callable[[], tuple[bool, str]]) -> Check:
-    passed, detail = probe()
+def _run_probe(name: str, backend: str, *, round_trip: bool) -> Check:
+    """Report a backend check, saying which question was actually answered."""
+    state = round_trip_backend(backend) if round_trip else inspect_backend(backend)
+    proof = "round trip" if state.round_tripped else "inspection only"
+    detail = f"{state.detail} ({proof})"
+    if state.side_effects:
+        detail = f"{detail}; {'; '.join(state.side_effects)}"
     return _check(
         name,
-        "pass" if passed else "fail",
+        "pass" if state.usable else "fail",
         detail,
-        exits.OK if passed else exits.CREDENTIAL_STORE_FAILED,
+        exits.OK if state.usable else exits.CREDENTIAL_STORE_FAILED,
     )
 
 
@@ -312,8 +316,14 @@ def run(
     profile_name: str | None = None,
     *,
     transport: Any = None,
+    round_trip: bool = False,
 ) -> Report:
-    """Run local checks and authenticated checks when a credential is present."""
+    """Run local checks and authenticated checks when a credential is present.
+
+    The backend check inspects by default and never writes. `round_trip` opts
+    into storing and removing a value, which is the only way to prove a store
+    can keep a credential and the only way this command changes anything.
+    """
     resolved = config.config_path(path)
     checks: list[Check] = []
     try:
@@ -362,22 +372,13 @@ def run(
             _check(f"origin:{profile.name}", "pass", f"{profile.origin}: well-formed origin")
         )
 
-        if profile.secret_backend == "pass":
-            checks.append(_run_probe(f"secret-backend:{profile.name}:pass", probe_pass))
-            checks.append(
-                _skip(
-                    f"secret-backend:{profile.name}:libsecret",
-                    "not selected by this profile",
-                )
-            )
-        else:
-            checks.append(
-                _skip(
-                    f"secret-backend:{profile.name}:pass",
-                    "not selected by this profile",
-                )
-            )
-            checks.append(_run_probe(f"secret-backend:{profile.name}:libsecret", probe_libsecret))
+        selected_backend = profile.secret_backend
+        for backend in ("pass", "libsecret"):
+            name = f"secret-backend:{profile.name}:{backend}"
+            if backend == selected_backend:
+                checks.append(_run_probe(name, backend, round_trip=round_trip))
+            else:
+                checks.append(_skip(name, "not selected by this profile"))
 
         for field, entries in (
             ("calendars", profile.calendars),
