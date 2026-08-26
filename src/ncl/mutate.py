@@ -274,8 +274,8 @@ def build_event(
     *,
     uid: str,
     summary: str,
-    start: dt.datetime,
-    end: dt.datetime,
+    start: dt.datetime | dt.date,
+    end: dt.datetime | dt.date,
     description: str = "",
     location: str = "",
     priority: int | None = None,
@@ -296,11 +296,24 @@ def build_event(
     Deliberately narrow: no recurrence or attendees. Those are refused rather
     than half-modelled, because writing a structure this tool does not understand
     is how an update silently destroys what it did not read.
+
+    Boundaries are either two instants or two dates. An all-day event is a pair
+    of `VALUE=DATE` values whose end is exclusive, so a single date needs the
+    day after it as its end. Mixing the two kinds is refused: RFC 5545 forbids
+    it, and choosing which side to coerce would invent either a timezone or a
+    local midnight the caller never stated.
     """
-    start = _stamp(start)
-    end = _stamp(end)
+    start = _boundary(start, "--from")
+    end = _boundary(end, "--to")
+    if isinstance(start, dt.datetime) != isinstance(end, dt.datetime):
+        raise EventError(
+            "an event is either all-day on both boundaries or timed on both; "
+            "give two YYYY-MM-DD dates or two instants with offsets",
+            exits.USAGE,
+        )
     if end <= start:
-        raise EventError("the event ends before it starts", exits.USAGE)
+        suffix = " (an all-day end date is exclusive)" if not isinstance(start, dt.datetime) else ""
+        raise EventError(f"the event ends before it starts{suffix}", exits.USAGE)
 
     calendar = icalendar.Calendar()
     calendar.add("prodid", PRODID)
@@ -429,8 +442,8 @@ def plan_create(
     *,
     calendar_href: str,
     summary: str,
-    start: dt.datetime,
-    end: dt.datetime,
+    start: dt.datetime | dt.date,
+    end: dt.datetime | dt.date,
     description: str = "",
     location: str = "",
     priority: int | None = None,

@@ -197,7 +197,11 @@ first failure, and never roll back a verified remote effect. Applying resumes
 by skipping verified steps. Partial plans do not expire, while untouched plans
 retain their short freshness window. Cancelling a partial plan removes local
 progress but does not undo remote effects.
-`cal update --from` and `--to` accept `YYYY-MM-DD` when both boundaries are
-explicitly supplied to convert an event between all-day and timed forms; mixed
-boundary types and non-exclusive all-day ends are refused before a plan is
-written.
+`cal create --from` and `--to`, and `cal update --from` and `--to`, accept
+`YYYY-MM-DD` for an all-day event and serialize it as `DTSTART;VALUE=DATE` with
+an exclusive `DTEND;VALUE=DATE`, so a single day ends on the following date. An
+event is all-day on both boundaries or timed on both: mixing a date with an
+instant is refused, as is an end that is not after the start. Update needs both
+boundaries stated together to convert between the two forms. Nothing infers a
+timezone or a local midnight from a date, and readback verifies the stored
+boundary kind rather than only the stamps.

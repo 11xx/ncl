@@ -173,6 +173,7 @@ REACH ALLOWLISTED FILES
 
 CHANGE NOTHING BY ACCIDENT
   ncl cal create <calendar> --summary S --from <iso> --to <iso>
+  ncl cal create <calendar> --summary S --from <date> --to <exclusive-date>
   ncl cal update <event-href> --target resource --summary S
   ncl cal update <event-href> --target series --summary S
   ncl cal update <event-href> --target occurrence --recurrence-id <wire-id> --summary S
