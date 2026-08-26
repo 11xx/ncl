@@ -62,7 +62,9 @@ redacted; text that merely ends inside a credential prefix is held only until
 the rest of the output arrives, and is released unchanged when the invocation
 finishes. Replacement repeats until the text stops changing, because the
 replacement marker contributes characters that could otherwise complete a
-second registered value at the seam. Raw
+second registered value at the seam. Text that never stops changing — possible
+only when a registered value is itself part of the marker, which then discloses
+it too — is dropped rather than written in part. Raw
 file-descriptor and binary-buffer writes remain prohibited by project discipline
 rather than intercepted by the stream wrapper.
 

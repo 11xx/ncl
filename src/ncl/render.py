@@ -35,7 +35,12 @@ def credential_representations(login_name: str, app_password: str) -> dict[str, 
 #: contributes characters of its own: with `ab` and `]xy` both registered,
 #: `abxy` becomes `[redacted]xy`, which contains `]xy` in full. Replacement
 #: therefore runs to a fixed point rather than once.
-_REDACTION_PASSES = 4
+#: Only a registered value overlapping the marker's own characters can need a
+#: second pass, and a real credential — an application password, a `user:pass`
+#: pair, its base64 form, or that form behind `Basic ` — contains no bracket and
+#: settles on the first. The allowance is for contrived sets; text that has not
+#: settled by then is suppressed rather than emitted in part.
+_REDACTION_PASSES = 8
 
 
 def _redact_text(value: str) -> str:
@@ -46,9 +51,9 @@ def _redact_text(value: str) -> str:
         if replaced == value:
             return value
         value = replaced
-    # A registered set that keeps re-forming itself out of the marker cannot be
-    # rendered safely in part, so none of it is rendered at all.
-    return _MARKER
+    # Text only fails to settle when a registered value is itself part of the
+    # marker, and then the marker discloses it too. Nothing can be written.
+    return ""
 
 
 def _held_prefix_length(value: str) -> int:

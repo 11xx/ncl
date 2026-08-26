@@ -1456,3 +1456,29 @@ def test_streams_are_restored_even_when_the_final_drain_fails(monkeypatch):
         sys.stdout.write(SENTINEL[:-1])
 
     assert sys.stdout is refusing
+
+
+def test_a_registered_set_that_never_settles_suppresses_the_text_entirely(monkeypatch):
+    """Failing closed beats emitting the part of a value that did settle."""
+    output = io.StringIO()
+    # Each replacement rebuilds a match out of the marker's own characters, so
+    # the text never reaches a fixed point.
+    monkeypatch.setattr(render, "_SECRETS", {"q", "ted]"})
+    monkeypatch.setattr(sys, "stdout", output)
+
+    with render.redacted_standard_streams():
+        sys.stdout.write("q")
+
+    assert "ted]" not in output.getvalue()
+    assert output.getvalue() == ""
+
+
+def test_a_real_credential_set_settles_without_suppressing_ordinary_text(monkeypatch):
+    output = io.StringIO()
+    _register_credential_representations(monkeypatch)
+    monkeypatch.setattr(sys, "stdout", output)
+
+    with render.redacted_standard_streams():
+        sys.stdout.write(f"profile alice used {SENTINEL} just now")
+
+    assert output.getvalue() == "profile alice used [redacted] just now"
