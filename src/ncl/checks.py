@@ -198,8 +198,7 @@ def _run_authenticated(profile: Any, checks: list[Check], *, transport: Any = No
     from .session import Session, SessionError
 
     try:
-        login_name = secret_store.get(profile, "login_name")
-        app_password = secret_store.get(profile, "app_password")
+        credential = secret_store.load_credential(profile)
     except secret_store.SecretError as exc:
         detail = "the secret backend could not read the credential; fix the backend"
         code = getattr(exc, "code", exits.PRECONDITION_FAILED)
@@ -222,7 +221,7 @@ def _run_authenticated(profile: Any, checks: list[Check], *, transport: Any = No
                     )
                 )
         return
-    if not login_name or not app_password:
+    if credential is None:
         detail = "no credential is stored; run `ncl login`"
         checks.extend(
             (

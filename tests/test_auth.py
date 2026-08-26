@@ -100,8 +100,32 @@ def home_response() -> Response:
     )
 
 
+def credential_record(login_name: str, app_password: str) -> str:
+    """The exact bytes a backend holds for one profile."""
+    return secrets._encode(secrets.Credential(login_name, app_password))
+
+
+def credential_reader(login_name: str, app_password: str):
+    """A `secrets.get` standing in for a backend holding that one credential."""
+    record = credential_record(login_name, app_password)
+    return lambda profile, key: record if key == secrets.RECORD_KEY else None
+
+
+def stored_credential(stored: dict[str, str]) -> dict[str, str]:
+    """What a fake backend's contents amount to, as plain fields."""
+    raw = stored.get(secrets.RECORD_KEY)
+    if raw is None:
+        return {}
+    decoded = secrets._decode(raw)
+    return {"login_name": decoded.login_name, "app_password": decoded.app_password}
+
+
 def seed_credentials(monkeypatch, values: dict[str, str] | None = None):
-    stored = dict(values or {})
+    stored: dict[str, str] = {}
+    if values:
+        stored[secrets.RECORD_KEY] = credential_record(
+            values["login_name"], values["app_password"]
+        )
     monkeypatch.setattr(secrets, "get", lambda profile, key: stored.get(key))
     monkeypatch.setattr(
         secrets,
@@ -324,7 +348,7 @@ def test_identity_rejects_needed_property_with_404_propstat(monkeypatch):
 def test_login_rejects_off_origin_urls_before_opening_browser(monkeypatch):
     seed_credentials(monkeypatch)
     monkeypatch.setattr(secrets, "probe", lambda profile: True)
-    monkeypatch.setattr(secrets, "has_credentials", lambda profile: False)
+    monkeypatch.setattr(secrets, "has_credential", lambda profile: False)
     opened = []
     transport = FakeTransport(
         [
@@ -391,7 +415,7 @@ def test_login_reports_issued_credential_when_post_consent_validation_fails(
 ):
     seed_credentials(monkeypatch)
     monkeypatch.setattr(secrets, "probe", lambda profile: True)
-    monkeypatch.setattr(secrets, "has_credentials", lambda profile: False)
+    monkeypatch.setattr(secrets, "has_credential", lambda profile: False)
     transport = FakeTransport(
         [
             response(
@@ -424,7 +448,7 @@ def test_login_reports_issued_credential_when_post_consent_validation_fails(
 def test_login_treats_unparseable_http_200_as_issued_credential(monkeypatch, capsys):
     stored = seed_credentials(monkeypatch)
     monkeypatch.setattr(secrets, "probe", lambda profile: True)
-    monkeypatch.setattr(secrets, "has_credentials", lambda profile: False)
+    monkeypatch.setattr(secrets, "has_credential", lambda profile: False)
     transport = FakeTransport(
         [
             response(
@@ -466,7 +490,7 @@ def test_login_refuses_unencodable_poll_request_values(
 ):
     seed_credentials(monkeypatch)
     monkeypatch.setattr(secrets, "probe", lambda profile: True)
-    monkeypatch.setattr(secrets, "has_credentials", lambda profile: False)
+    monkeypatch.setattr(secrets, "has_credential", lambda profile: False)
     transport = FakeTransport(
         [
             response(
@@ -506,7 +530,7 @@ def test_server_supplied_text_never_reaches_rendered_messages(monkeypatch, capsy
         Session(PROFILE, transport=retry_transport).request("GET", "/remote.php/dav/")
 
     monkeypatch.setattr(secrets, "probe", lambda profile: True)
-    monkeypatch.setattr(secrets, "has_credentials", lambda profile: False)
+    monkeypatch.setattr(secrets, "has_credential", lambda profile: False)
     login_transport = FakeTransport(
         [
             response(
@@ -552,13 +576,13 @@ def test_login_polls_404_then_stores_once_and_confirms_identity(monkeypatch):
     stored = seed_credentials(monkeypatch)
     monkeypatch.setattr(secrets, "probe", lambda profile: True)
     store_calls = []
-    original_store = secrets.store_credentials
+    original_store = secrets.store_credential
 
     def record_store(profile, login_name, app_password):
         store_calls.append((profile, login_name, app_password))
         return original_store(profile, login_name, app_password)
 
-    monkeypatch.setattr(secrets, "store_credentials", record_store)
+    monkeypatch.setattr(secrets, "store_credential", record_store)
     transport = FakeTransport(
         [
             response(
@@ -599,7 +623,7 @@ def test_login_polls_404_then_stores_once_and_confirms_identity(monkeypatch):
     )
 
     assert result.account_name == "alice"
-    assert stored == {
+    assert stored_credential(stored) == {
         "login_name": "alice@example.invalid",
         "app_password": "fixture-secret",
     }
@@ -624,10 +648,10 @@ def test_login_polls_404_then_stores_once_and_confirms_identity(monkeypatch):
 
 def test_login_store_failure_reports_orphaned_application_password(monkeypatch):
     monkeypatch.setattr(secrets, "probe", lambda profile: True)
-    monkeypatch.setattr(secrets, "has_credentials", lambda profile: False)
+    monkeypatch.setattr(secrets, "has_credential", lambda profile: False)
     monkeypatch.setattr(
         secrets,
-        "store_credentials",
+        "store_credential",
         lambda profile, login_name, app_password: (_ for _ in ()).throw(
             secrets.SecretError("store failed")
         ),
@@ -671,7 +695,7 @@ def test_login_store_failure_reports_orphaned_application_password(monkeypatch):
 
 def test_second_login_refuses_and_points_to_logout(monkeypatch):
     monkeypatch.setattr(secrets, "probe", lambda profile: True)
-    monkeypatch.setattr(secrets, "has_credentials", lambda profile: True)
+    monkeypatch.setattr(secrets, "has_credential", lambda profile: True)
     transport = FakeTransport([])
 
     with pytest.raises(login.LoginError) as error:
@@ -733,7 +757,7 @@ def test_force_login_revokes_existing_credential_before_starting_flow(monkeypatc
     )
 
     assert revoked == [(PROFILE, transport)]
-    assert stored == {"login_name": "alice", "app_password": "fixture-secret"}
+    assert stored_credential(stored) == {"login_name": "alice", "app_password": "fixture-secret"}
     assert any("revoked before browser consent" in message for message in output)
     assert any("without a credential" in message for message in output)
 
@@ -1204,7 +1228,7 @@ def test_public_cli_auth_commands_redact_registered_credential(
     def invoke(command, transport, *, has_credentials=True):
         monkeypatch.setattr(session, "UrllibTransport", lambda: transport)
         monkeypatch.setattr(login, "UrllibTransport", lambda: transport)
-        monkeypatch.setattr(secrets, "has_credentials", lambda profile: has_credentials)
+        monkeypatch.setattr(secrets, "has_credential", lambda profile: has_credentials)
         args = [command]
         if json_output:
             args.append("--json")
@@ -1228,7 +1252,7 @@ def test_public_cli_auth_commands_redact_registered_credential(
     stored.clear()
     monkeypatch.setattr(
         secrets,
-        "store_credentials",
+        "store_credential",
         lambda profile, login_name, app_password: stored.update(
             login_name=login_name, app_password=app_password
         ),

@@ -7,6 +7,7 @@ from xml.sax.saxutils import escape
 
 import icalendar
 import pytest
+from test_auth import credential_reader
 
 from ncl import caldav, cli, exits, plans, todos
 from ncl import session as http_session
@@ -429,7 +430,7 @@ def test_task_fetch_refuses_redirect_before_following_it_on_real_session(monkeyp
     monkeypatch.setattr(
         http_session.secrets,
         "get",
-        lambda profile, key: {"login_name": "alice", "app_password": "fixture"}.get(key),
+        credential_reader("alice", "fixture"),
     )
 
     with pytest.raises(http_session.SessionError) as error:

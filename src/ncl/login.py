@@ -153,7 +153,7 @@ def _store(profile: Any, payload: dict[str, Any]) -> None:
     if not isinstance(app_password, str) or not app_password:
         raise LoginError("the Login Flow v2 response omitted appPassword", exits.MALFORMED_RESPONSE)
     try:
-        secrets.store_credentials(profile, login_name, app_password)
+        secrets.store_credential(profile, login_name, app_password)
     except secrets.SecretError as exc:
         raise _orphaned_credential("the credential store failed") from exc
 
@@ -189,7 +189,7 @@ def _authenticate(
         )
 
     transport = transport or UrllibTransport()
-    if secrets.has_credentials(profile):
+    if secrets.has_credential(profile):
         if not force:
             raise LoginError(
                 "a credential is already stored; run `ncl logout` first", exits.CONFLICT
@@ -400,7 +400,7 @@ def _logout(
         revoked = False
 
     try:
-        secrets.clear_credentials(profile)
+        secrets.clear_credential(profile)
     except secrets.SecretError as exc:
         if not revoked:
             raise LoginError(

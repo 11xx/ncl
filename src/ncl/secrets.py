@@ -1,7 +1,14 @@
-"""Secret storage for profile-scoped Nextcloud credentials."""
+"""Secret storage for profile-scoped Nextcloud credentials.
+
+A usable credential is the pair of a login name and an application password, so
+one profile holds one record carrying both. Storing the halves separately made
+an interruption mid-replacement leave a password without its login name, and let
+one request read each half from a different generation.
+"""
 
 from __future__ import annotations
 
+import json
 import secrets as token_source
 import shutil
 import subprocess
@@ -43,10 +50,73 @@ def _run(command: list[str], *, input_text: str | None = None) -> subprocess.Com
         raise SecretError("the secret backend did not complete the request") from exc
 
 
+#: The one item a profile stores. The names beside it are the layout this
+#: release replaced; they are still removed on logout so a password the tool no
+#: longer reads cannot outlive the account it belonged to.
+RECORD_KEY = "credential"
+_SUPERSEDED_KEYS = ("app_password", "login_name")
+
+RECORD_VERSION = 1
+_RECORD_FIELDS = ("version", "login_name", "app_password")
+
+
 def _check_key(key: str) -> str:
-    if key not in {"app_password", "login_name"}:
+    if key not in {RECORD_KEY, *_SUPERSEDED_KEYS}:
         raise SecretError("unsupported credential key")
     return key
+
+
+@dataclass(frozen=True)
+class Credential:
+    """One profile's complete, usable credential."""
+
+    login_name: str
+    app_password: str
+
+
+def _encode(credential: Credential) -> str:
+    return json.dumps(
+        {
+            "version": RECORD_VERSION,
+            "login_name": credential.login_name,
+            "app_password": credential.app_password,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def _reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    seen: dict[str, Any] = {}
+    for name, value in pairs:
+        if name in seen:
+            raise SecretError(_MALFORMED)
+        seen[name] = value
+    return seen
+
+
+#: Every rejection says the same thing on purpose: the caller's only remedy is
+#: the same one, and naming which field was wrong describes the stored record.
+_MALFORMED = (
+    "the stored credential is not readable by this release; run `ncl login` to store it again"
+)
+
+
+def _decode(raw: str) -> Credential:
+    try:
+        # A stricter load than json.loads alone: it rejects a repeated field
+        # rather than silently keeping whichever copy came last.
+        record = json.loads(raw, object_pairs_hook=_reject_duplicates)
+    except (ValueError, TypeError) as exc:
+        raise SecretError(_MALFORMED) from exc
+    if not isinstance(record, dict) or sorted(record) != sorted(_RECORD_FIELDS):
+        raise SecretError(_MALFORMED)
+    if record["version"] != RECORD_VERSION or isinstance(record["version"], bool):
+        raise SecretError(_MALFORMED)
+    values = {name: record[name] for name in ("login_name", "app_password")}
+    if any(not isinstance(value, str) or not value for value in values.values()):
+        raise SecretError(_MALFORMED)
+    return Credential(**values)
 
 
 @dataclass(frozen=True)
@@ -90,7 +160,7 @@ class PassBackend:
         if shutil.which(self.executable) is None:
             return False, "pass binary is not installed"
         profile = f"probe-{token_source.token_hex(12)}"
-        key = "app_password"
+        key = RECORD_KEY
         value = token_source.token_urlsafe(24)
         stored = False
         try:
@@ -149,7 +219,7 @@ class LibsecretBackend:
         if shutil.which(self.executable) is None:
             return False, "secret-tool binary is not installed"
         profile = f"probe-{token_source.token_hex(12)}"
-        key = "app_password"
+        key = RECORD_KEY
         value = token_source.token_urlsafe(24)
         stored = False
         try:
@@ -207,50 +277,44 @@ def probe_backend(name: str) -> tuple[bool, str]:
     return False, "unsupported secret backend"
 
 
-def store_credentials(profile: Any, login_name: str, app_password: str) -> None:
-    """Replace both credential entries as one recoverable operation."""
+def load_credential(profile: Any) -> Credential | None:
+    """Return the profile's complete credential, or None if none is stored.
+
+    One backend read yields one generation of the record, so a caller cannot
+    observe a login name from one login paired with a password from another.
+    """
+    raw = get(profile, RECORD_KEY)
+    if raw is None:
+        return None
+    return _decode(raw)
+
+
+def store_credential(profile: Any, login_name: str, app_password: str) -> None:
+    """Replace the profile's credential with one write.
+
+    There is nothing to roll back and no window to be interrupted in: the record
+    is written whole, so the backend holds either the previous credential or the
+    new one.
+    """
     if not login_name or not app_password:
         raise SecretError("the server returned an empty credential")
-    old = {key: get(profile, key) for key in ("app_password", "login_name")}
-    changed: list[str] = []
-    try:
-        set(profile, "app_password", app_password)
-        changed.append("app_password")
-        set(profile, "login_name", login_name)
-        changed.append("login_name")
-    except SecretError:
-        for key in reversed(changed):
-            try:
-                if old[key] is None:
-                    delete(profile, key)
-                else:
-                    set(profile, key, old[key])
-            except SecretError:
-                pass
-        raise
-    except KeyboardInterrupt:
-        raise
-    except Exception as exc:
-        for key in reversed(changed):
-            try:
-                if old[key] is None:
-                    delete(profile, key)
-                else:
-                    set(profile, key, old[key])
-            except SecretError:
-                pass
-        raise SecretError("the secret backend could not store the credential") from exc
+    set(profile, RECORD_KEY, _encode(Credential(login_name, app_password)))
 
 
-def has_credentials(profile: Any) -> bool:
-    """Return whether either credential entry is already populated."""
-    return bool(get(profile, "app_password") or get(profile, "login_name"))
+def has_credential(profile: Any) -> bool:
+    """Return whether a usable credential is stored.
+
+    A record that cannot be decoded is not a credential, but it is also not
+    absence: it is reported as a conflict so that storing over it stays a
+    deliberate act.
+    """
+    return get(profile, RECORD_KEY) is not None
 
 
-def clear_credentials(profile: Any) -> None:
-    """Remove both local credential entries."""
+def clear_credential(profile: Any) -> None:
+    """Remove the profile's credential, and any entry the old layout left."""
     errors: list[SecretError] = []
-    for key in ("app_password", "login_name"):
+    for key in (RECORD_KEY, *_SUPERSEDED_KEYS):
         try:
             if get(profile, key) is None:
                 continue
