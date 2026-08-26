@@ -17,6 +17,22 @@ from test_config import VALID, write_config
 from ncl import checks, cli, exits, identity, secrets
 
 
+def fixture_backend(monkeypatch, state=None):
+    """Stand in for both backends, so no test touches a real secret store."""
+    from ncl import secrets
+
+    ready = state or secrets.BackendState(secrets.READY, "fixture backend")
+    monkeypatch.setattr(checks, "inspect_backend", lambda name: ready)
+    monkeypatch.setattr(
+        checks,
+        "round_trip_backend",
+        lambda name: secrets.BackendState(
+            ready.state, ready.detail, round_tripped=True, side_effects=("fixture effect",)
+        ),
+    )
+    return ready
+
+
 def resource_response(href: str):
     body = (
         '<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">'
@@ -39,8 +55,7 @@ def test_broken_config_fails_doctor(tmp_path):
 
 def test_good_config_passes_without_backend_or_server(monkeypatch, tmp_path):
     path = write_config(tmp_path)
-    monkeypatch.setattr(checks, "probe_pass", lambda: (True, "fixture pass"))
-    monkeypatch.setattr(checks, "probe_libsecret", lambda: (False, "must be skipped"))
+    fixture_backend(monkeypatch)
 
     report = checks.run(path)
 
@@ -59,7 +74,7 @@ def test_good_config_passes_without_backend_or_server(monkeypatch, tmp_path):
 
 def test_doctor_authenticated_checks_resolve_identity_and_allowlists(monkeypatch, tmp_path):
     path = write_config(tmp_path)
-    monkeypatch.setattr(checks, "probe_pass", lambda: (True, "fixture pass"))
+    fixture_backend(monkeypatch)
     monkeypatch.setattr(
         secrets, "get", credential_reader("alice@example.invalid", "fixture-secret")
     )
@@ -106,7 +121,7 @@ def test_doctor_authenticated_remote_failures_fail_with_bounded_details(
     monkeypatch, tmp_path, remote_status, expected_detail
 ):
     path = write_config(tmp_path)
-    monkeypatch.setattr(checks, "probe_pass", lambda: (True, "fixture pass"))
+    fixture_backend(monkeypatch)
     monkeypatch.setattr(
         secrets, "get", credential_reader("alice@example.invalid", "fixture-secret")
     )
@@ -145,7 +160,7 @@ def test_doctor_authenticated_remote_failures_fail_with_bounded_details(
 
 def test_doctor_fails_when_secret_backend_cannot_read(monkeypatch, tmp_path):
     path = write_config(tmp_path)
-    monkeypatch.setattr(checks, "probe_pass", lambda: (True, "fixture pass"))
+    fixture_backend(monkeypatch)
 
     def unreadable(command, **kwargs):
         return subprocess.CompletedProcess(command, 1, "", "gpg: decryption failed\n")
@@ -167,7 +182,7 @@ def test_doctor_preserves_credential_rejection_code_and_json_remediation(
     monkeypatch, tmp_path
 ):
     path = write_config(tmp_path)
-    monkeypatch.setattr(checks, "probe_pass", lambda: (True, "fixture pass"))
+    fixture_backend(monkeypatch)
     monkeypatch.setattr(
         secrets, "get", credential_reader("alice@example.invalid", "fixture-secret")
     )
@@ -201,10 +216,72 @@ def test_resource_existence_rejects_bodyless_or_wrong_root_207(body):
 def test_doctor_json_contains_checks_and_full_exit_map(monkeypatch, tmp_path, capsys):
     path = write_config(tmp_path)
     monkeypatch.setenv("NCL_CONFIG", str(path))
-    monkeypatch.setattr(checks, "probe_pass", lambda: (True, "fixture pass"))
+    fixture_backend(monkeypatch)
 
     assert cli.main(["doctor", "--json"]) == exits.OK
     output = json.loads(capsys.readouterr().out)
 
     assert output["checks"]
     assert set(output["response"]) == {str(code) for code in exits.RESPONSE}
+
+
+def _recording_runner(monkeypatch):
+    """Capture every backend command `doctor` causes, at the subprocess seam."""
+    from ncl import secrets
+
+    commands: list[list[str]] = []
+    held: dict[str, str] = {}
+
+    def _run(command, *, input_text=None):
+        commands.append(list(command))
+        # A store that actually keeps what it is given, so a round trip can
+        # succeed and be reported as one.
+        if "insert" in command or "store" in command:
+            held["value"] = (input_text or "").rstrip("\n")
+        elif "rm" in command or "clear" in command:
+            held.pop("value", None)
+        elif "show" in command or "lookup" in command:
+            return SimpleNamespace(returncode=0, stdout=held.get("value", ""), stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(secrets, "_run", _run)
+    monkeypatch.setattr(secrets.shutil, "which", lambda name: f"/usr/bin/{name}")
+    return commands
+
+
+def test_default_doctor_never_writes_to_the_password_store(tmp_path, monkeypatch, capsys):
+    path = write_config(tmp_path)
+    monkeypatch.setenv("NCL_CONFIG", str(path))
+    commands = _recording_runner(monkeypatch)
+
+    cli.main(["doctor"])
+    rendered = capsys.readouterr().out
+
+    assert "pass secret-backend:home:pass" in rendered
+    assert commands, "doctor must still ask the backend something"
+    assert not any({"insert", "rm", "store", "clear"}.intersection(c) for c in commands)
+    assert "inspection only" in rendered
+    assert "round trip" not in rendered
+
+
+def test_the_explicit_flag_round_trips_and_says_what_it_wrote(tmp_path, monkeypatch, capsys):
+    path = write_config(tmp_path)
+    monkeypatch.setenv("NCL_CONFIG", str(path))
+    commands = _recording_runner(monkeypatch)
+
+    cli.main(["doctor", "--probe-secret-store"])
+    rendered = capsys.readouterr().out
+
+    assert any({"insert", "rm"}.intersection(c) for c in commands)
+    assert "(round trip)" in rendered
+    assert "commits" in rendered
+
+
+def test_the_probe_flag_is_documented_as_writing_to_the_store(capsys):
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["doctor", "--help"])
+
+    text = capsys.readouterr().out
+    assert "--probe-secret-store" in text
+    assert "writes to the store" in text

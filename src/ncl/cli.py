@@ -133,6 +133,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = commands.add_parser("doctor", help="Check every local precondition")
     _add_options(doctor)
+    doctor.add_argument(
+        "--probe-secret-store",
+        action="store_true",
+        help="Also store and remove one value, proving the backend can keep a credential. "
+        "This writes to the store: a Git-backed pass records two commits",
+    )
 
     profile = commands.add_parser("profile", help="Inspect configured profiles")
     profile_commands = profile.add_subparsers(
@@ -1510,7 +1516,9 @@ def _main(argv: list[str] | None = None) -> int:
                 render.emit(guide.render(), end="")
             return exits.OK
         if args.command == "doctor":
-            report = checks.run(profile_name=args.profile)
+            report = checks.run(
+                profile_name=args.profile, round_trip=args.probe_secret_store
+            )
             if json_output:
                 _json(report.as_dict())
             else:
