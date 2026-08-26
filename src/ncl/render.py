@@ -34,12 +34,11 @@ def credential_representations(login_name: str, app_password: str) -> dict[str, 
 #: Replacing a secret can complete another one at the seam, because the marker
 #: contributes characters of its own: with `ab` and `]xy` both registered,
 #: `abxy` becomes `[redacted]xy`, which contains `]xy` in full. Replacement
-#: therefore runs to a fixed point rather than once.
-#: Only a registered value overlapping the marker's own characters can need a
-#: second pass, and a real credential — an application password, a `user:pass`
-#: pair, its base64 form, or that form behind `Basic ` — contains no bracket and
-#: settles on the first. The allowance is for contrived sets; text that has not
-#: settled by then is suppressed rather than emitted in part.
+#: therefore runs to a fixed point rather than once. Only a value overlapping
+#: the marker's own characters needs a second pass, and a real credential — an
+#: application password, a `user:pass` pair, its base64 form, or that form
+#: behind `Basic ` — carries no bracket and settles on the first, so this
+#: allowance exists for contrived registered sets alone.
 _REDACTION_PASSES = 8
 
 
