@@ -1370,3 +1370,89 @@ def test_logout_requires_successful_ocs_revocation_envelope(monkeypatch, body):
 
     assert error.value.code == exits.REVOCATION_FAILED
     assert stored == {}
+
+
+def test_standard_stream_redacts_a_secret_completed_by_the_marker_seam(monkeypatch):
+    """Replacing one secret must not assemble another out of the marker.
+
+    `[redacted]` ends in a bracket, so a registered value beginning with one can
+    be completed by the marker that replaced its neighbour.
+    """
+    output = io.StringIO()
+    monkeypatch.setattr(render, "_SECRETS", {"ab", "]XYZ"})
+    monkeypatch.setattr(sys, "stdout", output)
+
+    with render.redacted_standard_streams():
+        sys.stdout.write("a")
+        sys.stdout.write("bXYZ")
+        sys.stdout.write("abXYZ")
+
+    assert "]XYZ" not in output.getvalue()
+    assert "ab" not in output.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("representation", "split"), SPLIT_REPRESENTATIONS, ids=str
+)
+def test_standard_stream_flush_between_halves_never_leaks(monkeypatch, representation, split):
+    output = io.StringIO()
+    _register_credential_representations(monkeypatch)
+    monkeypatch.setattr(sys, "stdout", output)
+
+    with render.redacted_standard_streams():
+        sys.stdout.write(representation[:split])
+        sys.stdout.flush()
+        sys.stdout.write(representation[split:])
+
+    rendered = output.getvalue()
+    assert not any(value in rendered for value in CREDENTIAL_REPRESENTATIONS)
+    assert "[redacted]" in rendered
+
+
+@pytest.mark.parametrize(
+    ("representation", "split"), SPLIT_REPRESENTATIONS, ids=str
+)
+def test_standard_error_stream_redacts_across_write_boundaries(
+    monkeypatch, representation, split
+):
+    output = io.StringIO()
+    _register_credential_representations(monkeypatch)
+    monkeypatch.setattr(sys, "stderr", output)
+
+    with render.redacted_standard_streams():
+        sys.stderr.write(representation[:split])
+        sys.stderr.write(representation[split:])
+
+    rendered = output.getvalue()
+    assert not any(value in rendered for value in CREDENTIAL_REPRESENTATIONS)
+    assert "[redacted]" in rendered
+
+
+def test_pending_text_is_released_and_streams_restored_when_the_body_raises(monkeypatch):
+    output = io.StringIO()
+    _register_credential_representations(monkeypatch)
+    original = sys.stdout
+    monkeypatch.setattr(sys, "stdout", output)
+
+    with pytest.raises(ValueError), render.redacted_standard_streams():
+        sys.stdout.write(f"kept {SENTINEL[:-1]}")
+        raise ValueError("body")
+
+    assert output.getvalue() == f"kept {SENTINEL[:-1]}"
+    assert sys.stdout is output
+    assert sys.stdout is not original
+
+
+def test_streams_are_restored_even_when_the_final_drain_fails(monkeypatch):
+    class _Refusing(io.StringIO):
+        def write(self, value):
+            raise OSError("stream closed")
+
+    _register_credential_representations(monkeypatch)
+    refusing = _Refusing()
+    monkeypatch.setattr(sys, "stdout", refusing)
+
+    with pytest.raises(OSError), render.redacted_standard_streams():
+        sys.stdout.write(SENTINEL[:-1])
+
+    assert sys.stdout is refusing

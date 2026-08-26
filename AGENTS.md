@@ -34,9 +34,10 @@ Remove this section when that stops being true.
 - **The CLI redacts standard text streams.** Writes through `sys.stdout` and
   `sys.stderr` are wrapped at CLI entry, covering the structured renderer,
   `argparse`, `print`, and library text writers. Redaction spans arbitrary write
-  boundaries within one invocation: a credential split across two writes, or
-  across a flush, is recognized when the rest of it arrives, because nothing
-  emitting output controls where a buffered writer breaks a line. Raw
+  boundaries within one invocation as well as within a single write: a
+  credential split across two writes, or across a flush, is recognized when the
+  rest of it arrives, because nothing emitting output controls where a buffered
+  writer breaks a line. Raw
   file-descriptor writes such as `os.write(1, ...)` and direct binary-buffer
   writes bypass that wrapper; project code must not use those paths for command
   output.
