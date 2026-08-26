@@ -1553,3 +1553,176 @@ def test_update_priority_range_is_validated_before_a_plan_is_written(
     assert output["code"] == exits.USAGE
     assert transport.requests == []
     assert plans.listing() == []
+
+
+def test_creating_an_all_day_event_serializes_exclusive_date_boundaries():
+    plan = mutate.plan_create(
+        PROFILE,
+        calendar_href=CAL,
+        summary="Anniversary",
+        start=dt.date(2026, 12, 30),
+        end=dt.date(2026, 12, 31),
+        location="Somewhere",
+        url="https://example.invalid/anniversary",
+    )
+    payload = plans.payload_bytes(plan.steps[0])
+
+    assert b"DTSTART;VALUE=DATE:20261230" in payload
+    assert b"DTEND;VALUE=DATE:20261231" in payload
+    assert b"T00:00" not in payload and b"TZID" not in payload
+    assert plan.steps[0].details["all_day"] is True
+    assert plan.steps[0].details["start"] == "20261230"
+    assert plan.steps[0].details["end"] == "20261231"
+    assert b"LOCATION:Somewhere" in payload
+    assert b"URL:https://example.invalid/anniversary" in payload
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        (dt.date(2026, 12, 30), dt.datetime(2026, 12, 31, 12, tzinfo=dt.UTC)),
+        (dt.datetime(2026, 12, 30, 12, tzinfo=dt.UTC), dt.date(2026, 12, 31)),
+    ],
+)
+def test_creating_an_event_refuses_mixed_date_and_instant_boundaries(start, end):
+    with pytest.raises(events.EventError) as error:
+        mutate.build_event(uid="mixed@example", summary="Mixed", start=start, end=end)
+
+    assert error.value.code == exits.USAGE
+    assert "all-day on both boundaries" in str(error.value)
+
+
+@pytest.mark.parametrize("end", [dt.date(2026, 12, 30), dt.date(2026, 12, 29)])
+def test_creating_an_all_day_event_requires_an_exclusive_end_after_the_start(end):
+    with pytest.raises(events.EventError) as error:
+        mutate.build_event(
+            uid="backwards@example", summary="Backwards", start=dt.date(2026, 12, 30), end=end
+        )
+
+    assert error.value.code == exits.USAGE
+    assert "exclusive" in str(error.value)
+
+
+def test_all_day_create_readback_verifies_the_stored_boundary_kind():
+    plan = mutate.plan_create(
+        PROFILE,
+        calendar_href=CAL,
+        summary="Anniversary",
+        start=dt.date(2026, 12, 30),
+        end=dt.date(2026, 12, 31),
+    )
+    stored = plans.payload_bytes(plan.steps[0])
+    transport = _SequenceEventSession(
+        _EventResponse(b"", status=201),
+        _EventResponse(stored, etag='"v2"'),
+    )
+
+    result = _apply_bundle(plan, transport)
+
+    assert result["all_day"] is True
+    assert result["start"] == "20261230"
+    assert result["end"] == "20261231"
+    assert result["verified"] is True
+
+
+@pytest.mark.parametrize(
+    "alter",
+    [
+        # A server that widened the event by a day, keeping the DATE kind.
+        lambda raw: raw.replace(b"DTEND;VALUE=DATE:20261231", b"DTEND;VALUE=DATE:20270101"),
+        # A server that resolved the dates to a local midnight of its own.
+        lambda raw: raw.replace(
+            b"DTSTART;VALUE=DATE:20261230", b"DTSTART:20261230T000000Z"
+        ).replace(b"DTEND;VALUE=DATE:20261231", b"DTEND:20261231T000000Z"),
+    ],
+)
+def test_all_day_create_refuses_a_readback_that_changed_the_dates(alter):
+    plan = mutate.plan_create(
+        PROFILE,
+        calendar_href=CAL,
+        summary="Anniversary",
+        start=dt.date(2026, 12, 30),
+        end=dt.date(2026, 12, 31),
+    )
+    transport = _SequenceEventSession(
+        _EventResponse(b"", status=201),
+        _EventResponse(alter(plans.payload_bytes(plan.steps[0])), etag='"v2"'),
+    )
+
+    with pytest.raises(events.EventError) as error:
+        _apply_bundle(plan, transport)
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+    assert plans.read(plan.plan_id).plan_id == plan.plan_id
+
+
+def test_cli_creates_an_all_day_event_and_states_it_without_a_timezone(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    monkeypatch.setattr(cli, "_resolved_calendar", lambda profile, transport, target: CAL)
+    monkeypatch.setattr(cli.session, "Session", lambda profile: _SequenceEventSession())
+
+    code = cli.main(
+        ["cal", "create", CAL, "--summary", "Anniversary", "--from", "2026-12-30",
+         "--to", "2026-12-31"]
+    )
+    preview = capsys.readouterr().out
+
+    assert code == exits.CONFIRMATION_REQUIRED
+    assert "all-day 20261230 .. 20261231 (end date is exclusive)" in preview
+    assert "00:00" not in preview
+
+
+def test_cli_create_refuses_a_mixed_boundary_pair_before_writing_a_plan(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    monkeypatch.setattr(cli, "_resolved_calendar", lambda profile, transport, target: CAL)
+    monkeypatch.setattr(cli.session, "Session", lambda profile: _SequenceEventSession())
+
+    code = cli.main(
+        ["cal", "create", CAL, "--summary", "Mixed", "--from", "2026-12-30",
+         "--to", "2026-12-31T12:00:00+00:00"]
+    )
+
+    assert code == exits.USAGE
+    assert "all-day on both boundaries" in capsys.readouterr().err
+
+
+def test_human_event_listing_marks_an_all_day_event(monkeypatch):
+    all_day = _ref(
+        RICH.replace(
+            b"DTSTART;TZID=America/Sao_Paulo:20260901T110000", b"DTSTART;VALUE=DATE:20260901"
+        ).replace(b"DTEND;TZID=America/Sao_Paulo:20260901T120000", b"DTEND;VALUE=DATE:20260902")
+    )
+    output: list[str] = []
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    monkeypatch.setattr(cli.session, "Session", lambda profile: object())
+    monkeypatch.setattr(cli, "_resolved_calendar", lambda profile, transport, target: CAL)
+    monkeypatch.setattr(cli.events, "query", lambda *args, **kwargs: [all_day, _ref()])
+    monkeypatch.setattr(cli.render, "emit", lambda value, **kwargs: output.append(value))
+
+    result = cli._run_cal(
+        SimpleNamespace(
+            cal_command="events",
+            profile="home",
+            json=False,
+            calendar=CAL,
+            start="2026-09-01T00:00:00+00:00",
+            end="2026-09-03T00:00:00+00:00",
+        )
+    )
+
+    assert result == exits.OK
+    assert "[all-day]" in output[0]
+    assert "[all-day]" not in output[2]
+
+
+def test_create_and_update_help_describe_the_same_all_day_contract(capsys):
+    parser = cli.build_parser()
+    texts = []
+    for command in ("create", "update"):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["cal", command, "--help"])
+        texts.append(capsys.readouterr().out)
+
+    for text in texts:
+        assert "YYYY-MM-DD" in text
+        assert "all-day" in text

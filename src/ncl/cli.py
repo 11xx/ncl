@@ -215,10 +215,16 @@ def build_parser() -> argparse.ArgumentParser:
     cal_create.add_argument("calendar", help="Calendar href, or an unambiguous display name")
     cal_create.add_argument("--summary", required=True)
     cal_create.add_argument(
-        "--from", dest="start", required=True, help="Start instant, ISO 8601 with an offset"
+        "--from",
+        dest="start",
+        required=True,
+        help="Start instant with an offset, or YYYY-MM-DD for an all-day event",
     )
     cal_create.add_argument(
-        "--to", dest="end", required=True, help="End instant, ISO 8601 with an offset"
+        "--to",
+        dest="end",
+        required=True,
+        help="End instant with an offset, or the exclusive YYYY-MM-DD end of an all-day event",
     )
     cal_create.add_argument("--description", default="")
     cal_create.add_argument("--location", default="")
@@ -846,6 +852,11 @@ def _emit_plan(plan: Any, json_output: bool) -> int:
                 f"{step.summary or step.href} ({len(plans.payload_bytes(step))} bytes)"
             )
             render.emit(f"       href    {step.href}")
+            if step.details.get("all_day"):
+                render.emit(
+                    f"       all-day {step.details.get('start', '')} .. "
+                    f"{step.details.get('end', '')} (end date is exclusive)"
+                )
             if step.details.get("warning"):
                 render.emit(f"       warning {step.details['warning']}")
         render.emit(f"  apply   ncl apply {plan.plan_id}")
@@ -944,7 +955,8 @@ def _run_cal(args: argparse.Namespace) -> int:
             for event in found:
                 status = "  [CANCELLED]" if event.status.upper() == "CANCELLED" else ""
                 flag = status if event.writable else status + f"  [{', '.join(event.unsupported)}]"
-                render.emit(f"{event.start} .. {event.end}  {event.summary}{flag}")
+                kind = "  [all-day]" if event.all_day else ""
+                render.emit(f"{event.start} .. {event.end}  {event.summary}{kind}{flag}")
                 render.emit(f"      {event.href}")
         return exits.OK
 
@@ -984,8 +996,8 @@ def _run_cal(args: argparse.Namespace) -> int:
             profile,
             calendar_href=href,
             summary=args.summary,
-            start=_moment(args.start, "--from"),
-            end=_moment(args.end, "--to"),
+            start=_boundary_moment(args.start, "--from"),
+            end=_boundary_moment(args.end, "--to"),
             description=args.description,
             location=args.location,
             priority=args.priority,
