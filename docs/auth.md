@@ -45,12 +45,25 @@ and principal verification. The per-profile lock file persists, while the
 kernel owns lock liveness through `flock`: process exit releases the lock
 without PID recording, stale-file recovery, or PID-reuse assumptions.
 
+A profile's credential is one backend item holding a versioned record of both
+the login name and the application password. A usable credential is the pair, so
+storing the halves separately gave an interruption a window in which to leave a
+password without its login name, and gave one request the chance to read each
+half from a different login. One write replaces the whole record and one read
+returns one generation of it. The record is decoded strictly — an unknown
+version, a missing or empty field, a repeated field, or anything trailing the
+record is refused — and every refusal names the one remedy there is, which is to
+run `ncl login` again. An entry written under the layout this replaced is not a
+credential and is not mistaken for one; `ncl logout` removes it along with the
+record so a password the tool no longer reads cannot outlive its account.
+
 Secret backends distinguish an absent entry from an unusable backend. `pass`
 reports absence with its explicit “not in the password store” result, while
 Secret Service reports it with an empty successful lookup. Decryption,
 agent, service, and other backend failures remain failures, so `ncl doctor`
 directs the caller to repair the backend rather than treating the credential
-as absent.
+as absent. A record that is present but undecodable is neither: it is reported
+as a stored credential, so replacing it stays a deliberate act.
 
 The authenticated request boundary registers the application password, the
 `user:password` pair, its base64 encoding, and its Basic-auth form. Structured

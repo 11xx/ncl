@@ -203,8 +203,7 @@ class Session:
     ) -> Response:
         url = absolute_url(self.profile, url_or_path)
         try:
-            login_name = secrets.get(self.profile, "login_name")
-            app_password = secrets.get(self.profile, "app_password")
+            credential = secrets.load_credential(self.profile)
         except secrets.SecretError as exc:
             raise SessionError(
                 "the selected profile's secret backend failed", exits.PRECONDITION_FAILED
@@ -215,10 +214,12 @@ class Session:
             raise SessionError(
                 "the selected profile's secret backend failed", exits.PRECONDITION_FAILED
             ) from exc
-        if not login_name or not app_password:
+        if credential is None:
             raise SessionError(
                 "the selected profile has no stored credential", exits.NO_CREDENTIAL
             )
+        login_name = credential.login_name
+        app_password = credential.app_password
 
         representations = render.credential_representations(login_name, app_password)
         for representation in representations.values():

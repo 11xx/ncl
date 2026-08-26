@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import icalendar
 import pytest
+from test_auth import credential_reader
 
 from ncl import cli, events, exits, mutate, plans
 from ncl import session as http_session
@@ -940,7 +941,7 @@ def test_calendar_fetch_refuses_redirect_before_following_it(monkeypatch):
     monkeypatch.setattr(
         http_session.secrets,
         "get",
-        lambda profile, key: {"login_name": "alice", "app_password": "probe"}.get(key),
+        credential_reader("alice", "probe"),
     )
 
     with pytest.raises(http_session.SessionError) as error:
@@ -986,7 +987,7 @@ def test_calendar_put_refuses_redirect_before_following_it(action, monkeypatch):
     monkeypatch.setattr(
         http_session.secrets,
         "get",
-        lambda profile, key: {"login_name": "alice", "app_password": "probe"}.get(key),
+        credential_reader("alice", "probe"),
     )
 
     with pytest.raises(http_session.SessionError) as error:
@@ -1017,7 +1018,7 @@ def test_calendar_readback_redirect_is_outcome_uncertain_without_following_it(mo
     monkeypatch.setattr(
         http_session.secrets,
         "get",
-        lambda profile, key: {"login_name": "alice", "app_password": "probe"}.get(key),
+        credential_reader("alice", "probe"),
     )
 
     with pytest.raises(events.EventError) as error:
