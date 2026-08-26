@@ -37,18 +37,59 @@ def _redact_text(value: str) -> str:
     return value
 
 
+def _held_prefix_length(value: str) -> int:
+    """How many trailing characters could still turn into a registered secret.
+
+    A secret split across two writes is invisible to a per-write replacement, so
+    the wrapper keeps back the longest suffix that is a proper prefix of some
+    registered value and reconsiders it once the next write arrives.
+    """
+    if not _SECRETS:
+        return 0
+    longest = max(len(secret) for secret in _SECRETS)
+    for length in range(min(longest - 1, len(value)), 0, -1):
+        suffix = value[len(value) - length:]
+        if any(secret.startswith(suffix) and len(secret) > length for secret in _SECRETS):
+            return length
+    return 0
+
+
 class _RedactingTextStream:
+    """A text stream whose redaction spans write boundaries.
+
+    Held text is never released on flush: by construction it is a proper prefix
+    of a registered secret, so draining it early is exactly the leak this exists
+    to close. It is at most one character short of the longest secret, and it
+    reaches the wrapped stream when the wrapper exits.
+    """
+
     def __init__(self, stream: Any) -> None:
         self._stream = stream
+        self._pending = ""
 
     def write(self, value: str) -> int:
-        return self._stream.write(_redact_text(value))
+        redacted = _redact_text(self._pending + value)
+        held = _held_prefix_length(redacted)
+        keep = len(redacted) - held
+        self._pending = redacted[keep:]
+        if keep:
+            self._stream.write(redacted[:keep])
+        # The text-stream contract counts the characters of the argument that
+        # were consumed, which redaction changes the length of but not the fate.
+        return len(value)
 
     def writelines(self, values: Any) -> None:
-        self._stream.writelines(_redact_text(value) for value in values)
+        for value in values:
+            self.write(value)
 
     def flush(self) -> None:
         self._stream.flush()
+
+    def drain(self) -> None:
+        """Release held text, which holds no complete secret, and forget it."""
+        pending, self._pending = self._pending, ""
+        if pending:
+            self._stream.write(_redact_text(pending))
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._stream, name)
@@ -59,11 +100,13 @@ def redacted_standard_streams():
     """Redact text written through stdout and stderr for one CLI invocation."""
     stdout = sys.stdout
     stderr = sys.stderr
-    sys.stdout = _RedactingTextStream(stdout)
-    sys.stderr = _RedactingTextStream(stderr)
+    wrapped = (_RedactingTextStream(stdout), _RedactingTextStream(stderr))
+    sys.stdout, sys.stderr = wrapped
     try:
         yield
     finally:
+        for stream in wrapped:
+            stream.drain()
         sys.stdout = stdout
         sys.stderr = stderr
 
