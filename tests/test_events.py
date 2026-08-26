@@ -1676,6 +1676,7 @@ def test_cli_create_refuses_a_mixed_boundary_pair_before_writing_a_plan(monkeypa
     monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
     monkeypatch.setattr(cli, "_resolved_calendar", lambda profile, transport, target: CAL)
     monkeypatch.setattr(cli.session, "Session", lambda profile: _SequenceEventSession())
+    before = plans.listing()
 
     code = cli.main(
         ["cal", "create", CAL, "--summary", "Mixed", "--from", "2026-12-30",
@@ -1684,6 +1685,7 @@ def test_cli_create_refuses_a_mixed_boundary_pair_before_writing_a_plan(monkeypa
 
     assert code == exits.USAGE
     assert "all-day on both boundaries" in capsys.readouterr().err
+    assert plans.listing() == before
 
 
 def test_human_event_listing_marks_an_all_day_event(monkeypatch):
@@ -1726,3 +1728,68 @@ def test_create_and_update_help_describe_the_same_all_day_contract(capsys):
     for text in texts:
         assert "YYYY-MM-DD" in text
         assert "all-day" in text
+        # The exclusive end is the half of the contract a caller gets wrong.
+        assert "exclusive YYYY-MM-DD end" in text
+
+
+def test_cli_create_refuses_an_impossible_calendar_date(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    monkeypatch.setattr(cli, "_resolved_calendar", lambda profile, transport, target: CAL)
+    monkeypatch.setattr(cli.session, "Session", lambda profile: _SequenceEventSession())
+    before = plans.listing()
+
+    code = cli.main(
+        ["cal", "create", CAL, "--summary", "Impossible", "--from", "2026-02-30",
+         "--to", "2026-03-01"]
+    )
+
+    assert code == exits.USAGE
+    assert "not a valid all-day date" in capsys.readouterr().err
+    assert plans.listing() == before
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"not iCalendar at all", b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n"],
+)
+def test_all_day_create_readback_that_is_unreadable_is_an_uncertain_outcome(body):
+    plan = mutate.plan_create(
+        PROFILE,
+        calendar_href=CAL,
+        summary="Anniversary",
+        start=dt.date(2026, 12, 30),
+        end=dt.date(2026, 12, 31),
+    )
+    transport = _SequenceEventSession(
+        _EventResponse(b"", status=201),
+        _EventResponse(body, etag='"v2"'),
+    )
+
+    with pytest.raises(events.EventError) as error:
+        _apply_bundle(plan, transport)
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+    assert plans.read(plan.plan_id).plan_id == plan.plan_id
+
+
+def test_converting_an_event_to_all_day_preserves_everything_it_did_not_touch():
+    """A boundary conversion must not cost the caller the rest of the resource."""
+    payload = mutate.patch_event(
+        RICH,
+        {"DTSTART": dt.date(2026, 9, 1), "DTEND": dt.date(2026, 9, 2)},
+    ).encode()
+
+    assert b"DTSTART;VALUE=DATE:20260901" in payload
+    assert b"DTEND;VALUE=DATE:20260902" in payload
+    for retained in (
+        b"BEGIN:VTIMEZONE",
+        b"TZID:America/Sao_Paulo",
+        b"BEGIN:VALARM",
+        b"TRIGGER:-PT15M",
+        b"X-CUSTOM-FIELD:do-not-lose-me",
+        b"CATEGORIES:WORK",
+        b"LOCATION:Somewhere",
+        b"SUMMARY:Original",
+        b"UID:keep-me@example",
+    ):
+        assert retained in payload

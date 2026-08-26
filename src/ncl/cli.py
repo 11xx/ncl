@@ -290,7 +290,7 @@ def build_parser() -> argparse.ArgumentParser:
     cal_update.add_argument(
         "--to",
         dest="end",
-        help="End instant with an offset, or YYYY-MM-DD for an all-day event",
+        help="End instant with an offset, or the exclusive YYYY-MM-DD end of an all-day event",
     )
     cal_update.add_argument("--description")
     cal_update.add_argument("--location")
