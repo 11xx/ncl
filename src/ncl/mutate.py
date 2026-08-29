@@ -872,11 +872,24 @@ def reconcile(profile: Any, *, session: Session, step: plans.Step) -> dict[str, 
             return {"state": "verified"}
         if exc.code == exits.TARGET_NOT_FOUND:
             return {"state": "uncertain"}
+        if exc.code in {exits.MALFORMED_RESPONSE, exits.SERVER_ERROR}:
+            raise EventError(
+                f"the {step.action} readback could not be reconciled",
+                exits.OUTCOME_UNCERTAIN,
+            ) from exc
         raise
+    except (ValueError, IndexError, TypeError) as exc:
+        raise EventError(
+            f"the {step.action} readback could not be reconciled",
+            exits.OUTCOME_UNCERTAIN,
+        ) from exc
     try:
         exact = _semantic_calendar(raw) == _semantic_calendar(plans.payload_bytes(step))
-    except EventError:
-        raise
+    except (EventError, ValueError, IndexError, TypeError) as exc:
+        raise EventError(
+            f"the {step.action} readback could not be reconciled",
+            exits.OUTCOME_UNCERTAIN,
+        ) from exc
     if step.action == "cal.create":
         return {"state": "verified" if exact else "uncertain"}
     current_etag = etag.normalize_strong(stored.etag)

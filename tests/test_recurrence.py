@@ -1043,3 +1043,13 @@ def test_malformed_post_write_readback_records_uncertainty():
     assert [(item.state, item.exit_code) for item in stored.progress] == [
         ("uncertain", exits.OUTCOME_UNCERTAIN)
     ]
+
+    with plans.claim(plan.plan_id), pytest.raises(events.EventError) as reconcile_error:
+        plans.reconcile(
+            PROFILE,
+            session=Transport(Response(200, malformed, etag='"v2"')),
+            plan=stored,
+            dispatchers=cli._dispatchers(),
+        )
+    assert reconcile_error.value.code == exits.OUTCOME_UNCERTAIN
+    assert plans.read(plan.plan_id).progress[0].state == "uncertain"
