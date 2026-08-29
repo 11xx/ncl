@@ -827,7 +827,7 @@ def test_secret_backends_send_values_on_stdin_not_in_argv(monkeypatch, backend):
         ),
         (
             secrets.LibsecretBackend(),
-            subprocess.CompletedProcess(["secret-tool"], 0, "", ""),
+            subprocess.CompletedProcess(["secret-tool"], 1, "", ""),
             subprocess.CompletedProcess(["secret-tool"], 1, "", "secret service unavailable\n"),
         ),
     ],
