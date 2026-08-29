@@ -9,12 +9,14 @@ one request read each half from a different generation.
 from __future__ import annotations
 
 import json
+import os
 import secrets as token_source
 import shutil
 import subprocess
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from . import exits
 
@@ -45,6 +47,43 @@ class BackendState:
         return self.state == READY
 
 
+class BackendProfile(Protocol):
+    """The profile fields a backend needs to address one credential."""
+
+    name: str
+    secret_backend: str
+
+
+BackendProfileValue = BackendProfile | str
+
+
+class SecretBackend(Protocol):
+    """The structural boundary shared by every credential backend."""
+
+    def get(self, profile: BackendProfileValue, key: str) -> str | None:
+        """Read one value, returning ``None`` when the entry is absent."""
+        ...
+
+    def set(self, profile: BackendProfileValue, key: str, value: str) -> None:
+        """Store one value without placing it in a command argument."""
+        ...
+
+    def delete(self, profile: BackendProfileValue, key: str) -> None:
+        """Remove one value from the backend."""
+        ...
+
+    def inspect(self) -> BackendState:
+        """Report backend readiness without changing the store."""
+        ...
+
+    def round_trip(self) -> BackendState:
+        """Store, read, and remove a probe value."""
+        ...
+
+
+BackendFactory = Callable[[], SecretBackend]
+
+
 class SecretError(RuntimeError):
     """A secret backend could not complete an operation."""
 
@@ -54,15 +93,17 @@ class SecretError(RuntimeError):
         super().__init__(message)
 
 
-def _profile_name(profile: Any) -> str:
+def _profile_name(profile: BackendProfileValue) -> str:
     return profile.name if hasattr(profile, "name") else str(profile)
 
 
-def _backend_name(profile: Any) -> str:
+def _backend_name(profile: BackendProfileValue) -> str:
     return profile.secret_backend if hasattr(profile, "secret_backend") else str(profile)
 
 
 def _run(command: list[str], *, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment["LC_ALL"] = "C"
     try:
         return subprocess.run(
             command,
@@ -71,6 +112,7 @@ def _run(command: list[str], *, input_text: str | None = None) -> subprocess.Com
             text=True,
             check=False,
             timeout=10,
+            env=environment,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise SecretError("the secret backend did not complete the request") from exc
@@ -94,6 +136,14 @@ def _check_key(key: str) -> str:
     if key not in {RECORD_KEY, *_SUPERSEDED_KEYS}:
         raise SecretError("unsupported credential key")
     return key
+
+
+def _pass_missing(result: subprocess.CompletedProcess[str], path: str) -> bool:
+    """Recognize pass's C-locale missing-entry result, not another exit-1 error."""
+    return (
+        result.returncode == 1
+        and result.stderr.strip() == f"Error: {path} is not in the password store."
+    )
 
 
 @dataclass(frozen=True)
@@ -155,15 +205,14 @@ class PassBackend:
 
     executable: str = "pass"
 
-    def _path(self, profile: Any, key: str) -> str:
+    def _path(self, profile: BackendProfileValue, key: str) -> str:
         return f"ncl/{_profile_name(profile)}/{_check_key(key)}"
 
-    def get(self, profile: Any, key: str) -> str | None:
-        result = _run([self.executable, "show", self._path(profile, key)])
+    def get(self, profile: BackendProfileValue, key: str) -> str | None:
+        path = self._path(profile, key)
+        result = _run([self.executable, "show", path])
         if result.returncode != 0:
-            if result.returncode == 1 and result.stderr.strip().endswith(
-                "is not in the password store."
-            ):
+            if _pass_missing(result, path):
                 return None
             raise SecretError("the pass backend could not read the credential")
         value = result.stdout.rstrip("\n")
@@ -171,7 +220,7 @@ class PassBackend:
             raise SecretError("the pass backend returned an empty credential")
         return value
 
-    def set(self, profile: Any, key: str, value: str) -> None:
+    def set(self, profile: BackendProfileValue, key: str, value: str) -> None:
         if not isinstance(value, str) or not value:
             raise SecretError("cannot store an empty credential")
         result = _run(
@@ -181,7 +230,7 @@ class PassBackend:
         if result.returncode != 0:
             raise SecretError("the pass backend could not store the credential")
 
-    def delete(self, profile: Any, key: str) -> None:
+    def delete(self, profile: BackendProfileValue, key: str) -> None:
         result = _run([self.executable, "rm", "--force", self._path(profile, key)])
         if result.returncode != 0:
             raise SecretError("the pass backend could not remove the credential")
@@ -259,17 +308,19 @@ class LibsecretBackend:
 
     executable: str = "secret-tool"
 
-    def _attributes(self, profile: Any, key: str) -> list[str]:
+    def _attributes(self, profile: BackendProfileValue, key: str) -> list[str]:
         return ["service", "ncl", "profile", _profile_name(profile), "key", _check_key(key)]
 
-    def get(self, profile: Any, key: str) -> str | None:
+    def get(self, profile: BackendProfileValue, key: str) -> str | None:
         result = _run([self.executable, "lookup", *self._attributes(profile, key)])
         if result.returncode != 0:
+            if result.returncode == 1 and not result.stderr.strip():
+                return None
             raise SecretError("the libsecret backend could not read the credential")
         value = result.stdout.rstrip("\n")
         return value or None
 
-    def set(self, profile: Any, key: str, value: str) -> None:
+    def set(self, profile: BackendProfileValue, key: str, value: str) -> None:
         if not isinstance(value, str) or not value:
             raise SecretError("cannot store an empty credential")
         result = _run(
@@ -284,7 +335,7 @@ class LibsecretBackend:
         if result.returncode != 0:
             raise SecretError("the libsecret backend could not store the credential")
 
-    def delete(self, profile: Any, key: str) -> None:
+    def delete(self, profile: BackendProfileValue, key: str) -> None:
         result = _run([self.executable, "clear", *self._attributes(profile, key)])
         if result.returncode != 0:
             raise SecretError("the libsecret backend could not remove the credential")
@@ -353,49 +404,61 @@ class LibsecretBackend:
                     self.delete(profile, key)
 
 
-def _backend(profile_or_name: Any):
-    name = _backend_name(profile_or_name)
-    if name == "pass":
-        return PassBackend()
-    if name == "libsecret":
-        return LibsecretBackend()
-    raise SecretError("unsupported secret backend")
+_BACKEND_FACTORIES: dict[str, BackendFactory] = {
+    "pass": PassBackend,
+    "libsecret": LibsecretBackend,
+}
+DEFAULT_BACKEND = "pass"
 
 
-def get(profile: Any, key: str) -> str | None:
+def backend_names() -> tuple[str, ...]:
+    """Return the configured backend names in their stable registry order."""
+    return tuple(_BACKEND_FACTORIES)
+
+
+def backend_for(name: str) -> SecretBackend:
+    """Create a fresh adapter for a registered backend name."""
+    try:
+        factory = _BACKEND_FACTORIES[name]
+    except KeyError as exc:
+        raise SecretError("unsupported secret backend") from exc
+    return factory()
+
+
+def get(profile: BackendProfileValue, key: str) -> str | None:
     """Read one credential from the profile's configured backend."""
-    return _backend(profile).get(profile, key)
+    return backend_for(_backend_name(profile)).get(profile, key)
 
 
-def set(profile: Any, key: str, value: str) -> None:
+def set(profile: BackendProfileValue, key: str, value: str) -> None:
     """Write one credential without putting its value in a command argument."""
-    _backend(profile).set(profile, key, value)
+    backend_for(_backend_name(profile)).set(profile, key, value)
 
 
-def delete(profile: Any, key: str) -> None:
+def delete(profile: BackendProfileValue, key: str) -> None:
     """Delete one credential from the profile's configured backend."""
-    _backend(profile).delete(profile, key)
+    backend_for(_backend_name(profile)).delete(profile, key)
 
 
 def inspect_backend(name: str) -> BackendState:
     """Report a backend's state without storing or removing anything."""
-    if name == "pass":
-        return PassBackend().inspect()
-    if name == "libsecret":
-        return LibsecretBackend().inspect()
-    return BackendState(MISCONFIGURED, "unsupported secret backend")
+    try:
+        backend = backend_for(name)
+    except SecretError as exc:
+        return BackendState(MISCONFIGURED, exc.message)
+    return backend.inspect()
 
 
 def round_trip_backend(name: str) -> BackendState:
     """Prove a backend can keep a value, by storing and removing one."""
-    if name == "pass":
-        return PassBackend().round_trip()
-    if name == "libsecret":
-        return LibsecretBackend().round_trip()
-    return BackendState(MISCONFIGURED, "unsupported secret backend")
+    try:
+        backend = backend_for(name)
+    except SecretError as exc:
+        return BackendState(MISCONFIGURED, exc.message)
+    return backend.round_trip()
 
 
-def probe(profile: Any | None = None) -> bool:
+def probe(profile: BackendProfileValue | None = None) -> bool:
     """Prove the profile's backend can keep the credential about to be issued.
 
     Login Flow v2 returns the application password exactly once, so this is the
@@ -403,11 +466,12 @@ def probe(profile: Any | None = None) -> bool:
     unusable store discovered afterwards costs a second trip through consent and
     leaves an application password nobody holds.
     """
-    backend = _backend(profile) if profile is not None else PassBackend()
+    name = _backend_name(profile) if profile is not None else DEFAULT_BACKEND
+    backend = backend_for(name)
     return backend.round_trip().usable
 
 
-def load_credential(profile: Any) -> Credential | None:
+def load_credential(profile: BackendProfileValue) -> Credential | None:
     """Return the profile's complete credential, or None if none is stored.
 
     One backend read yields one generation of the record, so a caller cannot
@@ -419,7 +483,7 @@ def load_credential(profile: Any) -> Credential | None:
     return _decode(raw)
 
 
-def store_credential(profile: Any, login_name: str, app_password: str) -> None:
+def store_credential(profile: BackendProfileValue, login_name: str, app_password: str) -> None:
     """Replace the profile's credential with one write.
 
     There is nothing to roll back and no window to be interrupted in: the record
@@ -431,7 +495,7 @@ def store_credential(profile: Any, login_name: str, app_password: str) -> None:
     set(profile, RECORD_KEY, _encode(Credential(login_name, app_password)))
 
 
-def has_credential(profile: Any) -> bool:
+def has_credential(profile: BackendProfileValue) -> bool:
     """Return whether a usable credential is stored.
 
     A record that cannot be decoded is not a credential, but it is also not
@@ -441,7 +505,7 @@ def has_credential(profile: Any) -> bool:
     return get(profile, RECORD_KEY) is not None
 
 
-def clear_credential(profile: Any) -> None:
+def clear_credential(profile: BackendProfileValue) -> None:
     """Remove the profile's credential, and any entry the old layout left."""
     errors: list[SecretError] = []
     for key in (RECORD_KEY, *_SUPERSEDED_KEYS):

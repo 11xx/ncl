@@ -325,6 +325,8 @@ def run(
     can keep a credential and the only way this command changes anything.
     """
     resolved = config.config_path(path)
+    from . import secrets as secret_store
+
     checks: list[Check] = []
     try:
         loaded = config.load(resolved)
@@ -373,7 +375,7 @@ def run(
         )
 
         selected_backend = profile.secret_backend
-        for backend in ("pass", "libsecret"):
+        for backend in secret_store.backend_names():
             name = f"secret-backend:{profile.name}:{backend}"
             if backend == selected_backend:
                 checks.append(_run_probe(name, backend, round_trip=round_trip))

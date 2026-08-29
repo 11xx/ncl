@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import subprocess
 from types import SimpleNamespace
 
 import pytest
 
 from ncl import exits, secrets
 from ncl.config import Profile
+
+_REAL_RUN = secrets._run
 
 PROFILE = Profile(
     "home",
@@ -275,6 +278,14 @@ def test_an_uninitialised_password_store_is_misconfigured(monkeypatch):
     assert runner.mutations == []
 
 
+def test_a_noncanonical_pass_exit_one_is_not_treated_as_absence(monkeypatch):
+    runner = _Commands({("pass", "show"): (1, "", "Error: gpg: decryption failed")})
+    monkeypatch.setattr(secrets, "_run", runner)
+
+    with pytest.raises(secrets.SecretError, match="could not read"):
+        secrets.PassBackend().get("home", secrets.RECORD_KEY)
+
+
 def test_a_locked_secret_service_is_locked_rather_than_misconfigured(monkeypatch):
     runner = _Commands(
         {("secret-tool", "lookup"): (1, "", "the collection is locked and could not be unlocked")}
@@ -378,3 +389,33 @@ def test_a_backend_that_does_not_respond_is_reported_not_raised(
     assert state.usable is False
     # The round trip stops at the same reading rather than writing anyway.
     assert backend.round_trip().state == expected
+
+
+@pytest.mark.parametrize(
+    "failure", [OSError("cannot execute"), subprocess.TimeoutExpired(["pass"], 10)]
+)
+def test_the_subprocess_boundary_maps_execution_failures(monkeypatch, failure):
+    def _fail(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(secrets, "_run", _REAL_RUN)
+    monkeypatch.setattr(secrets.subprocess, "run", _fail)
+
+    with pytest.raises(secrets.SecretError, match="did not complete"):
+        secrets._run(["pass", "ls"])
+
+
+def test_the_subprocess_boundary_forces_a_deterministic_locale(monkeypatch):
+    observed = {}
+
+    def _run(*args, **kwargs):
+        observed.update(kwargs)
+        return subprocess.CompletedProcess(args[0], 0, "", "")
+
+    monkeypatch.setattr(secrets, "_run", _REAL_RUN)
+    monkeypatch.setattr(secrets.subprocess, "run", _run)
+
+    secrets._run(["pass", "ls"], input_text="fixture-secret")
+
+    assert observed["env"]["LC_ALL"] == "C"
+    assert observed["input"] == "fixture-secret"
