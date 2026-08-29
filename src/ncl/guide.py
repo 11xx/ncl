@@ -47,6 +47,9 @@ READ
   row. `cal occurrences` expands validated recurring resources in the bounded
   window and emits the exact reusable `RECURRENCE-ID` wire identity, including
   whether the item is the master or an override and whether it is cancelled.
+  DATE events without an end occupy one day. Explicit DTEND durations remain
+  exact across timezone transitions, while DURATION remains nominal. Ambiguous
+  or nonexistent TZID local boundaries and generated occurrences are refused.
   Generic event references still mark recurrence and scheduling structure as
   unwritable; only the explicit target modes below may edit a recurring resource.
 
@@ -264,9 +267,10 @@ WHAT IT REFUSES
 
   Scheduling structures remain refused, as do EXRULE, period-valued RDATE,
   multiple RRULEs, incompatible recurrence value kinds or timezones, RANGE=
-  THISANDFUTURE, recurrence-time shifts, complex or unbounded future
-  partitions whose identity mapping cannot be proven. Attendee and organizer
-  edits are outside this recurrence slice.
+  THISANDFUTURE, time-valued RRULE parts on DATE events, unsupported nested
+  components, recurrence-time shifts, complex or unbounded future partitions
+  whose identity mapping cannot be proven. Attendee and organizer edits are
+  outside this recurrence slice.
 
 Use `ncl <command> --help` for the exact arguments a command accepts.
 """

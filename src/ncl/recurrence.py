@@ -4,8 +4,8 @@ The ordinary calendar writer intentionally refuses recurrence.  This module is
 the narrower exception: it validates one direct recurring master and its
 direct exceptions, expands only a bounded window, and rewrites only the
 components a target names.  The resource is spliced as bytes so an exception,
-timezone, alarm, unknown property, fold, and line ending that is not part of
-the requested change remains in the frozen request exactly as it was read.
+timezone, alarm, unknown property, and line ending that is not part of the
+requested change remains in the frozen request exactly as it was read.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import icalendar
+from dateutil.relativedelta import relativedelta
 from dateutil.rrule import rrulestr
 
 from . import events, exits, plans, profiles
@@ -30,6 +31,13 @@ RECURRENCE_MARKERS = RECURRENCE_PROPERTIES | frozenset({"RECURRENCE-ID"})
 SCHEDULING_PROPERTIES = frozenset({"ORGANIZER", "ATTENDEE"})
 TARGETS = frozenset({"series", "occurrence", "this-and-future"})
 MAX_EXPANSIONS = 10_000
+SUPPORTED_COMPONENTS = frozenset(
+    {"VCALENDAR", "VTIMEZONE", "STANDARD", "DAYLIGHT", "VEVENT", "VALARM"}
+)
+_DURATION_RE = re.compile(
+    r"(?P<sign>[+-])?P(?:(?P<weeks>\d+)W|(?:(?P<days>\d+)D)?"
+    r"(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?)?)"
+)
 
 
 class RecurrenceError(events.EventError):
@@ -87,6 +95,25 @@ class _SeriesModel:
 
 
 @dataclass(frozen=True)
+class _DurationModel:
+    """Describe the recurrence duration without losing its RFC 5545 kind."""
+
+    kind: str
+    exact: dt.timedelta | None = None
+    nominal: relativedelta | None = None
+
+    def end(self, start: dt.date | dt.datetime) -> dt.date | dt.datetime:
+        if self.kind == "exact":
+            assert self.exact is not None
+            if isinstance(start, dt.datetime):
+                instant = _as_instant(start) + self.exact
+                return instant.astimezone(start.tzinfo)
+            return start + self.exact
+        assert self.nominal is not None
+        return start + self.nominal
+
+
+@dataclass(frozen=True)
 class Resource:
     """One validated recurring resource and its exact direct components."""
 
@@ -135,6 +162,102 @@ class Occurrence:
 
 def _error(message: str, code: int = exits.UNSUPPORTED_STRUCTURE) -> RecurrenceError:
     return RecurrenceError(message, code)
+
+
+def _zone(tzid: str, *, label: str, code: int = exits.UNSUPPORTED_STRUCTURE) -> ZoneInfo:
+    try:
+        return ZoneInfo(tzid)
+    except ZoneInfoNotFoundError as exc:
+        raise _error(f"{label} uses an unknown TZID {tzid!r}", code) from exc
+
+
+def _validate_local_time(local: dt.datetime, zone: ZoneInfo, *, label: str) -> None:
+    """Reject a local time that maps to zero or two instants in its TZID."""
+    instants: set[dt.datetime] = set()
+    for fold in (0, 1):
+        candidate = local.replace(tzinfo=zone, fold=fold)
+        round_trip = candidate.astimezone(dt.UTC).astimezone(zone)
+        if round_trip.replace(tzinfo=None) == local:
+            instants.add(candidate.astimezone(dt.UTC))
+    if len(instants) == 0:
+        raise _error(f"{label} is a nonexistent local time in TZID {zone.key}")
+    if len(instants) > 1:
+        raise _error(f"{label} is an ambiguous local time in TZID {zone.key}")
+
+
+def _property_params(value: Any) -> dict[str, str]:
+    return {str(key).upper(): str(item) for key, item in value.params.items()}
+
+
+def _boundary_signature(value: Any, *, label: str) -> tuple[str, str | None]:
+    """Validate one DTSTART/DTEND value and return its kind and TZID."""
+    try:
+        typed = getattr(value, "dt", None)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise _error(f"{label} has an invalid value", exits.MALFORMED_RESPONSE) from exc
+    if typed is None or isinstance(typed, tuple):
+        raise _error(f"{label} has an invalid value", exits.UNSUPPORTED_STRUCTURE)
+    params = _property_params(value)
+    value_param = params.get("VALUE")
+    tzid = params.get("TZID")
+    if isinstance(typed, dt.date) and not isinstance(typed, dt.datetime):
+        if value_param != "DATE" or tzid is not None:
+            raise _error(f"{label} has incompatible DATE parameters")
+        return "DATE", None
+    if not isinstance(typed, dt.datetime):
+        raise _error(f"{label} has an invalid value", exits.UNSUPPORTED_STRUCTURE)
+    if value_param not in {None, "DATE-TIME"}:
+        raise _error(f"{label} has an unsupported DATE-TIME value kind")
+    if tzid is not None:
+        zone = _zone(tzid, label=label)
+        local = typed.astimezone(zone).replace(tzinfo=None)
+        _validate_local_time(local, zone, label=label)
+        return "DATE-TIME", tzid
+    if typed.tzinfo is None or typed.utcoffset() != dt.timedelta(0):
+        raise _error(f"{label} has a floating or non-UTC DATE-TIME")
+    try:
+        wire = value.to_ical().decode("utf-8")
+    except (AttributeError, UnicodeDecodeError, ValueError, TypeError) as exc:
+        raise _error(f"{label} has no reusable wire value", exits.MALFORMED_RESPONSE) from exc
+    if not wire.endswith("Z"):
+        raise _error(f"{label} has a non-UTC DATE-TIME without a TZID")
+    return "DATE-TIME", None
+
+
+def _boundary_semantics(component: Any, *, label: str) -> tuple[str, str | None]:
+    start = component.get("DTSTART")
+    if start is None:
+        raise _error(f"{label} has no DTSTART", exits.MALFORMED_RESPONSE)
+    semantics = _boundary_signature(start, label=f"{label} DTSTART")
+    end = component.get("DTEND")
+    if end is not None and _boundary_signature(end, label=f"{label} DTEND") != semantics:
+        raise _error(f"{label} has incompatible DTSTART and DTEND boundaries")
+    return semantics
+
+
+def _validate_component_tree(raw: bytes) -> None:
+    """Reject components outside the supported VCALENDAR nesting."""
+    spans = _component_spans(raw)
+    for span in spans:
+        if span.name not in SUPPORTED_COMPONENTS:
+            raise _error(
+                f"the resource carries unsupported {span.name} structure",
+                exits.UNSUPPORTED_STRUCTURE,
+            )
+        expected_parent = {
+            "VEVENT": "VCALENDAR",
+            "VTIMEZONE": "VCALENDAR",
+            "VALARM": "VEVENT",
+            "STANDARD": "VTIMEZONE",
+            "DAYLIGHT": "VTIMEZONE",
+        }.get(span.name)
+        if expected_parent is not None and span.parent != expected_parent:
+            raise _error(
+                f"the {span.name} component is nested under an unsupported parent",
+                exits.UNSUPPORTED_STRUCTURE,
+            )
+        if span.name == "VCALENDAR" and span.parent is not None:
+            raise _error("the VCALENDAR component is nested", exits.UNSUPPORTED_STRUCTURE)
 
 
 def _physical_lines(raw: bytes) -> list[tuple[int, int, bytes]]:
@@ -254,7 +377,10 @@ def _direct_events(raw: bytes, parsed: icalendar.Calendar) -> tuple[tuple[Any, b
 
 
 def _typed_wire(value: Any, params: Mapping[str, Any], *, label: str) -> WireId:
-    typed = getattr(value, "dt", None)
+    try:
+        typed = getattr(value, "dt", None)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise _error(f"{label} has an invalid value", exits.MALFORMED_RESPONSE) from exc
     if isinstance(typed, tuple) or typed is None:
         raise _error(f"{label} has a period or invalid value", exits.UNSUPPORTED_STRUCTURE)
     value_kind = (
@@ -277,21 +403,19 @@ def _typed_wire(value: Any, params: Mapping[str, Any], *, label: str) -> WireId:
         raise _error(f"{label} has a floating DATE-TIME that cannot be targeted")
     try:
         wire = value.to_ical().decode("utf-8")
-    except (AttributeError, UnicodeDecodeError) as exc:
+    except (AttributeError, UnicodeDecodeError, TypeError, ValueError) as exc:
         raise _error(f"{label} has no reusable wire value", exits.MALFORMED_RESPONSE) from exc
     if tzid is not None:
         if wire.endswith("Z"):
             raise _error(f"{label} has a TZID but a UTC wire value")
-        try:
-            ZoneInfo(tzid)
-        except ZoneInfoNotFoundError as exc:
-            raise _error(f"{label} uses an unknown TZID {tzid!r}") from exc
-        local = typed.astimezone(ZoneInfo(tzid)).replace(tzinfo=None)
+        zone = _zone(tzid, label=label)
+        local = typed.astimezone(zone).replace(tzinfo=None)
+        _validate_local_time(local, zone, label=label)
         return WireId(
             f"TZID={tzid}:{local.strftime('%Y%m%dT%H%M%S')}",
             value_kind,
             tzid,
-            local.replace(tzinfo=ZoneInfo(tzid)),
+            local.replace(tzinfo=zone),
         )
     if not wire.endswith("Z") or typed.utcoffset() != dt.timedelta(0):
         raise _error(f"{label} has a non-UTC DATE-TIME without a TZID")
@@ -313,10 +437,11 @@ def parse_wire_id(text: str) -> WireId:
     if tz_match:
         tzid = tz_match.group(1)
         try:
-            zone = ZoneInfo(tzid)
+            zone = _zone(tzid, label="--recurrence-id", code=exits.USAGE)
             local = dt.datetime.strptime(tz_match.group(2), "%Y%m%dT%H%M%S")
-        except (ValueError, ZoneInfoNotFoundError) as exc:
+        except ValueError as exc:
             raise _error("--recurrence-id has an invalid TZID DATE-TIME", exits.USAGE) from exc
+        _validate_local_time(local, zone, label="--recurrence-id")
         return WireId(
             f"TZID={tzid}:{local.strftime('%Y%m%dT%H%M%S')}",
             "DATE-TIME",
@@ -400,6 +525,7 @@ def _series_model(master: Any) -> _SeriesModel:
                 not parts["INTERVAL"].isdigit() or int(parts["INTERVAL"]) <= 0
             ):
                 raise _error("the RRULE INTERVAL must be a positive integer")
+            _validate_rrule_types(start, parts)
             rrulestr(f"RRULE:{rrule}", dtstart=_rule_datetime(start))
         except (TypeError, ValueError, OverflowError) as exc:
             raise _error("the RRULE could not be expanded safely") from exc
@@ -423,7 +549,9 @@ def _wire_from_rule_value(value: dt.datetime, model: _SeriesModel) -> WireId:
     if model.start.tzid is None:
         value = value.astimezone(dt.UTC)
         return WireId(value.strftime("%Y%m%dT%H%M%SZ"), "DATE-TIME", None, value)
-    local = value.astimezone(ZoneInfo(model.start.tzid))
+    zone = ZoneInfo(model.start.tzid)
+    local = value.astimezone(zone)
+    _validate_local_time(local.replace(tzinfo=None), zone, label="an RRULE occurrence")
     return WireId(
         f"TZID={model.start.tzid}:{local.strftime('%Y%m%dT%H%M%S')}",
         "DATE-TIME",
@@ -501,10 +629,68 @@ def _as_instant(value: dt.date | dt.datetime) -> dt.datetime:
     return dt.datetime.combine(value, dt.time.min, tzinfo=dt.UTC)
 
 
+def _nominal_duration(
+    value: Any, *, label: str, date_start: bool = False
+) -> relativedelta:
+    try:
+        text = value.to_ical().decode("ascii")
+    except (AttributeError, UnicodeDecodeError, TypeError, ValueError) as exc:
+        raise _error(f"{label} has no usable duration", exits.MALFORMED_RESPONSE) from exc
+    match = _DURATION_RE.fullmatch(text)
+    if match is None:
+        raise _error(f"{label} is not a supported RFC 5545 duration")
+    numbers = {
+        name: int(match.group(name) or 0)
+        for name in ("weeks", "days", "hours", "minutes", "seconds")
+    }
+    if not any(numbers.values()):
+        raise _error(f"{label} is not a supported RFC 5545 duration")
+    if date_start and any(numbers[name] for name in ("hours", "minutes", "seconds")):
+        raise _error("a DATE DTSTART requires a whole-day or whole-week DURATION")
+    sign = -1 if match.group("sign") == "-" else 1
+    return relativedelta(
+        weeks=sign * numbers["weeks"],
+        days=sign * numbers["days"],
+        hours=sign * numbers["hours"],
+        minutes=sign * numbers["minutes"],
+        seconds=sign * numbers["seconds"],
+    )
+
+
+def _duration_model(component: Any) -> _DurationModel:
+    start, end = events._event_bounds(component, href="", code=exits.MALFORMED_RESPONSE)
+    duration = component.get("DURATION")
+    if duration is not None:
+        return _DurationModel(
+            "nominal",
+            nominal=_nominal_duration(
+                duration,
+                label="DURATION",
+                date_start=isinstance(start, dt.date) and not isinstance(start, dt.datetime),
+            ),
+        )
+    explicit_end = component.get("DTEND")
+    if explicit_end is not None:
+        return _DurationModel(
+            "exact",
+            exact=_as_instant(end) - _as_instant(start),
+        )
+    if isinstance(start, dt.date) and not isinstance(start, dt.datetime):
+        return _DurationModel("nominal", nominal=relativedelta(days=1))
+    return _DurationModel("exact", exact=dt.timedelta(0))
+
+
+def _component_effective_end(component: Any) -> dt.date | dt.datetime:
+    start, end = events._event_bounds(component, href="")
+    if component.get("DTEND") is not None:
+        assert end is not None
+        return end
+    return _duration_model(component).end(start)
+
+
 def _duration(master: Any) -> dt.timedelta:
-    start, end = events._event_bounds(master, href="", code=exits.MALFORMED_RESPONSE)
-    if end is None:
-        return dt.timedelta(0)
+    start, _ = events._event_bounds(master, href="", code=exits.MALFORMED_RESPONSE)
+    end = _duration_model(master).end(start)
     return _as_instant(end) - _as_instant(start)
 
 
@@ -519,9 +705,10 @@ def _occurrence(resource: Resource, wire: WireId) -> Occurrence:
     source, component, _ = _occurrence_component(resource, wire)
     if source == "master":
         start = wire.value
-        end = start + _duration(resource.master)
+        end = _duration_model(resource.master).end(start)
     else:
-        start, end = events._event_bounds(component, href=resource.href)
+        start, _ = events._event_bounds(component, href=resource.href)
+        end = _component_effective_end(component)
     return Occurrence(
         calendar_href=resource.calendar_href,
         href=resource.href,
@@ -568,9 +755,10 @@ def _resource_occurrences(
         component = _occurrence_component(resource, wire)[1]
         if override is None:
             effective_start = wire.value
-            effective_end = effective_start + _duration(resource.master)
+            effective_end = _duration_model(resource.master).end(effective_start)
         else:
-            effective_start, effective_end = events._event_bounds(component, href=resource.href)
+            effective_start, _ = events._event_bounds(component, href=resource.href)
+            effective_end = _component_effective_end(component)
         if _as_instant(effective_end or effective_start) <= _as_instant(start):
             continue
         if _as_instant(effective_start) >= _as_instant(end):
@@ -581,6 +769,7 @@ def _resource_occurrences(
 
 def _validate_resource(raw: bytes, *, calendar_href: str, href: str, etag: str) -> Resource:
     parsed = _parse_calendar(raw)
+    _validate_component_tree(raw)
     direct = _direct_events(raw, parsed)
     if not direct:
         raise _error("the resource holds no direct VEVENT", exits.MALFORMED_RESPONSE)
@@ -606,11 +795,13 @@ def _validate_resource(raw: bytes, *, calendar_href: str, href: str, etag: str) 
             exits.MALFORMED_RESPONSE,
         )
     master, master_raw = masters[0]
+    master_boundaries = _boundary_semantics(master, label="the recurrence master")
     model = _series_model(master)
     master_uid = str(master.get("UID", "")).strip()
     if not master_uid:
         raise _error("the recurrence master has no UID", exits.MALFORMED_RESPONSE)
     events._event_bounds(master, href=href, code=exits.MALFORMED_RESPONSE)
+    _duration_model(master)
     override_by_key: dict[tuple[str, str | None, str], tuple[WireId, Any, bytes]] = {}
     override_components: list[Any] = []
     override_raw: list[bytes] = []
@@ -623,6 +814,10 @@ def _validate_resource(raw: bytes, *, calendar_href: str, href: str, etag: str) 
             )
         if names & RECURRENCE_PROPERTIES:
             raise _error("recurrence-set properties belong only on the direct master")
+        if _boundary_semantics(component, label="the recurrence override") != master_boundaries:
+            raise _error(
+                "a recurrence override has incompatible DATE/DATE-TIME or timezone boundaries"
+            )
         if str(component.get("UID", "")).strip() != master_uid:
             raise _error("a recurrence override has an orphaned UID")
         identities = _property_items(component, "RECURRENCE-ID")
@@ -635,6 +830,7 @@ def _validate_resource(raw: bytes, *, calendar_href: str, href: str, etag: str) 
         if not _identity_exists(model, identity):
             raise _error("a recurrence override does not map to the master's recurrence set")
         events._event_bounds(component, href=href, code=exits.MALFORMED_RESPONSE)
+        _duration_model(component)
         override_by_key[identity.key] = (identity, component, data)
         override_components.append(component)
         override_raw.append(data)
@@ -1002,6 +1198,21 @@ def _rrule_parts(text: str) -> list[tuple[str, str]]:
     return parts
 
 
+def _validate_rrule_types(start: WireId, parts: Mapping[str, str]) -> None:
+    """Reject RRULE fields that cannot preserve the master's value type."""
+    until = parts.get("UNTIL")
+    if start.kind == "DATE":
+        if until is not None and not re.fullmatch(r"\d{8}", until):
+            raise _error("a DATE DTSTART requires a DATE-valued RRULE UNTIL")
+        frequency = parts.get("FREQ", "").upper()
+        if frequency in {"HOURLY", "MINUTELY", "SECONDLY"}:
+            raise _error("a DATE DTSTART cannot use a sub-day RRULE frequency")
+        if {"BYHOUR", "BYMINUTE", "BYSECOND"} & parts.keys():
+            raise _error("a DATE DTSTART cannot use time-valued RRULE parts")
+    elif until is not None and not re.fullmatch(r"\d{8}T\d{6}Z", until):
+        raise _error("a DATE-TIME DTSTART requires a UTC RRULE UNTIL")
+
+
 def _rrule_with(text: str, *, count: int | None = None, until: str | None = None) -> str:
     parts = [(key, value) for key, value in _rrule_parts(text) if key not in {"COUNT", "UNTIL"}]
     if count is not None:
@@ -1125,7 +1336,8 @@ def _split_model(
         _, proven_position = _prove_rule_partition(model, cut, old_rule, new_rule)
         if proven_position != position:
             raise _error("this-and-future cannot prove the RRULE COUNT position")
-        old_keys = {item.key for item in base if item.key < cut.key}
+        old_keys = {model.start.key} if model.start.key < cut.key else set()
+        old_keys.update(item.key for item in base if item.key < cut.key)
         old_keys.update(item.key for item in old_rdates)
         if old_rule is None and model.start.key == cut.key and old_rdates:
             raise _error("this-and-future cannot re-anchor a master with earlier RDATE values")
@@ -1147,7 +1359,8 @@ def _split_model(
     new_rule = model.rrule
     if "UNTIL" in parts:
         _prove_rule_partition(model, cut, old_rule, new_rule)
-    old_keys = {item.key for item in previous}
+    old_keys = {model.start.key} if model.start.key < cut.key else set()
+    old_keys.update(item.key for item in previous)
     old_keys.update(item.key for item in old_rdates)
     if old_rule is None and model.start.key == cut.key and old_rdates:
         raise _error("this-and-future cannot re-anchor a master with earlier RDATE values")
@@ -1279,6 +1492,19 @@ def _resource_for_plan(profile: Any, session: Session, href: str) -> Resource:
     )
 
 
+def _validate_planned_resource(
+    resource: Resource, raw: bytes, *, href: str, etag: str
+) -> None:
+    """Validate the final resource before freezing any recurrence mutation."""
+    _validate_component_tree(raw)
+    parsed = _parse_calendar(raw)
+    direct = _direct_events(raw, parsed)
+    if any(_property_names(component) & RECURRENCE_MARKERS for component, _ in direct):
+        _validate_resource(raw, calendar_href=resource.calendar_href, href=href, etag=etag)
+    else:
+        events._describe(raw, calendar_href=resource.calendar_href, href=href, etag=etag)
+
+
 def _resolve_target(resource: Resource, text: str) -> WireId:
     target = parse_wire_id(text)
     if not _identity_exists(resource.model, target):
@@ -1320,6 +1546,7 @@ def plan_update(
             portable_description=portable_description,
         )
         planned = _rewrite_resource(resource, master_raw=master)
+        _validate_planned_resource(resource, planned, href=resource.href, etag=resource.etag)
         step = _update_step(resource, planned, target=target)
         return plans.write_bundle(profile=profile.name, summary=step.summary, steps=(step,))
     if not recurrence_id:
@@ -1331,17 +1558,10 @@ def plan_update(
         if existing is None:
             base = _exception_base(resource.master_raw, identity)
             if "DTSTART" not in normalized and identity.key != resource.model.start.key:
-                base_start, base_end = events._event_bounds(resource.master, href=resource.href)
                 normalized = dict(normalized)
                 normalized["DTSTART"] = identity.value
-                if base_end is not None:
-                    duration = _as_instant(base_end) - _as_instant(base_start)
-                    if isinstance(identity.value, dt.date) and not isinstance(
-                        identity.value, dt.datetime
-                    ):
-                        normalized["DTEND"] = identity.value + duration
-                    else:
-                        normalized["DTEND"] = identity.value + duration
+                if resource.master.get("DTEND") is not None:
+                    normalized["DTEND"] = _duration_model(resource.master).end(identity.value)
             exception = _patch_component(
                 base,
                 normalized,
@@ -1356,6 +1576,7 @@ def plan_update(
             )
             planned = _rewrite_resource(resource, master_raw=resource.master_raw)
             planned = _replace_component(planned, existing[2], exception)
+        _validate_planned_resource(resource, planned, href=resource.href, etag=resource.etag)
         step = _update_step(resource, planned, target=target, recurrence_id=identity.text)
         return plans.write_bundle(profile=profile.name, summary=step.summary, steps=(step,))
 
@@ -1388,16 +1609,10 @@ def plan_update(
         rdates=new_rdates,
         exdates=new_exdates,
     )
-    master_start, master_end = events._event_bounds(resource.master, href=resource.href)
-    duration = (
-        _as_instant(master_end) - _as_instant(master_start)
-        if master_end is not None
-        else dt.timedelta(0)
-    )
     new_changes = dict(normalized)
     new_changes["DTSTART"] = identity.value
-    if master_end is not None:
-        new_changes["DTEND"] = identity.value + duration
+    if resource.master.get("DTEND") is not None:
+        new_changes["DTEND"] = _duration_model(resource.master).end(identity.value)
     new_master = _patch_component(
         new_master,
         new_changes,
@@ -1419,6 +1634,9 @@ def plan_update(
         appended=future_overrides,
     )
     new_href = f"{resource.calendar_href.rstrip('/')}/{new_uid}.ics"
+    _validate_planned_resource(resource, new_raw, href=new_href, etag="")
+    if old_exists:
+        _validate_planned_resource(resource, old_raw, href=resource.href, etag=resource.etag)
     warning = (
         "This split is non-atomic: apply creates the future resource before "
         "changing the old resource; "
@@ -1469,6 +1687,7 @@ def plan_delete(
         else:
             exception = _patch_component(existing[2], {"STATUS": "CANCELLED"})
             planned = _replace_component(resource.raw, existing[2], exception)
+        _validate_planned_resource(resource, planned, href=resource.href, etag=resource.etag)
         step = _update_step(resource, planned, target=target, recurrence_id=identity.text)
         return plans.write_bundle(profile=profile.name, summary=step.summary, steps=(step,))
     if target == "this-and-future":
@@ -1491,6 +1710,7 @@ def plan_delete(
         if old_exists:
             old_master = _patch_component(old_master, {})
             old_raw = _rewrite_resource(resource, master_raw=old_master, removed_overrides=removed)
+            _validate_planned_resource(resource, old_raw, href=resource.href, etag=resource.etag)
             step = _update_step(resource, old_raw, target=target, recurrence_id=identity.text)
         else:
             step = _delete_step(resource, target=target, recurrence_id=identity.text)
