@@ -5,9 +5,9 @@ from collections.abc import Mapping
 
 import pytest
 
-from ncl import cli, exits, files, plans
+from ncl import cli, exits, files, plans, secrets
 from ncl.config import Profile
-from ncl.session import Response, SessionError
+from ncl.session import Response, Session, SessionError
 
 PROFILE = Profile(
     "home",
@@ -57,7 +57,15 @@ class FakeSession:
         self.requests: list[dict] = []
 
     def request(self, method, url, *, headers=None, data=None, **kwargs):
-        self.requests.append({"method": method, "url": url, "headers": headers, "data": data})
+        self.requests.append(
+            {
+                "method": method,
+                "url": url,
+                "headers": headers,
+                "data": data,
+                "kwargs": kwargs,
+            }
+        )
         assert self.responses, f"unexpected request: {method} {url}"
         outcome = self.responses.pop(0)
         if isinstance(outcome, Exception):
@@ -131,6 +139,48 @@ def test_listing_rejects_a_depth_one_response_outside_the_collection():
         files.list_collection(PROFILE, session=FakeSession(response(207, body)), href=ROOT)
 
 
+def test_listing_refuses_a_redirect_before_following_it(monkeypatch):
+    outside = "https://cloud.example.invalid/remote.php/dav/files/alice/private/"
+    transport = FakeSession(
+        response(302, headers={"Location": outside}, url=ROOT),
+        response(207, multistatus(entry(outside, collection=True)), url=outside),
+    )
+    record = secrets._encode(secrets.Credential("alice", "fixture"))
+    monkeypatch.setattr(
+        secrets,
+        "get",
+        lambda profile, key: record if key == secrets.RECORD_KEY else None,
+    )
+
+    with pytest.raises(SessionError) as error:
+        files.list_collection(PROFILE, session=Session(PROFILE, transport=transport), href=ROOT)
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+    assert [request["method"] for request in transport.requests] == ["PROPFIND"]
+    assert transport.requests[0]["url"] == ROOT
+
+
+def test_read_refuses_a_same_origin_redirect_before_following_it(monkeypatch):
+    outside = "https://cloud.example.invalid/remote.php/dav/files/alice/private/secret"
+    transport = FakeSession(
+        response(302, headers={"Location": outside}, url=SCRIPT),
+        response(200, b"outside", {"Content-Type": "text/plain"}, outside),
+    )
+    record = secrets._encode(secrets.Credential("alice", "fixture"))
+    monkeypatch.setattr(
+        secrets,
+        "get",
+        lambda profile, key: record if key == secrets.RECORD_KEY else None,
+    )
+
+    with pytest.raises(SessionError) as error:
+        files.read_file(PROFILE, session=Session(PROFILE, transport=transport), href=SCRIPT)
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+    assert [request["method"] for request in transport.requests] == ["GET"]
+    assert transport.requests[0]["url"] == SCRIPT
+
+
 def test_scope_is_checked_before_any_request():
     transport = FakeSession()
     with pytest.raises(files.FileError) as error:
@@ -139,6 +189,17 @@ def test_scope_is_checked_before_any_request():
             session=transport,
             href="/remote.php/dav/files/alice/private/secret",
         )
+    assert error.value.code == exits.SCOPE_DENIED
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize("href", [ROOT + "%2e%2e%2fprivate", ROOT + "name%2Fwith-slash"])
+def test_scope_rejects_encoded_separators_before_any_request(href):
+    transport = FakeSession()
+
+    with pytest.raises(files.FileError) as error:
+        files.read_file(PROFILE, session=transport, href=href)
+
     assert error.value.code == exits.SCOPE_DENIED
     assert transport.requests == []
 
@@ -179,8 +240,37 @@ def test_stat_does_not_read_properties_from_a_failed_propstat():
             prop_status="HTTP/1.1 403 Forbidden",
         )
     )
-    with pytest.raises(files.FileError, match="no successful properties"):
+    with pytest.raises(files.FileError, match="not returned successfully"):
         files.stat_resource(PROFILE, session=FakeSession(response(207, body)), href=SCRIPT)
+
+
+def test_stat_refuses_a_partial_propstat_before_planning_a_delete():
+    body = multistatus(
+        f"""<d:response><d:href>{SCRIPT}</d:href>
+        <d:propstat><d:prop><d:getetag>\"v1\"</d:getetag></d:prop>
+          <d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+        <d:propstat><d:prop><d:resourcetype/><d:getcontenttype>text/plain</d:getcontenttype></d:prop>
+          <d:status>HTTP/1.1 403 Forbidden</d:status></d:propstat>
+        </d:response>"""
+    )
+    transport = FakeSession(response(207, body))
+
+    with pytest.raises(files.FileError, match="resourcetype") as error:
+        files.plan_delete(PROFILE, session=transport, href=SCRIPT)
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+    assert [request["method"] for request in transport.requests] == ["PROPFIND"]
+
+
+def test_stat_refuses_duplicate_resource_hrefs():
+    body = multistatus(entry(SCRIPT), entry(SCRIPT, collection=True, etag='"v2"', size=""))
+    transport = FakeSession(response(207, body))
+
+    with pytest.raises(files.FileError, match="repeated a resource href") as error:
+        files.stat_resource(PROFILE, session=transport, href=SCRIPT)
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+    assert [request["method"] for request in transport.requests] == ["PROPFIND"]
 
 
 def test_read_returns_exact_content_and_response_metadata():
@@ -561,14 +651,70 @@ def test_cli_write_returns_a_frozen_plan_without_sending_put(
     assert [request["method"] for request in transport.requests] == ["PROPFIND"]
 
 
+@pytest.mark.parametrize(
+    ("content", "content_type"),
+    [(b"\x00\xff", ""), (b"\x00\x01", "application/octet-stream")],
+)
 def test_cli_refuses_binary_stdout_and_directs_it_to_output(
-    monkeypatch, tmp_path, capsys
+    monkeypatch, tmp_path, capsys, content, content_type
 ):
     configure(monkeypatch, tmp_path)
-    transport = FakeSession(response(200, b"\x00\xff"))
+    transport = FakeSession(response(200, content, {"Content-Type": content_type}))
     monkeypatch.setattr(cli.session, "Session", lambda profile: transport)
 
     code = cli.main(["files", "read", SCRIPT])
 
     assert code == exits.UNSUPPORTED_STRUCTURE
     assert "use --output" in capsys.readouterr().err
+
+
+def test_cli_emits_declared_utf8_text_through_the_redacting_stream(monkeypatch, tmp_path, capsys):
+    configure(monkeypatch, tmp_path)
+    transport = FakeSession(response(200, b"hello", {"Content-Type": "text/plain"}))
+    monkeypatch.setattr(cli.session, "Session", lambda profile: transport)
+
+    code = cli.main(["files", "read", SCRIPT])
+
+    assert code == exits.OK
+    assert capsys.readouterr().out == "hello"
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        Profile(
+            "home",
+            "https://other.example.invalid",
+            "pass",
+            ("/remote.php/dav/calendars/alice/work/",),
+            ("/remote.php/dav/files/alice/Violentmonkey/",),
+        ),
+        Profile(
+            "home",
+            "https://cloud.example.invalid",
+            "pass",
+            ("/remote.php/dav/calendars/alice/work/",),
+            ("/remote.php/dav/files/alice/",),
+        ),
+    ],
+)
+def test_apply_refuses_profile_configuration_drift_before_any_request(changed):
+    plan = files.plan_write(
+        PROFILE,
+        session=FakeSession(response(404)),
+        href=SCRIPT,
+        content=b"new",
+    )
+    transport = FakeSession()
+
+    with plans.claim(plan.plan_id), pytest.raises(plans.PlanError) as error:
+        plans.apply(
+            changed,
+            session=transport,
+            plan=plan,
+            dispatchers=cli._dispatchers(),
+        )
+
+    assert error.value.code == exits.PLAN_STALE
+    assert transport.requests == []
+    plans.consume(plan.plan_id)

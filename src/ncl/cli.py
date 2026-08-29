@@ -1459,7 +1459,7 @@ def _run_files(args: argparse.Namespace) -> int:
             else:
                 render.emit(f"wrote {len(content)} bytes to {output}")
             return exits.OK
-        text = files.text_content(content)
+        text = files.text_content(content, content_type=reference.content_type)
         if args.json:
             _json({"file": reference.as_dict(), "content": text})
         else:

@@ -105,8 +105,11 @@ def _write(**kwargs):
     ttl = kwargs.pop("ttl", plans.DEFAULT_TTL_SECONDS)
     now = kwargs.pop("now", None)
     summary = kwargs.pop("summary")
+    profile = kwargs.pop("profile")
+    if profile == PROFILE.name:
+        profile = PROFILE
     return plans.write_bundle(
-        profile=kwargs.pop("profile"),
+        profile=profile,
         summary=summary,
         steps=(plans.freeze_step(payload=payload, summary=summary, **kwargs),),
         ttl=ttl,

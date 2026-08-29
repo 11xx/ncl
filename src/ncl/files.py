@@ -58,6 +58,25 @@ _PROPFIND = (
     "<d:getetag/><d:getcontenttype/>"
     "</d:prop></d:propfind>"
 )
+_PROPERTIES = frozenset(
+    {
+        (DAV, "resourcetype"),
+        (DAV, "getcontentlength"),
+        (DAV, "getlastmodified"),
+        (DAV, "getetag"),
+        (DAV, "getcontenttype"),
+    }
+)
+_TEXT_MEDIA_TYPES = frozenset(
+    {
+        "application/javascript",
+        "application/json",
+        "application/ld+json",
+        "application/xml",
+        "application/xhtml+xml",
+        "image/svg+xml",
+    }
+)
 
 
 def _canonical(profile: Any, href: str) -> str:
@@ -112,19 +131,32 @@ def _prop_elements(response: ET.Element) -> dict[tuple[str, str], ET.Element]:
     for propstat in response:
         if _element_name(propstat) != (DAV, "propstat"):
             continue
-        status = next(
-            (item for item in propstat if _element_name(item) == (DAV, "status")), None
-        )
-        code = _status_code(status.text if status is not None else None)
-        if code is None or not 200 <= code < 300:
-            continue
         prop = next(
             (item for item in propstat if _element_name(item) == (DAV, "prop")), None
         )
         if prop is None:
             continue
-        for element in prop:
-            found[_element_name(element)] = element
+        elements = list(prop)
+        status = next(
+            (item for item in propstat if _element_name(item) == (DAV, "status")), None
+        )
+        code = _status_code(status.text if status is not None else None)
+        known = {_element_name(element) for element in elements} & _PROPERTIES
+        if code is None:
+            if known:
+                raise FileError("the WebDAV property status was malformed")
+            continue
+        for element in elements:
+            name = _element_name(element)
+            if name not in _PROPERTIES:
+                continue
+            if not 200 <= code < 300:
+                raise FileError(
+                    f"the WebDAV property {name[1]} was not returned successfully"
+                )
+            if name in found:
+                raise FileError(f"the WebDAV response repeated property {name[1]}")
+            found[name] = element
     return found
 
 
@@ -152,7 +184,9 @@ def _file_ref(
     if not props:
         raise FileError("the WebDAV response returned no successful properties")
     resource_type = props.get((DAV, "resourcetype"))
-    collection = resource_type is not None and any(
+    if resource_type is None:
+        raise FileError("the WebDAV response omitted the resource type")
+    collection = any(
         _element_name(item) == (DAV, "collection") for item in resource_type
     )
     size_element = props.get((DAV, "getcontentlength"))
@@ -191,11 +225,18 @@ def _multistatus(
         raise FileError("the WebDAV response was not valid XML") from exc
     if _element_name(root) != (DAV, "multistatus"):
         raise FileError("the WebDAV response was not a Multi-Status response")
-    return [
-        _file_ref(profile, entry)
-        for entry in root
-        if _element_name(entry) == (DAV, "response")
-    ]
+    found: list[tuple[str, FileRef | None, int | None]] = []
+    seen: set[tuple[str, ...]] = set()
+    for entry in root:
+        if _element_name(entry) != (DAV, "response"):
+            continue
+        item = _file_ref(profile, entry)
+        key = _segments(item[0])
+        if key in seen:
+            raise FileError("the WebDAV response repeated a resource href")
+        seen.add(key)
+        found.append(item)
+    return found
 
 
 def list_collection(profile: Any, *, session: Session, href: str) -> list[FileRef]:
@@ -206,7 +247,9 @@ def list_collection(profile: Any, *, session: Session, href: str) -> list[FileRe
         collection_href,
         headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
         data=_PROPFIND,
+        max_redirects=0,
     )
+    _refuse_redirect(response, action="listing", href=collection_href)
     if response.status == 404:
         raise FileError(f"no file collection exists at {collection_href}", exits.TARGET_NOT_FOUND)
     if response.status != 207:
@@ -313,8 +356,14 @@ def read_file(profile: Any, *, session: Session, href: str) -> tuple[FileRef, by
     )
 
 
-def text_content(content: bytes) -> str:
-    """Decode content that can safely pass through the redacting text stream."""
+def text_content(content: bytes, *, content_type: str = "") -> str:
+    """Decode declared textual content before it reaches the redacting stream."""
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    if not media_type.startswith("text/") and media_type not in _TEXT_MEDIA_TYPES:
+        raise FileError(
+            "the file does not declare a textual media type; use --output to write its exact bytes",
+            exits.UNSUPPORTED_STRUCTURE,
+        )
     try:
         return content.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -390,7 +439,7 @@ def plan_write(
     if existing is not None:
         existing_etag = _strong_etag(existing.etag, "a file replacement")
     return plans.write_bundle(
-        profile=profile.name,
+        profile=profile,
         summary=_segments(target)[-1],
         steps=(
             plans.freeze_step(
@@ -419,7 +468,7 @@ def plan_delete(profile: Any, *, session: Session, href: str) -> plans.Plan:
         raise FileError("collection deletion is not supported", exits.UNSUPPORTED_STRUCTURE)
     existing_etag = _strong_etag(existing.etag, "a file deletion")
     return plans.write_bundle(
-        profile=profile.name,
+        profile=profile,
         summary=existing.name,
         steps=(
             plans.freeze_step(

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import unicodedata
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import unquote_to_bytes, urlsplit
 
 from . import config, exits
@@ -52,7 +55,10 @@ def _decode_segment(segment: str) -> str:
         decoded = unquote_to_bytes(segment).decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError("href contains a non-UTF-8 percent escape") from exc
-    return unicodedata.normalize("NFC", decoded)
+    decoded = unicodedata.normalize("NFC", decoded)
+    if "/" in decoded or "\\" in decoded:
+        raise ValueError("href contains a path separator inside a path segment")
+    return decoded
 
 
 def _authority(parsed) -> tuple[str, str, int | None] | None:
@@ -103,6 +109,30 @@ def canonicalize_href(value: str) -> tuple[tuple[str, str, int | None] | None, t
     """Return the canonical authority and decoded path segments for an href."""
     href = _canonical(value)
     return href.authority, href.segments
+
+
+def fingerprint(profile: Any) -> str:
+    """Return a stable identity for the profile state a plan relies on."""
+    name = profile if isinstance(profile, str) else getattr(profile, "name", None)
+    if not isinstance(name, str) or not name:
+        raise ValueError("profile must have a non-empty name")
+    if all(
+        hasattr(profile, field)
+        for field in ("origin", "secret_backend", "calendars", "files_roots")
+    ):
+        state: dict[str, Any] = {
+            "name": name,
+            "origin": profile.origin,
+            "secret_backend": profile.secret_backend,
+            "calendars": list(profile.calendars),
+            "files_roots": list(profile.files_roots),
+        }
+    else:
+        # Small protocol fakes can identify a profile by name only. Real
+        # configured profiles always take the complete branch above.
+        state = {"name": name}
+    encoded = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def in_scope(candidate_href: str, allowlist: list[str] | tuple[str, ...]) -> bool:

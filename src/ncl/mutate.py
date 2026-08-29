@@ -486,7 +486,7 @@ def plan_create(
         payload.encode("utf-8"), calendar_href=calendar_href, href=href, etag=""
     )
     return plans.write_bundle(
-        profile=profile.name,
+        profile=profile,
         summary=summary,
         steps=(
             plans.freeze_step(
@@ -560,7 +560,7 @@ def plan_update(
         etag=etag,
     )
     return plans.write_bundle(
-        profile=profile.name,
+        profile=profile,
         summary=updated.summary,
         steps=(
             plans.freeze_step(
@@ -615,7 +615,7 @@ def plan_delete(
         )
     etag = events.strong_etag(reference.etag)
     return plans.write_bundle(
-        profile=profile.name,
+        profile=profile,
         summary=reference.summary,
         steps=(
             plans.freeze_step(

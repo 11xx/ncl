@@ -24,7 +24,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from . import exits
+from . import exits, profiles
 
 # A plan with no recorded remote progress describes a resource that may change
 # under it, so it has a short freshness window. Progress changes the expiry to
@@ -89,6 +89,7 @@ class Plan:
 
     plan_id: str
     profile: str
+    profile_fingerprint: str
     summary: str
     steps: tuple[Step, ...]
     created_at: float
@@ -101,6 +102,7 @@ class Plan:
         return {
             "plan_id": self.plan_id,
             "profile": self.profile,
+            "profile_fingerprint": self.profile_fingerprint,
             "summary": self.summary,
             "steps": [step.as_dict() for step in self.steps],
             "created_at": self.created_at,
@@ -192,6 +194,12 @@ def validate_shape(plan: Plan, *, plan_id: str | None = None) -> None:
         raise _shape_error(expected_id, "an invalid plan id")
     if not isinstance(plan.profile, str) or not plan.profile:
         raise _shape_error(plan.plan_id, "an invalid profile")
+    if (
+        not isinstance(plan.profile_fingerprint, str)
+        or len(plan.profile_fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in plan.profile_fingerprint)
+    ):
+        raise _shape_error(plan.plan_id, "an invalid profile fingerprint")
     if not isinstance(plan.summary, str):
         raise _shape_error(plan.plan_id, "an invalid bundle summary")
     if not _finite_number(plan.created_at):
@@ -224,6 +232,7 @@ def _serialized(plan: Plan) -> dict[str, Any]:
     return {
         "plan_id": plan.plan_id,
         "profile": plan.profile,
+        "profile_fingerprint": plan.profile_fingerprint,
         "summary": plan.summary,
         "steps": [
             {
@@ -261,14 +270,15 @@ def _store(plan: Plan) -> None:
 
 def write_bundle(
     *,
-    profile: str,
+    profile: Any,
     summary: str,
     steps: Iterable[Step],
     ttl: float = DEFAULT_TTL_SECONDS,
     now: float | None = None,
 ) -> Plan:
     """Atomically store a nonempty ordered sequence of frozen steps."""
-    if not isinstance(profile, str) or not profile:
+    profile_name = profile if isinstance(profile, str) else getattr(profile, "name", None)
+    if not isinstance(profile_name, str) or not profile_name:
         raise PlanError("a plan needs a profile", exits.USAGE)
     if not isinstance(summary, str):
         raise PlanError("a plan summary must be text", exits.USAGE)
@@ -280,9 +290,14 @@ def write_bundle(
     created = time.time() if now is None else now
     if not _finite_number(created):
         raise PlanError("the plan creation time is invalid", exits.USAGE)
+    try:
+        profile_hash = profiles.fingerprint(profile)
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise PlanError("the plan profile is not usable", exits.USAGE) from exc
     plan = Plan(
         plan_id=token_source.token_hex(8),
-        profile=profile,
+        profile=profile_name,
+        profile_fingerprint=profile_hash,
         summary=summary,
         steps=frozen_steps,
         created_at=float(created),
@@ -296,7 +311,7 @@ def write_bundle(
 
 def write(
     *,
-    profile: str,
+    profile: Any,
     summary: str,
     steps: Iterable[Step],
     ttl: float = DEFAULT_TTL_SECONDS,
@@ -317,7 +332,16 @@ def payload_bytes(step: Step) -> bytes:
 
 
 def _decode_plan(plan_id: str, data: Any) -> Plan:
-    required = {"plan_id", "profile", "summary", "steps", "created_at", "expires_at", "progress"}
+    required = {
+        "plan_id",
+        "profile",
+        "profile_fingerprint",
+        "summary",
+        "steps",
+        "created_at",
+        "expires_at",
+        "progress",
+    }
     if not isinstance(data, dict) or set(data) != required:
         raise _shape_error(plan_id, "an unexpected serialized shape")
     if data["plan_id"] != plan_id:
@@ -359,6 +383,7 @@ def _decode_plan(plan_id: str, data: Any) -> Plan:
     plan = Plan(
         plan_id=data["plan_id"],
         profile=data["profile"],
+        profile_fingerprint=data["profile_fingerprint"],
         summary=data["summary"],
         steps=tuple(steps),
         created_at=data["created_at"],
@@ -479,6 +504,15 @@ def _validate_for_lifecycle(
     if plan.profile != profile_name:
         raise PlanError(
             f"plan {plan.plan_id} was made for profile {plan.profile!r}", exits.USAGE
+        )
+    try:
+        current_fingerprint = profiles.fingerprint(profile)
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise PlanError("the selected profile is invalid", exits.USAGE) from exc
+    if plan.profile_fingerprint != current_fingerprint:
+        raise PlanError(
+            f"plan {plan.plan_id} was made for a different profile configuration; re-plan",
+            exits.PLAN_STALE,
         )
     if fresh:
         check_fresh(plan)

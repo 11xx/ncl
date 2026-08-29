@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from ncl import config, exits
-from ncl.profiles import in_scope, resolve
+from ncl.profiles import fingerprint, in_scope, resolve
 
 
 def test_resolve_uses_default_or_explicit_profile(tmp_path):
@@ -51,9 +51,9 @@ def test_scope_rejects_dot_dot_before_or_after_decoding():
     assert not in_scope("/files/user/%2E%2E/secret", ["/files/user"])
 
 
-def test_scope_keeps_encoded_slash_inside_one_segment():
-    assert in_scope("/files/user/a%2Fb", ["/files/user"])
-    assert not in_scope("/files/user/a%2Fb", ["/files/user/a/b"])
+@pytest.mark.parametrize("encoded_separator", ["%2F", "%2f", "%5C", "%5c"])
+def test_scope_rejects_encoded_path_separators(encoded_separator):
+    assert not in_scope(f"/files/user/a{encoded_separator}b", ["/files/user"])
 
 
 def test_scope_ignores_trailing_slash_difference():
@@ -74,6 +74,25 @@ def test_scope_normalizes_default_ports_without_matching_other_ports():
 
 def test_scope_normalizes_unicode_to_nfc():
     assert in_scope("/files/alice/cafe\u0301", ["/files/alice/caf\u00e9"])
+
+
+def test_profile_fingerprint_changes_when_profile_state_changes():
+    profile = config.Profile(
+        "home",
+        "https://cloud.example.invalid",
+        "pass",
+        ("/calendars/alice",),
+        ("/files/alice/work",),
+    )
+    changed = config.Profile(
+        profile.name,
+        profile.origin,
+        profile.secret_backend,
+        profile.calendars,
+        ("/files/alice/other",),
+    )
+
+    assert fingerprint(profile) != fingerprint(changed)
 
 
 def test_empty_allowlist_admits_nothing():
