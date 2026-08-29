@@ -88,9 +88,15 @@ RESPONSE = {
     SCOPE_DENIED: (
         "The requested resource is outside the configured allowlist. Do not widen it implicitly."
     ),
+    # One code, four kinds of refusal: a 412 on a remote resource, a local
+    # output path that already exists, a run whose authoring is frozen, and a
+    # stored credential that will not be replaced implicitly. Re-reading
+    # resolves only the first, so the standing answer names the class and
+    # leaves the remedy to the message, which every site states.
     CONFLICT: (
-        "The resource changed under us and its ETag no longer matches. "
-        "Read it again before retrying."
+        "Nothing was overwritten. The target already exists, changed underneath, "
+        "or is in a state that refuses the change; resolve what the message names "
+        "before retrying."
     ),
     UNSUPPORTED_STRUCTURE: (
         "The resource contains structure this tool does not model. Do not rewrite it."
