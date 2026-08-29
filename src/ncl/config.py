@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from . import exits
+from . import exits, secrets
 
 
 class ConfigError(RuntimeError):
@@ -149,9 +149,13 @@ def _validate_profile(name: str, raw: Any) -> Profile:
     _keys(table, allowed, context)
 
     origin = validate_origin(_required(table, "origin", context), f"{context}.origin")
-    backend = _string(table.get("secret_backend", "pass"), f"{context}.secret_backend")
-    if backend not in {"pass", "libsecret"}:
-        raise _error(f"{context}.secret_backend", "must be 'pass' or 'libsecret'")
+    backend = _string(
+        table.get("secret_backend", secrets.DEFAULT_BACKEND), f"{context}.secret_backend"
+    )
+    supported_backends = secrets.backend_names()
+    if backend not in supported_backends:
+        choices = " or ".join(repr(name) for name in supported_backends)
+        raise _error(f"{context}.secret_backend", f"must be {choices}")
 
     calendars = _string_list(_required(table, "calendars", context), f"{context}.calendars")
     files_roots = _string_list(
