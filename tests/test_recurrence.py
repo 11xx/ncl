@@ -341,6 +341,19 @@ def test_reusable_wire_id_forms_preserve_type_and_timezone(wire):
     assert parsed.kind in {"DATE", "DATE-TIME"}
 
 
+@pytest.mark.parametrize(
+    ("wire", "kind"),
+    [
+        ("TZID=America/New_York:20261101T013000", "ambiguous"),
+        ("TZID=America/New_York:20260308T023000", "nonexistent"),
+    ],
+)
+def test_recurrence_target_wire_ids_refuse_ambiguous_or_nonexistent_local_times(wire, kind):
+    with pytest.raises(recurrence.RecurrenceError, match=kind) as error:
+        recurrence.parse_wire_id(wire)
+    assert error.value.code == exits.UNSUPPORTED_STRUCTURE
+
+
 def test_occurrence_discovery_emits_tzid_and_date_wire_id_forms():
     tzid = SERIES.replace(
         b"DTSTART:20260901T090000Z",
@@ -775,10 +788,12 @@ def test_dtend_duration_remains_exact_across_a_dst_transition():
             b"RRULE:FREQ=DAILY;COUNT=3\r\n"
         )
     )
-    found = recurrence._resource_occurrences(
-        _resource(raw),
-        dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-        dt.datetime(2026, 12, 31, tzinfo=dt.UTC),
+    found = recurrence.occurrences(
+        PROFILE,
+        session=_report_transport(raw),
+        calendar_href=CAL,
+        start=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        end=dt.datetime(2026, 12, 31, tzinfo=dt.UTC),
     )
 
     assert [(item.effective_start, item.effective_end) for item in found] == [
@@ -824,10 +839,12 @@ def test_all_day_recurrence_without_end_uses_the_default_one_day_duration():
             b"RRULE:FREQ=DAILY;COUNT=2\r\n"
         )
     )
-    found = recurrence._resource_occurrences(
-        _resource(raw),
-        dt.datetime(2026, 9, 1, tzinfo=dt.UTC),
-        dt.datetime(2026, 9, 3, tzinfo=dt.UTC),
+    found = recurrence.occurrences(
+        PROFILE,
+        session=_report_transport(raw),
+        calendar_href=CAL,
+        start=dt.datetime(2026, 9, 1, tzinfo=dt.UTC),
+        end=dt.datetime(2026, 9, 3, tzinfo=dt.UTC),
     )
 
     assert [(item.recurrence_id, item.effective_start, item.effective_end) for item in found] == [
@@ -902,10 +919,12 @@ def test_generated_tzid_gap_is_refused_during_expansion():
     )
 
     with pytest.raises(recurrence.RecurrenceError, match="nonexistent"):
-        recurrence._resource_occurrences(
-            _resource(raw),
-            dt.datetime(2026, 3, 1, tzinfo=dt.UTC),
-            dt.datetime(2026, 3, 12, tzinfo=dt.UTC),
+        recurrence.occurrences(
+            PROFILE,
+            session=_report_transport(raw),
+            calendar_href=CAL,
+            start=dt.datetime(2026, 3, 1, tzinfo=dt.UTC),
+            end=dt.datetime(2026, 3, 12, tzinfo=dt.UTC),
         )
 
 
