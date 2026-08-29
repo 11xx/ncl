@@ -807,7 +807,7 @@ def _write(
         )
         for step in steps
     )
-    return plans.write_bundle(profile=profile.name, summary=summary, steps=frozen_steps)
+    return plans.write_bundle(profile=profile, summary=summary, steps=frozen_steps)
 
 
 def plan_create(

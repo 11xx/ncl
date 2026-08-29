@@ -884,7 +884,7 @@ def plan_create(
         etag="",
     )
     return plans.write_bundle(
-        profile=profile.name,
+        profile=profile,
         summary=summary,
         steps=(
             plans.freeze_step(
@@ -942,7 +942,7 @@ def plan_update(
         etag=strong,
     )
     return plans.write_bundle(
-        profile=profile.name,
+        profile=profile,
         summary=updated.summary,
         steps=(
             plans.freeze_step(
@@ -985,7 +985,7 @@ def plan_complete(
         etag=strong,
     )
     return plans.write_bundle(
-        profile=profile.name,
+        profile=profile,
         summary=updated.summary,
         steps=(
             plans.freeze_step(
@@ -1006,7 +1006,7 @@ def plan_delete(profile: Any, *, session: Session, href: str) -> plans.Plan:
     _reject_run_resource(reference, "deletion")
     strong = _require_etag(reference, "a deletion")
     return plans.write_bundle(
-        profile=profile.name,
+        profile=profile,
         summary=reference.summary,
         steps=(
             plans.freeze_step(

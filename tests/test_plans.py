@@ -91,6 +91,7 @@ def test_bundle_writer_requires_ordered_nonempty_steps_and_redacts_payload():
     assert all("payload" not in item for item in view["steps"])
     assert view["steps"][0]["payload_bytes"] == len(b"secret")
     assert [item["state"] for item in view["progress"]] == ["pending", "pending"]
+    assert len(view["profile_fingerprint"]) == 64
 
 
 def test_two_and_three_step_success_are_dispatched_in_order_and_consumed():

@@ -169,10 +169,12 @@ REACH ALLOWLISTED FILES
   ncl files stat <resource-href>    Read size, mtime, media type, and ETag.
   ncl files read <file-href>        Read UTF-8 text through redacted stdout.
 
-  File hrefs must be inside one of the profile's `files_roots`. Binary content
-  never bypasses the text redaction boundary: use `files read --output <path>`
-  to write its exact bytes to a local file. An existing output path is refused
-  unless `--force` is explicit.
+  File hrefs must be inside one of the profile's `files_roots`. Only content
+  declared as textual and decodable as UTF-8 is sent to redacted stdout; binary,
+  unknown, or non-UTF-8 content requires `files read --output <path>` to write
+  its exact bytes to a local file. Every file request stays on its exact href
+  and refuses redirects. An existing output path is refused unless `--force`
+  is explicit.
 
 CHANGE NOTHING BY ACCIDENT
   ncl cal create <calendar> --summary S --from <iso> --to <iso>
@@ -201,7 +203,9 @@ CHANGE NOTHING BY ACCIDENT
   skipped on resume. The loop stops at the first failure, never rolls back a
   verified remote effect, and does not describe the bundle as atomic. A plan
   with any verified or uncertain progress does not expire; an untouched plan
-  retains its short freshness window.
+  retains its short freshness window. The plan fingerprints the selected
+  profile's origin, backend, calendars, and file roots; changing that state
+  makes the plan stale before any request.
 
   Recurrence series updates change only the master and preserve every override.
   Occurrence updates address the original wire identity, preserve its UID, and

@@ -654,7 +654,7 @@ def plan_create(
         route_url=route_url,
     )
     return plans.write_bundle(
-        profile=profile.name,
+        profile=profile,
         summary=schedule.summary,
         steps=_create_steps(profile, calendar_href, schedule),
     )
@@ -801,7 +801,7 @@ def plan_update(
         route_url=next_url,
     )
     return plans.write_bundle(
-        profile=profile.name,
+        profile=profile,
         summary=schedule.summary,
         steps=_update_steps(
             bundle,

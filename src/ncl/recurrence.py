@@ -1548,7 +1548,7 @@ def plan_update(
         planned = _rewrite_resource(resource, master_raw=master)
         _validate_planned_resource(resource, planned, href=resource.href, etag=resource.etag)
         step = _update_step(resource, planned, target=target)
-        return plans.write_bundle(profile=profile.name, summary=step.summary, steps=(step,))
+        return plans.write_bundle(profile=profile, summary=step.summary, steps=(step,))
     if not recurrence_id:
         raise _error("--recurrence-id is required for an occurrence target", exits.USAGE)
     identity = _resolve_target(resource, recurrence_id)
@@ -1578,7 +1578,7 @@ def plan_update(
             planned = _replace_component(planned, existing[2], exception)
         _validate_planned_resource(resource, planned, href=resource.href, etag=resource.etag)
         step = _update_step(resource, planned, target=target, recurrence_id=identity.text)
-        return plans.write_bundle(profile=profile.name, summary=step.summary, steps=(step,))
+        return plans.write_bundle(profile=profile, summary=step.summary, steps=(step,))
 
     if any(name.upper() in {"DTSTART", "DTEND"} for name in changes):
         raise _error("this-and-future does not shift DTSTART or DTEND", exits.UNSUPPORTED_STRUCTURE)
@@ -1648,7 +1648,7 @@ def plan_update(
     else:
         old = _delete_step(resource, target=target, recurrence_id=identity.text)
     return plans.write_bundle(
-        profile=profile.name,
+        profile=profile,
         summary=f"{create.summary} (non-atomic future split)",
         steps=(create, old),
     )
@@ -1674,7 +1674,7 @@ def plan_delete(
         if recurrence_id:
             raise _error("--recurrence-id belongs only to an occurrence target", exits.USAGE)
         step = _delete_step(resource, target=target)
-        return plans.write_bundle(profile=profile.name, summary=step.summary, steps=(step,))
+        return plans.write_bundle(profile=profile, summary=step.summary, steps=(step,))
     if target == "occurrence":
         identity = _resolve_target(resource, recurrence_id)
         existing = resource.override_by_key.get(identity.key)
@@ -1689,7 +1689,7 @@ def plan_delete(
             planned = _replace_component(resource.raw, existing[2], exception)
         _validate_planned_resource(resource, planned, href=resource.href, etag=resource.etag)
         step = _update_step(resource, planned, target=target, recurrence_id=identity.text)
-        return plans.write_bundle(profile=profile.name, summary=step.summary, steps=(step,))
+        return plans.write_bundle(profile=profile, summary=step.summary, steps=(step,))
     if target == "this-and-future":
         identity = _resolve_target(resource, recurrence_id)
         old_rule, _, old_rdates, _, old_exdates, _, old_exists = _split_model(
@@ -1714,7 +1714,7 @@ def plan_delete(
             step = _update_step(resource, old_raw, target=target, recurrence_id=identity.text)
         else:
             step = _delete_step(resource, target=target, recurrence_id=identity.text)
-        return plans.write_bundle(profile=profile.name, summary=step.summary, steps=(step,))
+        return plans.write_bundle(profile=profile, summary=step.summary, steps=(step,))
     raise _error(f"unknown recurrence target {target!r}", exits.USAGE)
 
 

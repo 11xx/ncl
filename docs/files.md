@@ -17,14 +17,18 @@ slash, or `..`.
 collection's immediate children. `ncl files stat <resource>` uses depth zero.
 Both expose stable hrefs, resource type, size where applicable, modification
 time, ETag, and media type. A depth-one response naming a resource outside the
-requested collection is malformed rather than extra discovery.
+requested collection is malformed rather than extra discovery. Every requested
+property must be returned successfully, each response needs a resource type,
+and duplicate resource hrefs are malformed rather than alternate observations.
 
-`ncl files read <file>` sends `GET`. UTF-8 content can be emitted through the
-CLI's redacting text stream or returned as structured JSON. Arbitrary content
-uses `--output <path>`, which writes the exact response bytes locally. The CLI
-does not send binary content through `sys.stdout.buffer`, because that would
-bypass credential redaction. A local output path is not replaced unless
-`--force` is present.
+`ncl files read <file>` sends `GET`. Content declared as a textual media type
+and encoded as UTF-8 can be emitted through the CLI's redacting text stream or
+returned as structured JSON. Unknown, binary, or non-UTF-8 content uses
+`--output <path>`, which writes the exact response bytes locally. The CLI does
+not send binary content through `sys.stdout.buffer`, because that would bypass
+credential redaction. A local output path is not replaced unless `--force` is
+present. Every file request, including a listing, must answer for its exact
+href; redirects are refused.
 
 Reads currently buffer one complete response in memory. Recursive traversal,
 range reads, and streaming large objects are not implemented.
@@ -41,8 +45,10 @@ Collections are never deleted by this command, which rules out an accidental
 recursive removal.
 
 Neither command changes the server. `ncl apply <plan-id>` performs the frozen
-request as one ordered step. Every step in a bundle is validated before the
-first request; verified steps are recorded and skipped on resume, execution
+request as one ordered step. The plan also stores an opaque fingerprint of the
+selected profile's origin, backend, calendars, and file roots; changing that
+configuration makes the plan stale. Every step in a bundle is validated before
+the first request; verified steps are recorded and skipped on resume, execution
 stops at the first failure, and no verified remote effect is rolled back. A
 write is then read back and compared byte for byte. A deletion is followed by
 a depth-zero lookup that must report the resource absent. An ETag mismatch is
