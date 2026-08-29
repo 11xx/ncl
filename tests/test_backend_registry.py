@@ -80,6 +80,7 @@ files_roots = ["/remote.php/dav/files/alice/"]
 
     assert secrets.inspect_backend("fake").state == secrets.READY
     assert secrets.round_trip_backend("fake").round_tripped is True
+    assert secrets.probe(profile) is True
     secrets.store_credential(profile, "alice", "fixture-secret")
     assert secrets.load_credential(profile) == secrets.Credential("alice", "fixture-secret")
     assert secrets.has_credential(profile) is True
