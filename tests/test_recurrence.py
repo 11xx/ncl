@@ -853,6 +853,22 @@ def test_all_day_recurrence_without_end_uses_the_default_one_day_duration():
     ]
 
 
+def test_date_recurrence_rejects_a_time_based_duration():
+    raw = _single_event_calendar(
+        _probe_event(
+            b"DTSTART;VALUE=DATE:20260901\r\n"
+            b"DURATION:P1DT2H\r\n"
+            b"DTSTAMP:20260817T120000Z\r\n"
+            b"SEQUENCE:0\r\n"
+            b"RRULE:FREQ=DAILY;COUNT=2\r\n"
+        )
+    )
+
+    with pytest.raises(recurrence.RecurrenceError, match="whole-day") as error:
+        _resource(raw)
+    assert error.value.code == exits.UNSUPPORTED_STRUCTURE
+
+
 def test_count_split_retains_explicit_dtstart_before_the_first_rrule_value():
     raw = _single_event_calendar(
         _probe_event(

@@ -629,7 +629,9 @@ def _as_instant(value: dt.date | dt.datetime) -> dt.datetime:
     return dt.datetime.combine(value, dt.time.min, tzinfo=dt.UTC)
 
 
-def _nominal_duration(value: Any, *, label: str) -> relativedelta:
+def _nominal_duration(
+    value: Any, *, label: str, date_start: bool = False
+) -> relativedelta:
     try:
         text = value.to_ical().decode("ascii")
     except (AttributeError, UnicodeDecodeError, TypeError, ValueError) as exc:
@@ -643,6 +645,8 @@ def _nominal_duration(value: Any, *, label: str) -> relativedelta:
     }
     if not any(numbers.values()):
         raise _error(f"{label} is not a supported RFC 5545 duration")
+    if date_start and any(numbers[name] for name in ("hours", "minutes", "seconds")):
+        raise _error("a DATE DTSTART requires a whole-day or whole-week DURATION")
     sign = -1 if match.group("sign") == "-" else 1
     return relativedelta(
         weeks=sign * numbers["weeks"],
@@ -659,7 +663,11 @@ def _duration_model(component: Any) -> _DurationModel:
     if duration is not None:
         return _DurationModel(
             "nominal",
-            nominal=_nominal_duration(duration, label="DURATION"),
+            nominal=_nominal_duration(
+                duration,
+                label="DURATION",
+                date_start=isinstance(start, dt.date) and not isinstance(start, dt.datetime),
+            ),
         )
     explicit_end = component.get("DTEND")
     if explicit_end is not None:
@@ -793,6 +801,7 @@ def _validate_resource(raw: bytes, *, calendar_href: str, href: str, etag: str) 
     if not master_uid:
         raise _error("the recurrence master has no UID", exits.MALFORMED_RESPONSE)
     events._event_bounds(master, href=href, code=exits.MALFORMED_RESPONSE)
+    _duration_model(master)
     override_by_key: dict[tuple[str, str | None, str], tuple[WireId, Any, bytes]] = {}
     override_components: list[Any] = []
     override_raw: list[bytes] = []
@@ -821,6 +830,7 @@ def _validate_resource(raw: bytes, *, calendar_href: str, href: str, etag: str) 
         if not _identity_exists(model, identity):
             raise _error("a recurrence override does not map to the master's recurrence set")
         events._event_bounds(component, href=href, code=exits.MALFORMED_RESPONSE)
+        _duration_model(component)
         override_by_key[identity.key] = (identity, component, data)
         override_components.append(component)
         override_raw.append(data)
