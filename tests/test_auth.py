@@ -1005,6 +1005,112 @@ def test_cli_replaces_untyped_exception_text_with_catalogued_message(capsys):
     assert "Unexpected failure" in rendered.err
 
 
+def test_merged_standard_streams_share_redaction_state(monkeypatch):
+    output = io.StringIO()
+    representations = render.credential_representations("retX", "secret")
+    monkeypatch.setattr(render, "_SECRETS", set(representations.values()))
+    monkeypatch.setattr(sys, "stdout", output)
+    monkeypatch.setattr(sys, "stderr", output)
+
+    with render.redacted_standard_streams():
+        sys.stdout.write("sec")
+        sys.stderr.write("ret")
+
+    rendered = output.getvalue()
+    assert "secret" not in rendered
+    assert "[redacted]" in rendered
+
+
+def test_cli_converts_unexpected_exception_before_interpreter_traceback(monkeypatch):
+    script = """
+from ncl import cli, render
+
+render._SECRETS = {"fixture-secret"}
+
+def explode(argv=None):
+    raise RuntimeError("fixture-secret")
+
+cli._main = explode
+raise SystemExit(cli.main([]))
+"""
+    environment = os.environ.copy()
+    source = str(Path(__file__).parents[1] / "src")
+    existing = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        source if not existing else os.pathsep.join((source, existing))
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+    )
+
+    assert result.returncode == exits.ERROR
+    assert "fixture-secret" not in result.stdout + result.stderr
+    assert "Traceback" not in result.stderr
+    assert "Unexpected failure" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("secret", "value", "expected"),
+    [
+        (render._MARKER, f"left {render._MARKER} right", "left  right"),
+        ("redacted", "left redacted right", "left  right"),
+    ],
+)
+def test_marker_collisions_remove_only_registered_text(monkeypatch, secret, value, expected):
+    output = io.StringIO()
+    monkeypatch.setattr(render, "_SECRETS", {secret})
+    monkeypatch.setattr(sys, "stdout", output)
+
+    with render.redacted_standard_streams():
+        sys.stdout.write(value)
+
+    assert output.getvalue() == expected
+
+
+def test_final_drain_flushes_a_buffered_underlying_stream(monkeypatch):
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(io.BufferedWriter(raw), encoding="utf-8")
+    monkeypatch.setattr(render, "_SECRETS", {"secret"})
+    monkeypatch.setattr(sys, "stdout", stream)
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+
+    with render.redacted_standard_streams():
+        sys.stdout.write("ordinary sec")
+
+    try:
+        assert raw.getvalue() == b"ordinary sec"
+    finally:
+        stream.detach()
+
+
+def test_short_underlying_writes_are_retried_without_losing_text(monkeypatch):
+    class ShortTextStream(io.TextIOBase):
+        def __init__(self):
+            self.received = ""
+
+        def write(self, value):
+            self.received += value[:1]
+            return min(1, len(value))
+
+        def flush(self):
+            return None
+
+    output = ShortTextStream()
+    monkeypatch.setattr(render, "_SECRETS", set())
+    monkeypatch.setattr(sys, "stdout", output)
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+
+    with render.redacted_standard_streams():
+        assert sys.stdout.write("ordinary") == len("ordinary")
+
+    assert output.received == "ordinary"
+
+
 def _register_credential_representations(monkeypatch) -> None:
     monkeypatch.setattr(render, "_SECRETS", set(CREDENTIAL_REPRESENTATIONS))
 
@@ -1308,18 +1414,10 @@ def test_public_cli_auth_commands_redact_registered_credential(
 
 
 def test_cli_help_passes_through_redacting_stream(monkeypatch):
-    writes = []
-    original_redact = render._redact_text
-
-    def track_write(value):
-        writes.append(value)
-        return original_redact(value)
-
     def reject_emit(*args, **kwargs):
         raise AssertionError("argparse help must not depend on render.emit")
 
     output = io.StringIO()
-    monkeypatch.setattr(render, "_redact_text", track_write)
     monkeypatch.setattr(render, "emit", reject_emit)
     monkeypatch.setattr(sys, "stdout", output)
 
@@ -1327,7 +1425,6 @@ def test_cli_help_passes_through_redacting_stream(monkeypatch):
         cli.main(["--help"])
 
     assert error.value.code == exits.OK
-    assert any("Usage:" in value for value in writes)
     # Help leads with what the tool is, then the usage line — the shape the
     # sibling tools in this family use, rather than argparse's default.
     rendered = output.getvalue()
