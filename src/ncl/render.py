@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+import errno
 import json
 import sys
+from bisect import bisect_right
 from collections.abc import Mapping
 from contextlib import contextmanager
 from typing import Any
@@ -34,25 +36,118 @@ def credential_representations(login_name: str, app_password: str) -> dict[str, 
 #: Replacing a secret can complete another one at the seam, because the marker
 #: contributes characters of its own: with `ab` and `]xy` both registered,
 #: `abxy` becomes `[redacted]xy`, which contains `]xy` in full. Replacement
-#: therefore runs to a fixed point rather than once. Only a value overlapping
-#: the marker's own characters needs a second pass, and a real credential — an
-#: application password, a `user:pass` pair, its base64 form, or that form
-#: behind `Basic ` — carries no bracket and settles on the first, so this
-#: allowance exists for contrived registered sets alone.
+#: therefore runs to a fixed point rather than once. A marker that already
+#: contains a registered value is not safe to emit, so those values are
+#: removed while the surrounding text is retained.
 _REDACTION_PASSES = 8
 
 
-def _redact_text(value: str) -> str:
+_TextChunk = tuple[Any, str]
+
+
+def _join_chunks(chunks: list[_TextChunk]) -> str:
+    return "".join(text for _, text in chunks)
+
+
+def _append_chunk(chunks: list[_TextChunk], target: Any, text: str) -> None:
+    if not text:
+        return
+    if chunks and chunks[-1][0] is target:
+        chunks[-1] = (target, chunks[-1][1] + text)
+    else:
+        chunks.append((target, text))
+
+
+def _chunk_starts(chunks: list[_TextChunk]) -> list[int]:
+    starts: list[int] = []
+    position = 0
+    for _, text in chunks:
+        starts.append(position)
+        position += len(text)
+    return starts
+
+
+def _append_chunk_range(
+    result: list[_TextChunk],
+    chunks: list[_TextChunk],
+    starts: list[int],
+    start: int,
+    end: int,
+) -> None:
+    if start >= end:
+        return
+    index = max(0, min(len(chunks) - 1, bisect_right(starts, start) - 1))
+    while index < len(chunks):
+        chunk_start = starts[index]
+        if chunk_start >= end:
+            break
+        left = max(start - chunk_start, 0)
+        right = min(end - chunk_start, len(chunks[index][1]))
+        if left < right:
+            _append_chunk(result, chunks[index][0], chunks[index][1][left:right])
+        index += 1
+
+
+def _slice_chunks(chunks: list[_TextChunk], start: int, end: int) -> list[_TextChunk]:
+    if start >= end or not chunks:
+        return []
+    return_result: list[_TextChunk] = []
+    _append_chunk_range(return_result, chunks, _chunk_starts(chunks), start, end)
+    return return_result
+
+
+def _replace_secret(
+    chunks: list[_TextChunk], secret: str, replacement: str
+) -> list[_TextChunk]:
+    value = _join_chunks(chunks)
+    if not secret or secret not in value:
+        return chunks
+    starts = _chunk_starts(chunks)
+    result: list[_TextChunk] = []
+    cursor = 0
+    while True:
+        match = value.find(secret, cursor)
+        if match < 0:
+            break
+        _append_chunk_range(result, chunks, starts, cursor, match)
+        target_index = max(0, min(len(chunks) - 1, bisect_right(starts, match) - 1))
+        _append_chunk(result, chunks[target_index][0], replacement)
+        cursor = match + len(secret)
+    _append_chunk_range(result, chunks, starts, cursor, len(value))
+    return result
+
+
+def _redaction_replacement() -> str:
+    if any(secret and secret in _MARKER for secret in _SECRETS):
+        return ""
+    return _MARKER
+
+
+def _redact_chunks(chunks: list[_TextChunk], replacement: str | None = None) -> list[_TextChunk]:
+    """Redact an ordered sequence while retaining each output target."""
+    if replacement is None:
+        replacement = _redaction_replacement()
+    current = chunks
     for _ in range(_REDACTION_PASSES):
-        replaced = value
+        replaced = current
         for secret in sorted(_SECRETS, key=len, reverse=True):
-            replaced = replaced.replace(secret, _MARKER)
-        if replaced == value:
-            return value
-        value = replaced
-    # Text only fails to settle when a registered value is itself part of the
-    # marker, and then the marker discloses it too. Nothing can be written.
-    return ""
+            replaced = _replace_secret(replaced, secret, replacement)
+        current_value = _join_chunks(current)
+        replaced_value = _join_chunks(replaced)
+        if replaced_value == current_value:
+            if any(secret and secret in replaced_value for secret in _SECRETS):
+                if replacement:
+                    return _redact_chunks(chunks, replacement="")
+                return []
+            return replaced
+        current = replaced
+    if replacement:
+        return _redact_chunks(chunks, replacement="")
+    return []
+
+
+def _redact_text(value: str) -> str:
+    return _join_chunks(_redact_chunks([(None, value)]))
 
 
 def _held_prefix_length(value: str) -> int:
@@ -62,52 +157,93 @@ def _held_prefix_length(value: str) -> int:
     the wrapper keeps back the longest suffix that is a proper prefix of some
     registered value and reconsiders it once the next write arrives.
     """
-    if not _SECRETS:
+    secrets = tuple(secret for secret in _SECRETS if secret)
+    if not secrets:
         return 0
-    longest = max(len(secret) for secret in _SECRETS)
+    longest = max(len(secret) for secret in secrets)
     for length in range(min(longest - 1, len(value)), 0, -1):
         suffix = value[len(value) - length:]
-        if any(secret.startswith(suffix) and len(secret) > length for secret in _SECRETS):
+        if any(secret.startswith(suffix) and len(secret) > length for secret in secrets):
             return length
     return 0
 
 
-class _RedactingTextStream:
-    """A text stream whose redaction spans write boundaries.
+class _StreamRedactionState:
+    """Redaction state shared by stdout and stderr for one invocation."""
 
-    Held text is never released on flush: by construction it is a proper prefix
-    of a registered secret, so draining it early is exactly the leak this exists
-    to close. It is at most one character short of the longest secret, and it
-    reaches the wrapped stream when the wrapper exits.
+    def __init__(self) -> None:
+        self._pending: list[_TextChunk] = []
+        self._ready: list[_TextChunk] = []
+
+    def _emit_ready(self) -> None:
+        while self._ready:
+            target, value = self._ready[0]
+            while value:
+                written = target.write(value)
+                if not isinstance(written, int) or isinstance(written, bool):
+                    raise TypeError("text stream write() must return an integer")
+                if written < 0 or written > len(value):
+                    raise ValueError("text stream write() returned an invalid length")
+                if written == 0:
+                    self._ready[0] = (target, value)
+                    raise BlockingIOError(errno.EAGAIN, "text stream write() made no progress")
+                value = value[written:]
+                self._ready[0] = (target, value)
+            self._ready.pop(0)
+
+    def write(self, target: Any, value: str) -> int:
+        if not isinstance(value, str):
+            raise TypeError(f"write() argument must be str, not {type(value).__name__}")
+        self._emit_ready()
+        combined = [*self._pending, (target, value)]
+        redacted = _redact_chunks(combined)
+        text = _join_chunks(redacted)
+        held = _held_prefix_length(text)
+        keep = len(text) - held
+        self._ready.extend(_slice_chunks(redacted, 0, keep))
+        self._pending = _slice_chunks(redacted, keep, len(text))
+        self._emit_ready()
+        return len(value)
+
+    def flush(self, target: Any) -> None:
+        self._emit_ready()
+        target.flush()
+
+    def drain(self) -> None:
+        self._emit_ready()
+        self._ready.extend(self._pending)
+        self._pending = []
+        self._emit_ready()
+
+
+class _RedactingTextStream:
+    """A text stream whose redaction spans all standard-stream boundaries.
+
+    The stdout and stderr wrappers share one state, so a secret split between
+    them cannot be reconstructed in a merged destination. Held text is never
+    released on flush: by construction it is a proper prefix of a registered
+    secret, so draining it early is exactly the leak this exists to close. It is
+    at most one character short of the longest secret and reaches its original
+    stream when the wrapper exits.
     """
 
-    def __init__(self, stream: Any) -> None:
+    def __init__(self, stream: Any, state: _StreamRedactionState) -> None:
         self._stream = stream
-        self._pending = ""
+        self._state = state
 
     def write(self, value: str) -> int:
-        redacted = _redact_text(self._pending + value)
-        held = _held_prefix_length(redacted)
-        keep = len(redacted) - held
-        self._pending = redacted[keep:]
-        if keep:
-            self._stream.write(redacted[:keep])
-        # The text-stream contract counts the characters of the argument that
-        # were consumed, which redaction changes the length of but not the fate.
-        return len(value)
+        return self._state.write(self._stream, value)
 
     def writelines(self, values: Any) -> None:
         for value in values:
             self.write(value)
 
     def flush(self) -> None:
-        self._stream.flush()
+        self._state.flush(self._stream)
 
     def drain(self) -> None:
-        """Release held text, which holds no complete secret."""
-        if self._pending:
-            self._stream.write(_redact_text(self._pending))
-            self._pending = ""
+        """Release held text, which holds no complete secret, in order."""
+        self._state.drain()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._stream, name)
@@ -115,20 +251,24 @@ class _RedactingTextStream:
 
 @contextmanager
 def redacted_standard_streams():
-    """Redact text written through stdout and stderr for one CLI invocation."""
+    """Redact one ordered text stream spanning stdout and stderr."""
     stdout = sys.stdout
     stderr = sys.stderr
-    wrapped = (_RedactingTextStream(stdout), _RedactingTextStream(stderr))
+    state = _StreamRedactionState()
+    wrapped = (_RedactingTextStream(stdout, state), _RedactingTextStream(stderr, state))
     sys.stdout, sys.stderr = wrapped
     try:
         yield
     finally:
-        # Restoration is not conditional on the drain succeeding: a stream that
-        # fails to accept its last write must not also leave the process with a
-        # wrapper standing in for its own stdout.
+        # Restoration is not conditional on draining or flushing: a stream that
+        # fails to accept its last write must not also leave a wrapper installed.
         try:
-            for stream in wrapped:
-                stream.drain()
+            state.drain()
+            flushed: list[Any] = []
+            for stream in (stdout, stderr):
+                if not any(stream is previous for previous in flushed):
+                    stream.flush()
+                    flushed.append(stream)
         finally:
             sys.stdout = stdout
             sys.stderr = stderr

@@ -83,15 +83,19 @@ The authenticated request boundary registers the application password, the
 `user:password` pair, its base64 encoding, and its Basic-auth form. Structured
 output is recursively redacted, and the CLI wraps its standard text streams so
 `argparse`, direct `print` calls, and library text writers pass through the same
-redaction. The wrapper matches within a write and across
-write boundaries alike, so a value broken in two by a buffered writer is still
-redacted; text that merely ends inside a credential prefix is held only until
-the rest of the output arrives, and is released unchanged when the invocation
-finishes. Replacement repeats until the text stops changing, because the
+redaction. One state covers both streams for the invocation, so a value broken
+across writes, flushes, or a merged stdout/stderr destination is still
+redacted. Text that merely ends inside a credential prefix is held until the
+rest of the output arrives; if the invocation finishes first, the pending text
+is written unchanged and the underlying streams are flushed. Short writes from
+the underlying text streams are retried so accepted output is not silently
+lost. Replacement repeats until the text stops changing, because the
 replacement marker contributes characters that could otherwise complete a
-second registered value at the seam. Text that never stops changing — possible
-only when a registered value is itself part of the marker, which then discloses
-it too — is dropped rather than written in part. Raw
+second registered value at the seam. If a registered value is already inside
+the marker, the value is removed instead of emitting a marker that contains it,
+and surrounding prose is retained. An unexpected exception is converted to the
+catalogued generic failure while the wrapper is active, so the interpreter
+cannot print a traceback containing a credential after restoration. Raw
 file-descriptor and binary-buffer writes remain prohibited by project discipline
 rather than intercepted by the stream wrapper.
 

@@ -1578,9 +1578,25 @@ def _main(argv: list[str] | None = None) -> int:
         return _error(exc, json_output)
 
 
+def _unexpected_error() -> int:
+    render.emit_error(f"ncl: {exits.RESPONSE[exits.ERROR]}")
+    return exits.ERROR
+
+
 def main(argv: list[str] | None = None) -> int:
-    with render.redacted_standard_streams():
-        return _main(argv)
+    try:
+        with render.redacted_standard_streams():
+            try:
+                return _main(argv)
+            except Exception:
+                # An interpreter traceback is formatted after the stream wrapper
+                # has restored the original streams, so it could expose a
+                # registered value.
+                return _unexpected_error()
+    except Exception:
+        # Cleanup failures happen after restoration and must not expose a
+        # traceback either.
+        return _unexpected_error()
 
 
 if __name__ == "__main__":
