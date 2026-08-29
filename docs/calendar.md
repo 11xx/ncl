@@ -215,3 +215,52 @@ instant is refused, as is an end that is not after the start. Update needs both
 boundaries stated together to convert between the two forms. Nothing infers a
 timezone or a local midnight from a date, and readback verifies the stored
 boundary kind rather than only the stamps.
+
+## Scheduling identity and role
+
+An event carrying `ORGANIZER` and `ATTENDEE` is a scheduling object: on a
+server that performs implicit scheduling, storing or deleting one causes the
+server to send iTIP messages to the other participants. Deciding whether such a
+write is permissible needs facts the ordinary principal model does not carry,
+so they live in a separate scheduling identity that ordinary reads never
+require.
+
+`ncl whoami --scheduling` resolves it. Discovery is authenticated,
+same-origin, and refuses before it reports:
+
+- The server must advertise `calendar-auto-schedule` in the `DAV` header of an
+  `OPTIONS` response for the principal. Without it the server sends nothing,
+  and a preview naming recipients at risk would describe a mechanism that is
+  not there.
+- The principal must return `calendar-user-address-set`,
+  `schedule-inbox-URL`, and `schedule-outbox-URL`. A property that is absent,
+  returned under a non-2xx status, empty, or pointing outside the configured
+  origin refuses.
+- Addresses are compared canonically: the scheme and domain are folded to
+  lower case and the local part is left as the server wrote it, because only
+  the domain is case-insensitive. A `mailto:` carrying headers, an address with
+  no single mailbox, and an invalid percent escape all refuse rather than being
+  trimmed into something that compares equal to a different mailbox.
+- The address set ordinarily mixes `mailto:` addresses with the principal's own
+  URL. The URLs are dropped, since nobody can be invited at one; a principal
+  with no `mailto:` address at all cannot hold a role and refuses here rather
+  than at every later comparison.
+
+The account holds exactly one role in an addressed resource: it is the
+organizer, or exactly one attendee, never both and never neither. Everything
+else leaves the role undecided, and an undecided role cannot bound who a write
+would contact:
+
+| Structure | Outcome |
+| --- | --- |
+| Organizer matches, no attendee does | organizer-owned; recipients at risk are the sorted unique attendees |
+| Exactly one attendee matches, organizer does not | attendee-owned; the organizer is the only recipient at risk |
+| Both organizer and an attendee match | refused as ambiguous |
+| Neither matches | refused |
+| Missing, repeated, or duplicated participants | refused |
+| A non-`mailto:` participant | refused |
+| `SCHEDULE-AGENT` other than `SERVER` on any participant | refused |
+
+`SCHEDULE-AGENT=CLIENT` or `NONE` moves delivery to the client or removes it.
+This tool neither performs delivery itself nor silently drops it, so it refuses
+the resource instead.

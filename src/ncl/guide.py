@@ -19,6 +19,9 @@ THE ORDER
   ncl login                     Browser consent, once. Prints a URL and waits.
   ncl whoami                    Prove the credential, and see which account and
                                 calendar home it actually reached.
+  ncl whoami --scheduling       Also resolve the scheduling addresses and boxes,
+                                which only a server that schedules has. Ordinary
+                                reads never need them, so this is opt-in.
   ncl logout                    Revoke server-side, then forget locally.
 
 FIND A CALENDAR BEFORE NAMING ONE

@@ -24,6 +24,7 @@ from . import (
     recurrence,
     render,
     runs,
+    scheduling,
     secrets,
     session,
     todos,
@@ -170,6 +171,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_options(logout_command)
 
     whoami = commands.add_parser("whoami", help="Show which account the credential reaches")
+    whoami.add_argument(
+        "--scheduling",
+        action="store_true",
+        help="Also resolve the scheduling addresses and boxes for this account",
+    )
     _add_options(whoami)
 
     cal = commands.add_parser("cal",
@@ -755,14 +761,35 @@ def _selected_profile(args: argparse.Namespace):
 
 
 def _run_whoami(args: argparse.Namespace) -> int:
+    """Report the account a credential reaches, and its scheduling identity on request.
+
+    Scheduling discovery is opt-in because a server without it, or a principal
+    without scheduling properties, still has a usable calendar home. Asking for
+    it unconditionally would make an absent optional feature look like a broken
+    credential.
+    """
     profile = _selected_profile(args)
-    result = identity.discover(profile)
+    authenticated = session.Session(profile)
+    result = identity.discover(profile, session=authenticated)
+    value = result.as_dict()
+    if args.scheduling:
+        value["scheduling"] = scheduling.discover(
+            profile, session=authenticated, identity=result
+        ).as_dict()
     if args.json:
-        _json(result.as_dict())
+        _json(value)
     else:
-        for key, value in result.as_dict().items():
-            render.emit(f"{key}: {value}")
+        for key, item in value.items():
+            if isinstance(item, dict):
+                for nested_key, nested in item.items():
+                    render.emit(f"{key}.{nested_key}: {_plain(nested)}")
+            else:
+                render.emit(f"{key}: {_plain(item)}")
     return exits.OK
+
+
+def _plain(value: Any) -> str:
+    return ", ".join(str(item) for item in value) if isinstance(value, list) else str(value)
 
 
 def _moment(value: str, label: str) -> datetime.datetime:
@@ -1567,6 +1594,7 @@ def _main(argv: list[str] | None = None) -> int:
         secrets.SecretError,
         session.SessionError,
         identity.IdentityError,
+        scheduling.SchedulingError,
         caldav.CalendarError,
         events.EventError,
         todos.TodoError,
