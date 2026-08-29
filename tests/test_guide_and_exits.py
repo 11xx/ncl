@@ -98,3 +98,39 @@ def test_guide_notes_refid_repeatability():
     # The checkpoint repair made generic VTODO reads accept duplicate REFID
     # while run validation still requires exactly one parameter-free REFID.
     assert "Singleton VTODO properties cannot repeat except REFID" in text
+
+
+def test_a_refusal_names_both_what_happened_and_what_to_do(capsys):
+    """The exit code's answer reaches a terminal caller, not only `--json`.
+
+    A number alone is only actionable to someone holding the table it indexes,
+    and nothing puts that table in front of a person reading stderr.
+    """
+    assert cli.main(["whoami"]) == exits.NOT_CONFIGURED
+
+    rendered = capsys.readouterr().err
+    assert "configuration file not found" in rendered
+    assert exits.RESPONSE[exits.NOT_CONFIGURED] in rendered
+
+
+def test_a_refusal_with_no_message_of_its_own_is_said_once(capsys):
+    """The two halves collapse rather than printing the same sentence twice."""
+    assert cli._error(RuntimeError("opaque"), json_output=False) == exits.ERROR
+
+    lines = [line for line in capsys.readouterr().err.splitlines() if line.strip()]
+    assert lines == [f"ncl: {exits.RESPONSE[exits.ERROR]}"]
+
+
+def test_the_conflict_response_holds_for_every_situation_that_raises_it():
+    """One code covers four kinds of refusal, so its answer may not assume one.
+
+    A 412 is re-read and re-planned. A local output path that already exists, a
+    run whose authoring is frozen, and a stored credential that will not be
+    replaced implicitly have nothing to re-read, and telling their callers to
+    read again sends them in a circle.
+    """
+    response = exits.RESPONSE[exits.CONFLICT].lower()
+
+    assert "etag" not in response
+    assert "read it again" not in response
+    assert "nothing was overwritten" in response

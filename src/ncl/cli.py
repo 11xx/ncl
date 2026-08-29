@@ -715,14 +715,27 @@ def _json(value: Any) -> None:
 
 
 def _error(exc: Exception, json_output: bool) -> int:
+    """Report a refusal as what happened, then what to do about it.
+
+    Both readers get both halves. The message says what this command hit; the
+    response is the exit code's standing answer, which is the contract `ncl
+    doctor --json` publishes. Emitting only the message left a terminal caller
+    holding a number whose meaning lived in a table it was never shown.
+
+    The two collapse into one line when a refusal has no message of its own,
+    because the response is then already what was printed.
+    """
     code = getattr(exc, "code", exits.ERROR)
     message = getattr(exc, "message", None)
     if not isinstance(message, str) or not message:
         message = exits.RESPONSE.get(code, "The command failed.")
+    response = exits.RESPONSE.get(code)
     if json_output:
-        _json({"error": message, "code": code, "response": exits.RESPONSE.get(code)})
+        _json({"error": message, "code": code, "response": response})
     else:
         render.emit_error(f"ncl: {message}")
+        if response and response != message:
+            render.emit_error(f"ncl: {response}")
     return code
 
 
