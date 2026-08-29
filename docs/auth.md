@@ -73,7 +73,7 @@ naming the value.
 
 Secret backends distinguish an absent entry from an unusable backend. `pass`
 reports absence with its explicit “not in the password store” result, while
-Secret Service reports it with an empty successful lookup. Decryption,
+Secret Service reports a lookup miss without a value. Decryption,
 agent, service, and other backend failures remain failures, so `ncl doctor`
 directs the caller to repair the backend rather than treating the credential
 as absent. A record that is present but undecodable is neither: it is reported
