@@ -398,6 +398,40 @@ def test_whoami_without_the_flag_asks_nothing_about_scheduling(monkeypatch, tmp_
     assert "scheduling" not in capsys.readouterr().out
 
 
+def test_whoami_renders_the_scheduling_identity_for_a_person(monkeypatch, tmp_path, capsys):
+    """The human path flattens the nested identity instead of printing a dict.
+
+    A rendered `{'addresses': [...]}` is the shape of the JSON output leaking
+    into the output that exists because the caller did not ask for JSON.
+    """
+    code, _ = _run(
+        monkeypatch,
+        tmp_path,
+        ["whoami", "--scheduling"],
+        [
+            principal_response(),
+            home_response(),
+            options_response(),
+            scheduling_response(
+                addresses=(
+                    "<d:href>mailto:alice@example.invalid</d:href>"
+                    "<d:href>mailto:a.liddell@example.invalid</d:href>"
+                )
+            ),
+        ],
+    )
+
+    assert code == exits.OK
+    rendered = capsys.readouterr().out
+    assert "account_name: alice" in rendered
+    assert (
+        "scheduling.addresses: mailto:a.liddell@example.invalid, "
+        "mailto:alice@example.invalid" in rendered
+    )
+    assert "scheduling.schedule_inbox: https://" in rendered
+    assert "[" not in rendered
+
+
 def test_whoami_scheduling_refusal_keeps_its_exit_code(monkeypatch, tmp_path):
     code, _ = _run(
         monkeypatch,
