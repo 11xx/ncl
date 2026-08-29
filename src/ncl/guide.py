@@ -267,7 +267,9 @@ WHAT IT REFUSES
   request outside it is refused here or nowhere.
 
   Every command takes `--json`. Exit codes are the contract and say what to do
-  next: configure, log in, re-read, reconcile, or stop. `ncl doctor --json`
+  next: configure, log in, re-read, reconcile, or stop. A refusal prints what
+  happened and then that standing answer, so a caller reading stderr is not
+  left holding a number whose meaning lives in a table it was never shown. `ncl doctor --json`
   ships the chosen exit code and remediation alongside the checks it ran.
   Remote credential, server, and malformed-response failures retain their
   actionable codes instead of becoming a generic local failure.
