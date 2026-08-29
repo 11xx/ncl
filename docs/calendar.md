@@ -23,10 +23,16 @@ DATE-TIME, and `VALUE=DATE` identities remain distinct and reusable.
 
 The expansion combines `DTSTART`, one `RRULE`, repeatable DATE or DATE-TIME
 `RDATE`, and repeatable `EXDATE`. It de-duplicates equivalent identities and
-never silently truncates a result. `EXRULE`, period-valued `RDATE`, multiple
-`RRULE` properties, incompatible value kinds or timezones, malformed master or
-override structures, and an expansion over the fixed safety ceiling are
-refused before a plan is created.
+never silently truncates a result. A DATE `DTSTART` without `DTEND` or
+`DURATION` occupies one day; an explicit `DTEND` keeps its exact duration, and
+`DURATION` keeps its nominal calendar duration. TZID boundaries and every
+generated TZID occurrence must identify exactly one local instant, so ambiguous
+and nonexistent local times are refused. DATE rules cannot use sub-day
+frequencies, time-valued BY parts, or a DATE-TIME `UNTIL`. `EXRULE`,
+period-valued `RDATE`, multiple `RRULE` properties, incompatible value kinds or
+timezones, malformed master or override structures, unsupported nested
+components, and an expansion over the fixed safety ceiling are refused before
+a plan is created.
 
 Every calendar update and deletion names `--target resource`, `series`,
 `occurrence`, or `this-and-future`. Occurrence and future-split targets also
@@ -54,6 +60,10 @@ identities and explicit properties. The plan creates the future resource with
 the preview warns that a partial failure may temporarily duplicate future
 occurrences. The generic plan resume, uncertainty, and reconciliation lifecycle
 handles the resulting ordered steps.
+
+Splitting preserves the master’s duration form. A future resource with an
+explicit `DTEND` receives the same exact duration at its new start; a resource
+with `DURATION` retains that property and its nominal day/time semantics.
 
 Organizer and attendee structures remain refused throughout this slice.
 

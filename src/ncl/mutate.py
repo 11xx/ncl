@@ -807,7 +807,7 @@ def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, An
 
     try:
         stored, stored_raw = events.fetch(profile, session=session, href=target)
-    except (EventError, SessionError) as exc:
+    except (EventError, SessionError, ValueError, IndexError, TypeError) as exc:
         raise EventError(
             f"the server accepted {step.action}, but its readback could not be verified",
             exits.OUTCOME_UNCERTAIN,
@@ -831,11 +831,23 @@ def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, An
     for field in ("url", "status"):
         if field in step.details and getattr(stored, field) != step.details[field]:
             mismatches.append(f"{field} {getattr(stored, field)!r} != {step.details[field]!r}")
-    if _semantic_calendar(stored_raw) != _semantic_calendar(plans.payload_bytes(step)):
+    try:
+        semantic_matches = _semantic_calendar(stored_raw) == _semantic_calendar(
+            plans.payload_bytes(step)
+        )
+        portable_matches = True
+        if step.details.get("portable_description"):
+            expected_description = _description_from_raw(plans.payload_bytes(step))
+            portable_matches = _description_from_raw(stored_raw) == expected_description
+    except (EventError, ValueError, IndexError, TypeError) as exc:
+        raise EventError(
+            f"the server accepted {step.action}, but its readback could not be verified",
+            exits.OUTCOME_UNCERTAIN,
+        ) from exc
+    if not semantic_matches:
         mismatches.append("semantic iCalendar content differs from the planned resource")
     if step.details.get("portable_description"):
-        expected_description = _description_from_raw(plans.payload_bytes(step))
-        if _description_from_raw(stored_raw) != expected_description:
+        if not portable_matches:
             mismatches.append("portable description differs from the planned projection")
         result["portable_description_verified"] = True
     result["verified"] = not mismatches

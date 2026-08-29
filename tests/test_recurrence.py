@@ -747,3 +747,299 @@ def test_plan_json_does_not_echo_recurrence_payload():
     rendered = json.dumps(plan.as_dict())
     assert "X-OVERRIDE-KEEP" not in rendered
     assert "BEGIN:VCALENDAR" not in rendered
+
+
+def _single_event_calendar(event: bytes) -> bytes:
+    return (
+        b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//probe//EN\r\n"
+        + event
+        + b"END:VCALENDAR\r\n"
+    )
+
+
+def _probe_event(body: bytes) -> bytes:
+    return (
+        b"BEGIN:VEVENT\r\nUID:probe@example.invalid\r\nSUMMARY:Probe\r\n"
+        + body
+        + b"END:VEVENT\r\n"
+    )
+
+
+def test_dtend_duration_remains_exact_across_a_dst_transition():
+    raw = _single_event_calendar(
+        _probe_event(
+            b"DTSTART;TZID=America/New_York:20260307T013000\r\n"
+            b"DTEND;TZID=America/New_York:20260307T033000\r\n"
+            b"DTSTAMP:20260817T120000Z\r\n"
+            b"SEQUENCE:0\r\n"
+            b"RRULE:FREQ=DAILY;COUNT=3\r\n"
+        )
+    )
+    found = recurrence._resource_occurrences(
+        _resource(raw),
+        dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        dt.datetime(2026, 12, 31, tzinfo=dt.UTC),
+    )
+
+    assert [(item.effective_start, item.effective_end) for item in found] == [
+        ("20260307T063000Z", "20260307T083000Z"),
+        ("20260308T063000Z", "20260308T083000Z"),
+        ("20260309T053000Z", "20260309T073000Z"),
+    ]
+
+
+def test_future_split_preserves_nominal_duration_and_unrelated_bytes():
+    raw = _single_event_calendar(
+        _probe_event(
+            b"SUMMARY:Nominal duration\r\n"
+            b"DTSTART;TZID=America/New_York:20260307T090000\r\n"
+            b"DURATION:P1D\r\n"
+            b"DTSTAMP:20260817T120000Z\r\n"
+            b"SEQUENCE:0\r\n"
+            b"RRULE:FREQ=DAILY;COUNT=3\r\n"
+            b"X-MASTER-KEEP:yes\r\n"
+        )
+    )
+    plan = mutate.plan_update(
+        PROFILE,
+        session=Transport(Response(200, raw, etag='"v1"')),
+        href=RESOURCE,
+        target="this-and-future",
+        recurrence_id="TZID=America/New_York:20260308T090000",
+        changes={"SUMMARY": "Future duration"},
+    )
+
+    new_payload = plans.payload_bytes(plan.steps[0])
+    assert b"DURATION:P1D\r\n" in new_payload
+    assert b"DTEND" not in new_payload
+    assert b"X-MASTER-KEEP:yes\r\n" in new_payload
+
+
+def test_all_day_recurrence_without_end_uses_the_default_one_day_duration():
+    raw = _single_event_calendar(
+        _probe_event(
+            b"DTSTART;VALUE=DATE:20260901\r\n"
+            b"DTSTAMP:20260817T120000Z\r\n"
+            b"SEQUENCE:0\r\n"
+            b"RRULE:FREQ=DAILY;COUNT=2\r\n"
+        )
+    )
+    found = recurrence._resource_occurrences(
+        _resource(raw),
+        dt.datetime(2026, 9, 1, tzinfo=dt.UTC),
+        dt.datetime(2026, 9, 3, tzinfo=dt.UTC),
+    )
+
+    assert [(item.recurrence_id, item.effective_start, item.effective_end) for item in found] == [
+        ("VALUE=DATE:20260901", "20260901", "20260902"),
+        ("VALUE=DATE:20260902", "20260902", "20260903"),
+    ]
+
+
+def test_count_split_retains_explicit_dtstart_before_the_first_rrule_value():
+    raw = _single_event_calendar(
+        _probe_event(
+            b"DTSTART:20260901T090000Z\r\n"
+            b"DTEND:20260901T100000Z\r\n"
+            b"DTSTAMP:20260817T120000Z\r\n"
+            b"SEQUENCE:0\r\n"
+            b"RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=2\r\n"
+        )
+    )
+    plan = mutate.plan_update(
+        PROFILE,
+        session=Transport(Response(200, raw, etag='"v1"')),
+        href=RESOURCE,
+        target="this-and-future",
+        recurrence_id="20260907T090000Z",
+        changes={"SUMMARY": "Future"},
+    )
+
+    assert [step.action for step in plan.steps] == ["cal.create", "cal.update"]
+    assert b"DTSTART:20260901T090000Z\r\n" in plans.payload_bytes(plan.steps[1])
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "kind"),
+    [
+        (
+            b"DTSTART;TZID=America/New_York:20261101T013000\r\n",
+            b"DTEND;TZID=America/New_York:20261101T023000\r\n",
+            "ambiguous",
+        ),
+        (
+            b"DTSTART;TZID=America/New_York:20260308T023000\r\n",
+            b"DTEND;TZID=America/New_York:20260308T033000\r\n",
+            "nonexistent",
+        ),
+    ],
+)
+def test_ambiguous_and_nonexistent_tzid_boundaries_are_refused(start, end, kind):
+    raw = _single_event_calendar(
+        _probe_event(
+            start
+            + end
+            + b"DTSTAMP:20260817T120000Z\r\n"
+            + b"SEQUENCE:0\r\n"
+            + b"RRULE:FREQ=DAILY;COUNT=2\r\n"
+        )
+    )
+
+    with pytest.raises(recurrence.RecurrenceError, match=kind) as error:
+        _resource(raw)
+    assert error.value.code == exits.UNSUPPORTED_STRUCTURE
+
+
+def test_generated_tzid_gap_is_refused_during_expansion():
+    raw = _single_event_calendar(
+        _probe_event(
+            b"DTSTART;TZID=America/New_York:20260307T023000\r\n"
+            b"DTEND;TZID=America/New_York:20260307T033000\r\n"
+            b"DTSTAMP:20260817T120000Z\r\n"
+            b"SEQUENCE:0\r\n"
+            b"RRULE:FREQ=DAILY;COUNT=2\r\n"
+        )
+    )
+
+    with pytest.raises(recurrence.RecurrenceError, match="nonexistent"):
+        recurrence._resource_occurrences(
+            _resource(raw),
+            dt.datetime(2026, 3, 1, tzinfo=dt.UTC),
+            dt.datetime(2026, 3, 12, tzinfo=dt.UTC),
+        )
+
+
+def test_override_boundaries_must_match_master_kind_and_timezone():
+    raw = _single_event_calendar(
+        _probe_event(
+            b"DTSTART;TZID=America/New_York:20260901T090000\r\n"
+            b"DTEND;TZID=America/New_York:20260901T100000\r\n"
+            b"DTSTAMP:20260817T120000Z\r\n"
+            b"SEQUENCE:0\r\n"
+            b"RRULE:FREQ=DAILY;COUNT=2\r\n"
+        )
+        + _probe_event(
+            b"SUMMARY:Moved\r\n"
+            b"DTSTART;TZID=America/Los_Angeles:20260902T090000\r\n"
+            b"DTEND;TZID=America/Los_Angeles:20260902T100000\r\n"
+            b"DTSTAMP:20260817T120000Z\r\n"
+            b"SEQUENCE:0\r\n"
+            b"RECURRENCE-ID;TZID=America/New_York:20260902T090000\r\n"
+        )
+    )
+
+    with pytest.raises(recurrence.RecurrenceError, match="boundaries") as error:
+        _resource(raw)
+    assert error.value.code == exits.UNSUPPORTED_STRUCTURE
+
+
+def test_floating_override_is_refused_before_occurrence_planning():
+    raw = _single_event_calendar(
+        _probe_event(
+            b"DTSTART:20260901T090000Z\r\n"
+            b"DTEND:20260901T100000Z\r\n"
+            b"DTSTAMP:20260817T120000Z\r\n"
+            b"SEQUENCE:0\r\n"
+            b"RRULE:FREQ=DAILY;COUNT=2\r\n"
+        )
+        + _probe_event(
+            b"SUMMARY:Floating\r\n"
+            b"DTSTART:20260902T090000\r\n"
+            b"DTEND:20260902T100000\r\n"
+            b"DTSTAMP:20260817T120000Z\r\n"
+            b"SEQUENCE:0\r\n"
+            b"RECURRENCE-ID:20260902T090000Z\r\n"
+        )
+    )
+
+    with pytest.raises(recurrence.RecurrenceError, match="floating") as error:
+        _resource(raw)
+    assert error.value.code == exits.UNSUPPORTED_STRUCTURE
+
+
+def test_occurrence_update_cannot_change_a_timed_master_to_a_date_exception():
+    raw = _single_event_calendar(
+        _probe_event(
+            b"DTSTART:20260901T090000Z\r\n"
+            b"DTEND:20260901T100000Z\r\n"
+            b"DTSTAMP:20260817T120000Z\r\n"
+            b"SEQUENCE:0\r\n"
+            b"RRULE:FREQ=DAILY;COUNT=2\r\n"
+        )
+    )
+
+    with pytest.raises(recurrence.RecurrenceError, match="boundaries") as error:
+        mutate.plan_update(
+            PROFILE,
+            session=Transport(Response(200, raw, etag='"v1"')),
+            href=RESOURCE,
+            target="occurrence",
+            recurrence_id="20260902T090000Z",
+            changes={"DTSTART": dt.date(2026, 9, 2), "DTEND": dt.date(2026, 9, 3)},
+        )
+    assert error.value.code == exits.UNSUPPORTED_STRUCTURE
+
+
+@pytest.mark.parametrize("rule", ["FREQ=HOURLY;COUNT=3", "FREQ=DAILY;UNTIL=20260903T000000Z"])
+def test_date_recurrences_reject_time_based_rrule_forms(rule):
+    raw = _single_event_calendar(
+        _probe_event(
+            b"DTSTART;VALUE=DATE:20260901\r\n"
+            b"DTEND;VALUE=DATE:20260902\r\n"
+            b"DTSTAMP:20260817T120000Z\r\n"
+            b"SEQUENCE:0\r\n"
+            + f"RRULE:{rule}\r\n".encode()
+        )
+    )
+
+    with pytest.raises(recurrence.RecurrenceError, match="DATE") as error:
+        _resource(raw)
+    assert error.value.code == exits.UNSUPPORTED_STRUCTURE
+
+
+def test_nested_unsupported_component_is_refused_before_planning():
+    raw = _single_event_calendar(
+        _probe_event(
+            b"DTSTART:20260901T090000Z\r\n"
+            b"DTEND:20260901T100000Z\r\n"
+            b"DTSTAMP:20260817T120000Z\r\n"
+            b"SEQUENCE:0\r\n"
+            b"RRULE:FREQ=DAILY;COUNT=2\r\n"
+            b"BEGIN:VTODO\r\n"
+            b"UID:nested@example.invalid\r\n"
+            b"SUMMARY:Nested\r\n"
+            b"END:VTODO\r\n"
+        )
+    )
+
+    with pytest.raises(recurrence.RecurrenceError, match="VTODO") as error:
+        _resource(raw)
+    assert error.value.code == exits.UNSUPPORTED_STRUCTURE
+
+
+def test_malformed_post_write_readback_records_uncertainty():
+    plan = mutate.plan_update(
+        PROFILE,
+        session=_get(),
+        href=RESOURCE,
+        target="series",
+        changes={"SUMMARY": "Updated"},
+    )
+    malformed = (
+        b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//probe//EN\r\n"
+        b"BEGIN:VEVENT\r\nUID:series@example.invalid\r\nSUMMARY:Updated\r\n"
+        b"DTSTART:TZID=America/New_York:20260901T090000\r\n"
+        b"DTEND:20260901T100000Z\r\nDTSTAMP:20260817T120000Z\r\n"
+        b"SEQUENCE:1\r\nRRULE:FREQ=DAILY;COUNT=2\r\nEND:VEVENT\r\n"
+        b"END:VCALENDAR\r\n"
+    )
+    transport = Transport(Response(204), Response(200, malformed, etag='"v2"'))
+
+    with plans.claim(plan.plan_id), pytest.raises(events.EventError) as error:
+        plans.apply(PROFILE, session=transport, plan=plan, dispatchers=cli._dispatchers())
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+    stored = plans.read(plan.plan_id)
+    assert [(item.state, item.exit_code) for item in stored.progress] == [
+        ("uncertain", exits.OUTCOME_UNCERTAIN)
+    ]
