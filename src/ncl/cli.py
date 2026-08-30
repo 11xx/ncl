@@ -27,6 +27,7 @@ from . import (
     render,
     runs,
     scheduling,
+    search,
     secrets,
     session,
     shares,
@@ -702,6 +703,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_options(files_list)
     files_list.add_argument("href", help="Collection href under an allowlisted files root")
+
+    files_find = file_subcommands.add_parser(
+        "find",
+        help="Search a subtree server-side instead of walking it",
+    )
+    _add_options(files_find)
+    files_find.add_argument("collection", help="Collection href to search under")
+    files_find.add_argument("--name", help="Name pattern; * and ? are the wildcards")
+    files_find.add_argument("--content-type", help="Exact media type")
+    files_find.add_argument(
+        "--modified-since", help="Instant, ISO 8601 with an offset"
+    )
+    files_find.add_argument("--limit", type=int, help="Most results to return")
 
     files_stat = file_subcommands.add_parser("stat", help="Read one resource's metadata")
     _add_options(files_stat)
@@ -1672,6 +1686,25 @@ def _run_files(args: argparse.Namespace) -> int:
                 size = "-" if reference.size is None else str(reference.size)
                 render.emit(f"{kind} {size:>10}  {reference.name}")
                 render.emit(f"              {reference.href}")
+        return exits.OK
+
+    if args.files_command == "find":
+        found = search.find(
+            profile,
+            session=transport,
+            href=args.collection,
+            name=args.name,
+            content_type=args.content_type,
+            modified_since=args.modified_since,
+            limit=args.limit,
+        )
+        if args.json:
+            _json({"files": [item.as_dict() for item in found]})
+        else:
+            for item in found:
+                kind = "d" if item.collection else "f"
+                size = "-" if item.size is None else str(item.size)
+                render.emit(f"{kind} {size:>10}  {item.href}")
         return exits.OK
 
     if args.files_command == "stat":
