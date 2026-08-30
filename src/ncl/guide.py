@@ -42,6 +42,7 @@ READ
   ncl cal occurrences <calendar> --from <iso> --to <iso>
   ncl cal show <event-href>
   ncl cal collection <calendar>
+  ncl cal freebusy --from <iso> --to <iso> [--attendee mailto:...]
 
   The window is required, and times need an explicit UTC offset: a local time
   is ambiguous across one DST transition each year and nonexistent across the
@@ -59,6 +60,16 @@ READ
   or nonexistent TZID local boundaries and generated occurrences are refused.
   Generic event references still mark recurrence and scheduling structure as
   unwritable; only the explicit target modes below may edit a recurring resource.
+  `cal freebusy` asks the scheduling outbox when someone is busy. It is a read
+  — nothing is stored and nobody is notified — so it needs no plan and no
+  consent, but it does need scheduling addresses, which a server derives from
+  an account's email address. Named with no attendee the question is about this
+  account. An answer reports intervals and their transparency and nothing else,
+  because the server is answering for a calendar the caller may not read. A
+  recipient the server declined to answer for is reported as unanswered and
+  never as an empty schedule: those two readings differ by exactly the meeting
+  the answer would be used to book.
+
   `cal collection` answers what a calendar is rather than how to address it:
   its description, its colour as the server spells it, and the component set it
   accepts. That set is worth reading before writing into a collection someone

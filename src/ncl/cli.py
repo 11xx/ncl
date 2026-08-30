@@ -15,6 +15,7 @@ from . import (
     events,
     exits,
     files,
+    freebusy,
     guide,
     identity,
     login,
@@ -222,6 +223,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cal_occurrences.add_argument(
         "--to", dest="end", required=True, help="End instant, ISO 8601 with an offset"
+    )
+
+    cal_freebusy = cal_commands.add_parser(
+        "freebusy",
+        help="Ask the scheduling outbox when someone is busy; contacts nobody",
+    )
+    _add_options(cal_freebusy)
+    cal_freebusy.add_argument(
+        "--from", dest="start", required=True, help="Start instant, ISO 8601 with an offset"
+    )
+    cal_freebusy.add_argument(
+        "--to", dest="end", required=True, help="End instant, ISO 8601 with an offset"
+    )
+    cal_freebusy.add_argument(
+        "--attendee",
+        action="append",
+        default=[],
+        metavar="MAILTO",
+        help="Calendar user address to ask about; repeatable, defaults to this account",
     )
 
     cal_show = cal_commands.add_parser(
@@ -1086,6 +1106,31 @@ def _run_cal(args: argparse.Namespace) -> int:
                     f"{item.recurrence_id}{cancelled}"
                 )
                 render.emit(f"      {item.href}")
+        return exits.OK
+
+    if args.cal_command == "freebusy":
+        who = identity.discover(profile, session=transport)
+        schedule = scheduling.discover(profile, session=transport, identity=who)
+        answers = freebusy.query(
+            profile,
+            session=transport,
+            scheduling=schedule,
+            start=_moment(args.start, "--from"),
+            end=_moment(args.end, "--to"),
+            attendees=tuple(args.attendee),
+        )
+        if args.json:
+            _json({"freebusy": [answer.as_dict() for answer in answers]})
+        else:
+            for answer in answers:
+                render.emit(f"{answer.recipient}  {answer.request_status}")
+                if not answer.answered:
+                    render.emit("      unanswered")
+                    continue
+                if not answer.periods:
+                    render.emit("      free for the whole window")
+                for period in answer.periods:
+                    render.emit(f"      {period.start} .. {period.end}  {period.kind}")
         return exits.OK
 
     if args.cal_command == "show":
