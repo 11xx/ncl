@@ -76,6 +76,29 @@ READ
   else made — most servers fix it at creation, so a calendar without VTODO can
   never host a task.
 
+SEE AND CHANGE WHO ELSE CAN REACH A FILE
+  ncl share list [<href>] [--subfiles]
+  ncl share show <id>
+  ncl share create <href> (--public | --user <uid> | --group <gid>)
+  ncl share delete <id>
+
+  A share is the only mutation here that hands a resource to somebody else, and
+  it is invisible from the resource itself: reading the file afterwards looks
+  the same whether or not the world can also read it. So creating one is
+  planned and applied like a write, and the preview names who would gain access
+  and at what permission.
+
+  An unscoped listing reports every share this account made, including over
+  paths the allowlist does not admit and types this tool cannot create. The
+  allowlist bounds what may be reached; a listing that hid a public link
+  because its path was unconfigured would answer the wrong question.
+
+  A link password comes from `--password-from <file>`, never an argument, and
+  its length is withheld from plan output along with its value. `--permissions`
+  grants `read` unless told otherwise, and applying reports any permission the
+  server granted beyond the plan — Nextcloud adds the share bit to every public
+  link.
+
 WORK WITH TASKS
   ncl task list <calendar> [--status <status>]
   ncl task show <task-href>
