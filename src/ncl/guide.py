@@ -44,8 +44,11 @@ READ
 
   The window is required, and times need an explicit UTC offset: a local time
   is ambiguous across one DST transition each year and nonexistent across the
-  other. JSON event references include `url` and `status`, using an empty value
-  when the VEVENT property is absent. Human `cal show` displays the URL, while
+  other. JSON event references carry every property a write can set — `url`,
+  `status`, `location`, `description`, `categories`, `priority`, `class`,
+  `transp`, `color`, `related_to`, and `alarms` — unfolded and unescaped, using
+  an empty value when the VEVENT property is absent, so a mutation can be read
+  back without parsing the raw `icalendar` blob. Human `cal show` displays the URL, while
   a cancelled event is marked in a human listing without putting links on every
   row. `cal occurrences` expands validated recurring resources in the bounded
   window and emits the exact reusable `RECURRENCE-ID` wire identity, including

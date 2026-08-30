@@ -67,6 +67,25 @@ with `DURATION` retains that property and its nominal day/time semantics.
 
 Organizer and attendee structures remain refused throughout this slice.
 
+## Event content fields
+
+An event reference carries every property `cal create` and `cal update` can
+write, as typed values beside the raw `icalendar` blob: `location`,
+`description`, `categories`, `priority`, `class`, `transp`, `color`,
+`related_to`, and `alarms`, alongside `summary`, `url`, and `status`. Absence is
+an empty string, an empty list, or — for `priority` — `null`, so an unset
+property is distinguishable from one set to an empty or undefined value.
+
+The typed view exists because the alternative is wrong more often than it
+looks. RFC 5545 folds a line longer than 75 octets onto continuation lines and
+escapes `,`, `;`, and newlines inside text values, so a reader that matches on
+lines returns a truncated string and reports it as the stored value. `alarms`
+holds each `VALARM` trigger in the spelling `--alarm` accepts, so a reminder
+read back can be written again unchanged; a trigger stored as an absolute
+instant is reported as that instant rather than disguised as an offset.
+Repeated or comma-separated `CATEGORIES` flatten into one tag list, since both
+spellings denote the same set.
+
 ## Reminders
 
 An update with neither alarm option preserves every existing `VALARM`. Repeating

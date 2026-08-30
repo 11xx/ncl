@@ -59,6 +59,15 @@ class EventRef:
     summary: str
     url: str
     status: str
+    location: str
+    description: str
+    categories: tuple[str, ...]
+    priority: int | None
+    classification: str
+    transp: str
+    color: str
+    related_to: tuple[str, ...]
+    alarms: tuple[str, ...]
     start: str
     end: str
     all_day: bool
@@ -75,6 +84,15 @@ class EventRef:
             "summary": self.summary,
             "url": self.url,
             "status": self.status,
+            "location": self.location,
+            "description": self.description,
+            "categories": list(self.categories),
+            "priority": self.priority,
+            "class": self.classification,
+            "transp": self.transp,
+            "color": self.color,
+            "related_to": list(self.related_to),
+            "alarms": list(self.alarms),
             "start": self.start,
             "end": self.end,
             "all_day": self.all_day,
@@ -115,6 +133,70 @@ def _first_vevent(calendar: icalendar.Calendar) -> Any:
 def _component_text(component: Any, name: str) -> str:
     value = component.get(name)
     return str(value) if value is not None else ""
+
+
+def _text_values(component: Any, name: str) -> tuple[Any, ...]:
+    """Return every occurrence of one property, whether or not it repeats."""
+    value = component.get(name)
+    if value is None:
+        return ()
+    return tuple(value) if isinstance(value, list) else (value,)
+
+
+def _categories(component: Any) -> tuple[str, ...]:
+    """Flatten CATEGORIES into its member tags.
+
+    One CATEGORIES property holds a comma-separated list, and the property may
+    repeat. Both spellings mean the same set of tags, so both flatten to one.
+    """
+    found: list[str] = []
+    for value in _text_values(component, "CATEGORIES"):
+        items = getattr(value, "cats", None)
+        if items is None:
+            found.append(str(value))
+            continue
+        found.extend(str(item) for item in items)
+    return tuple(found)
+
+
+def _priority(component: Any) -> int | None:
+    """Return PRIORITY as a number, or ``None`` when the event carries none.
+
+    Absence is not zero: RFC 5545 gives 0 the meaning "undefined", which is
+    also what an absent property means, and a caller distinguishing "unset"
+    from "explicitly undefined" cannot do it from an integer alone.
+    """
+    value = component.get("PRIORITY")
+    if value is None:
+        return None
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _alarms(component: Any) -> tuple[str, ...]:
+    """Return each VALARM trigger in the spelling ``--alarm`` accepts.
+
+    A relative trigger renders as the duration it was written with, so a
+    reminder read back can be passed straight to ``--alarm``. An absolute
+    trigger renders as its UTC instant instead, which this tool cannot write
+    but must not misreport as an offset.
+    """
+    triggers: list[str] = []
+    for child in getattr(component, "subcomponents", ()):
+        if getattr(child, "name", "") != "VALARM":
+            continue
+        trigger = child.get("TRIGGER")
+        if trigger is None:
+            continue
+        raw = trigger.to_ical() if hasattr(trigger, "to_ical") else str(trigger).encode()
+        triggers.append(raw.decode("utf-8", "replace"))
+    return tuple(triggers)
+
+
+def _related_to(component: Any) -> tuple[str, ...]:
+    return tuple(str(value) for value in _text_values(component, "RELATED-TO"))
 
 
 def _value_kind(value: Any) -> str | None:
@@ -233,6 +315,15 @@ def _describe(raw: bytes, *, calendar_href: str, href: str, etag: str) -> EventR
         summary=_component_text(component, "SUMMARY"),
         url=_component_text(component, "URL"),
         status=_component_text(component, "STATUS"),
+        location=_component_text(component, "LOCATION"),
+        description=_component_text(component, "DESCRIPTION"),
+        categories=_categories(component),
+        priority=_priority(component),
+        classification=_component_text(component, "CLASS"),
+        transp=_component_text(component, "TRANSP"),
+        color=_component_text(component, "COLOR"),
+        related_to=_related_to(component),
+        alarms=_alarms(component),
         start=_utc(start_value) if start_value is not None else "",
         end=_utc(end_value) if end_value is not None else "",
         all_day=isinstance(start_value, dt.date) and not isinstance(start_value, dt.datetime),
