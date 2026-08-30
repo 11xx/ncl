@@ -76,6 +76,27 @@ READ
   else made — most servers fix it at creation, so a calendar without VTODO can
   never host a task.
 
+UNDO A DELETION OR AN OVERWRITE
+  ncl trash list
+  ncl trash restore <trash-href>
+  ncl trash purge <trash-href>
+  ncl versions list <file-href>
+  ncl versions restore <file-href> <version-id>
+
+  The allowlist question here is the inverted one: a trash entry lives under
+  `/trashbin/`, which nothing allowlists, so what is bounded is where the file
+  came from and where restoring would put it back. An entry from outside the
+  allowlist is listed — seeing what was deleted is a read — and never restored.
+
+  A restore onto an occupied path is refused before anything is sent: the
+  server would restore beside the occupant under a name nobody asked for, so
+  the plan could not keep its promise. Move what is there first.
+
+  `trash purge` is the narrowest gate in the tool. Everything else leaves a
+  copy somewhere; this removes the last one, and the bin is where the remedy
+  for every other deletion lives. Restoring a version, by contrast, is safe:
+  the content it replaces becomes a version in turn.
+
 SEE AND CHANGE WHO ELSE CAN REACH A FILE
   ncl share list [<href>] [--subfiles]
   ncl share show <id>

@@ -24,6 +24,7 @@ from . import (
     ocs,
     plans,
     profiles,
+    recovery,
     recurrence,
     render,
     runs,
@@ -806,6 +807,50 @@ def build_parser() -> argparse.ArgumentParser:
     _add_options(files_delete)
     files_delete.add_argument("href", help="File href; collection deletion is refused")
 
+    trash = commands.add_parser(
+        "trash",
+        help="See, restore, or destroy what was deleted",
+        description=(
+            "The trash bin is where every deletion this tool makes can be taken back "
+            "from. Restoring and purging are planned and applied; purging is terminal."
+        ),
+    )
+    trash_commands = trash.add_subparsers(dest="trash_command", metavar="<subcommand>")
+
+    trash_list = trash_commands.add_parser("list", help="List everything in the trash bin")
+    _add_options(trash_list)
+
+    trash_restore = trash_commands.add_parser(
+        "restore", help="Plan a restoration to where the file came from"
+    )
+    _add_options(trash_restore)
+    trash_restore.add_argument("href", help="Trash entry href, as a listing reports it")
+
+    trash_purge = trash_commands.add_parser(
+        "purge", help="Plan a permanent destruction; there is nothing further back"
+    )
+    _add_options(trash_purge)
+    trash_purge.add_argument("href", help="Trash entry href, as a listing reports it")
+
+    versions = commands.add_parser(
+        "versions",
+        help="See and restore earlier revisions of a file",
+    )
+    version_commands = versions.add_subparsers(
+        dest="versions_command", metavar="<subcommand>"
+    )
+
+    versions_list = version_commands.add_parser("list", help="List one file's revisions")
+    _add_options(versions_list)
+    versions_list.add_argument("href", help="File href, inside the files allowlist")
+
+    versions_restore = version_commands.add_parser(
+        "restore", help="Plan a restoration of one revision over the current content"
+    )
+    _add_options(versions_restore)
+    versions_restore.add_argument("href", help="File href, inside the files allowlist")
+    versions_restore.add_argument("version", help="Version id, as a listing reports it")
+
     share = commands.add_parser(
         "share",
         help="See and change who else can reach a file",
@@ -1162,6 +1207,12 @@ def _dispatchers() -> dict[str, plans.Dispatcher]:
         ),
         "files.": plans.Dispatcher(files.validate_step, files.execute, files.reconcile),
         "share.": plans.Dispatcher(shares.validate_step, shares.execute, shares.reconcile),
+        "trash.": plans.Dispatcher(
+            recovery.validate_step, recovery.execute, recovery.reconcile
+        ),
+        "version.": plans.Dispatcher(
+            recovery.validate_step, recovery.execute, recovery.reconcile
+        ),
     }
 
 
@@ -1996,6 +2047,63 @@ def _run_share(args: argparse.Namespace) -> int:
     return exits.USAGE
 
 
+def _run_trash(args: argparse.Namespace) -> int:
+    profile = _selected_profile(args)
+    transport = session.Session(profile)
+    account = identity.discover(profile, session=transport).account_name
+
+    if args.trash_command == "list":
+        entries = recovery.list_trash(profile, session=transport, account_name=account)
+        if args.json:
+            _json({"trash": [item.as_dict() for item in entries]})
+        else:
+            for item in entries:
+                kind = "d" if item.collection else "f"
+                scope = "" if item.in_scope else "  [not-allowlisted]"
+                size = "-" if item.size is None else str(item.size)
+                render.emit(
+                    f"{kind} {size:>10}  {item.deleted_at}  "
+                    f"{item.original_location}{scope}"
+                )
+                render.emit(f"              {item.href}")
+        return exits.OK
+
+    planner = recovery.plan_restore if args.trash_command == "restore" else recovery.plan_purge
+    plan = planner(profile, session=transport, account_name=account, href=args.href)
+    return _emit_plan(plan, args.json)
+
+
+def _run_versions(args: argparse.Namespace) -> int:
+    profile = _selected_profile(args)
+    transport = session.Session(profile)
+    account = identity.discover(profile, session=transport).account_name
+
+    if args.versions_command == "list":
+        found = recovery.list_versions(
+            profile, session=transport, account_name=account, file_href=args.href
+        )
+        if args.json:
+            _json({"versions": [item.as_dict() for item in found]})
+        else:
+            for item in found:
+                size = "-" if item.size is None else str(item.size)
+                label = f"  {item.label}" if item.label else ""
+                render.emit(f"{item.version_id:>12}  {size:>10}  {item.modified}{label}")
+        return exits.OK
+
+    if args.versions_command == "restore":
+        plan = recovery.plan_version_restore(
+            profile,
+            session=transport,
+            account_name=account,
+            file_href=args.href,
+            version_id=args.version,
+        )
+        return _emit_plan(plan, args.json)
+
+    return exits.USAGE
+
+
 def _run_apply(args: argparse.Namespace) -> int:
     profile = _selected_profile(args)
     with plans.claim(args.plan_id):
@@ -2071,6 +2179,10 @@ def _main(argv: list[str] | None = None) -> int:
             return _run_files(args)
         if args.command == "share":
             return _run_share(args)
+        if args.command == "trash":
+            return _run_trash(args)
+        if args.command == "versions":
+            return _run_versions(args)
         if args.command == "plan":
             return _run_plan(args)
         if args.command == "apply":
