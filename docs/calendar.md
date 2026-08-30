@@ -71,8 +71,8 @@ Organizer and attendee structures remain refused throughout this slice.
 
 An event reference carries every property `cal create` and `cal update` can
 write, as typed values beside the raw `icalendar` blob: `location`,
-`description`, `categories`, `priority`, `class`, `transp`, `color`,
-`related_to`, and `alarms`, alongside `summary`, `url`, and `status`. Absence is
+`description`, `categories`, `priority`, `class`, `transp`, `color`, and
+`alarms`, alongside `summary`, `url`, and `status`. Absence is
 an empty string, an empty list, or — for `priority` — `null`, so an unset
 property is distinguishable from one set to an empty or undefined value.
 
@@ -84,7 +84,12 @@ holds each `VALARM` trigger in the spelling `--alarm` accepts, so a reminder
 read back can be written again unchanged; a trigger stored as an absolute
 instant is reported as that instant rather than disguised as an offset.
 Repeated or comma-separated `CATEGORIES` flatten into one tag list, since both
-spellings denote the same set.
+spellings denote the same set. A non-numeric `PRIORITY` and a `VALARM` with no
+readable trigger are refused rather than reported as absent, because a corrupt
+property must not read the same as one nobody set. `RELATED-TO` stays out of
+the typed view: its `RELTYPE` parameter distinguishes relations that would
+otherwise look identical, so projecting the bare UID would lose the part that
+tells them apart.
 
 ## Reminders
 

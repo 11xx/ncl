@@ -66,7 +66,6 @@ class EventRef:
     classification: str
     transp: str
     color: str
-    related_to: tuple[str, ...]
     alarms: tuple[str, ...]
     start: str
     end: str
@@ -91,7 +90,6 @@ class EventRef:
             "class": self.classification,
             "transp": self.transp,
             "color": self.color,
-            "related_to": list(self.related_to),
             "alarms": list(self.alarms),
             "start": self.start,
             "end": self.end,
@@ -159,44 +157,44 @@ def _categories(component: Any) -> tuple[str, ...]:
     return tuple(found)
 
 
-def _priority(component: Any) -> int | None:
+def _priority(component: Any, *, href: str) -> int | None:
     """Return PRIORITY as a number, or ``None`` when the event carries none.
 
     Absence is not zero: RFC 5545 gives 0 the meaning "undefined", which is
     also what an absent property means, and a caller distinguishing "unset"
-    from "explicitly undefined" cannot do it from an integer alone.
+    from "explicitly undefined" cannot do it from an integer alone. A value
+    that is neither is refused rather than reported as absent, which would
+    make a corrupt property indistinguishable from one nobody set.
     """
     value = component.get("PRIORITY")
     if value is None:
         return None
     try:
         return int(str(value))
-    except (TypeError, ValueError):
-        return None
+    except (TypeError, ValueError) as exc:
+        raise EventError(f"the event at {href} has a non-numeric PRIORITY") from exc
 
 
-def _alarms(component: Any) -> tuple[str, ...]:
+def _alarms(component: Any, *, href: str) -> tuple[str, ...]:
     """Return each VALARM trigger in the spelling ``--alarm`` accepts.
 
     A relative trigger renders as the duration it was written with, so a
     reminder read back can be passed straight to ``--alarm``. An absolute
     trigger renders as its UTC instant instead, which this tool cannot write
-    but must not misreport as an offset.
+    but must not misreport as an offset. A reminder whose trigger is missing
+    or unreadable is refused: reporting a shorter list would say the event
+    carries fewer reminders than it does.
     """
     triggers: list[str] = []
     for child in getattr(component, "subcomponents", ()):
         if getattr(child, "name", "") != "VALARM":
             continue
         trigger = child.get("TRIGGER")
-        if trigger is None:
-            continue
-        raw = trigger.to_ical() if hasattr(trigger, "to_ical") else str(trigger).encode()
-        triggers.append(raw.decode("utf-8", "replace"))
+        raw = getattr(trigger, "to_ical", None)
+        if raw is None:
+            raise EventError(f"the event at {href} has a VALARM without a usable TRIGGER")
+        triggers.append(raw().decode("utf-8", "replace"))
     return tuple(triggers)
-
-
-def _related_to(component: Any) -> tuple[str, ...]:
-    return tuple(str(value) for value in _text_values(component, "RELATED-TO"))
 
 
 def _value_kind(value: Any) -> str | None:
@@ -318,12 +316,11 @@ def _describe(raw: bytes, *, calendar_href: str, href: str, etag: str) -> EventR
         location=_component_text(component, "LOCATION"),
         description=_component_text(component, "DESCRIPTION"),
         categories=_categories(component),
-        priority=_priority(component),
+        priority=_priority(component, href=href),
         classification=_component_text(component, "CLASS"),
         transp=_component_text(component, "TRANSP"),
         color=_component_text(component, "COLOR"),
-        related_to=_related_to(component),
-        alarms=_alarms(component),
+        alarms=_alarms(component, href=href),
         start=_utc(start_value) if start_value is not None else "",
         end=_utc(end_value) if end_value is not None else "",
         all_day=isinstance(start_value, dt.date) and not isinstance(start_value, dt.datetime),

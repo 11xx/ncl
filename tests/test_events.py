@@ -1827,7 +1827,6 @@ def test_folded_and_escaped_content_fields_round_trip():
         classification="private",
         busy=False,
         color="cornflowerblue",
-        related_to=("other@example",),
         alarms=("-PT15M", "-P1D"),
     )
 
@@ -1838,7 +1837,6 @@ def test_folded_and_escaped_content_fields_round_trip():
     assert reference.classification == "PRIVATE"
     assert reference.transp == "TRANSPARENT"
     assert reference.color == "cornflowerblue"
-    assert reference.related_to == ("other@example",)
     assert reference.alarms == ("-PT15M", "-P1D")
 
 
@@ -1892,3 +1890,17 @@ def test_cal_show_json_carries_the_content_fields(monkeypatch, capsys):
     assert shown["description"] == AWKWARD_DESCRIPTION
     assert shown["categories"] == ["work"]
     assert shown["alarms"] == ["-PT15M"]
+
+
+def test_a_non_numeric_priority_is_refused_rather_than_read_as_absent():
+    raw = RICH.replace(b"CATEGORIES:WORK", b"PRIORITY:soon")
+
+    with pytest.raises(events.EventError):
+        _ref(raw)
+
+
+def test_a_valarm_without_a_trigger_is_refused():
+    raw = RICH.replace(b"TRIGGER:-PT15M\n", b"")
+
+    with pytest.raises(events.EventError):
+        _ref(raw)

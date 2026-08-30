@@ -46,7 +46,7 @@ READ
   is ambiguous across one DST transition each year and nonexistent across the
   other. JSON event references carry every property a write can set — `url`,
   `status`, `location`, `description`, `categories`, `priority`, `class`,
-  `transp`, `color`, `related_to`, and `alarms` — unfolded and unescaped, using
+  `transp`, `color`, and `alarms` — unfolded and unescaped, using
   an empty value when the VEVENT property is absent, so a mutation can be read
   back without parsing the raw `icalendar` blob. Human `cal show` displays the URL, while
   a cancelled event is marked in a human listing without putting links on every
