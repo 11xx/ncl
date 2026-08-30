@@ -1797,3 +1797,110 @@ def test_converting_an_event_to_all_day_preserves_everything_it_did_not_touch():
         b"UID:keep-me@example",
     ):
         assert retained in payload
+
+
+LONG_LOCATION = (
+    "Sala 12, Edifício Central, Avenida das Nações Unidas 1000, "
+    "São Paulo — the whole address, past the seventy-five octet fold width"
+)
+AWKWARD_DESCRIPTION = "first line; with a semicolon\nsecond, with a comma\nthird"
+
+
+def _content_ref(**fields):
+    """Serialize an event the way `cal create` does, then read it back."""
+    payload = mutate.build_event(
+        uid="content@example",
+        summary="Content",
+        start=dt.datetime(2026, 9, 1, 9, 0, tzinfo=dt.UTC),
+        end=dt.datetime(2026, 9, 1, 10, 0, tzinfo=dt.UTC),
+        **fields,
+    )
+    return _ref(payload.encode("utf-8"))
+
+
+def test_folded_and_escaped_content_fields_round_trip():
+    reference = _content_ref(
+        location=LONG_LOCATION,
+        description=AWKWARD_DESCRIPTION,
+        categories=("work", "travel"),
+        priority=3,
+        classification="private",
+        busy=False,
+        color="cornflowerblue",
+        alarms=("-PT15M", "-P1D"),
+    )
+
+    assert reference.location == LONG_LOCATION
+    assert reference.description == AWKWARD_DESCRIPTION
+    assert reference.categories == ("work", "travel")
+    assert reference.priority == 3
+    assert reference.classification == "PRIVATE"
+    assert reference.transp == "TRANSPARENT"
+    assert reference.color == "cornflowerblue"
+    assert reference.alarms == ("-PT15M", "-P1D")
+
+
+def test_absent_content_fields_report_absence_rather_than_a_default():
+    reference = _content_ref()
+
+    assert reference.location == ""
+    assert reference.description == ""
+    assert reference.categories == ()
+    assert reference.priority is None
+    assert reference.classification == ""
+    assert reference.transp == ""
+    assert reference.alarms == ()
+
+
+def test_repeated_categories_flatten_to_one_tag_list():
+    raw = RICH.replace(b"CATEGORIES:WORK", b"CATEGORIES:WORK,ERRAND\r\nCATEGORIES:TRAVEL")
+
+    assert _ref(raw).categories == ("WORK", "ERRAND", "TRAVEL")
+
+
+def test_an_absolute_alarm_trigger_is_reported_as_an_instant():
+    raw = RICH.replace(
+        b"TRIGGER:-PT15M", b"TRIGGER;VALUE=DATE-TIME:20260901T090000Z"
+    )
+
+    assert _ref(raw).alarms == ("20260901T090000Z",)
+
+
+def test_cal_show_json_carries_the_content_fields(monkeypatch, capsys):
+    payload = mutate.build_event(
+        uid="content@example",
+        summary="Content",
+        start=dt.datetime(2026, 9, 1, 9, 0, tzinfo=dt.UTC),
+        end=dt.datetime(2026, 9, 1, 10, 0, tzinfo=dt.UTC),
+        location=LONG_LOCATION,
+        description=AWKWARD_DESCRIPTION,
+        categories=("work",),
+        alarms=("-PT15M",),
+    ).encode("utf-8")
+    reference = _ref(payload)
+    monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
+    monkeypatch.setattr(cli.session, "Session", lambda profile: object())
+    monkeypatch.setattr(cli.events, "fetch", lambda *args, **kwargs: (reference, payload))
+
+    code = cli.main(["cal", "show", reference.href, "--json"])
+    shown = json.loads(capsys.readouterr().out)["event"]
+
+    assert code == exits.OK
+    assert shown["location"] == LONG_LOCATION
+    assert shown["description"] == AWKWARD_DESCRIPTION
+    assert shown["categories"] == ["work"]
+    assert shown["alarms"] == ["-PT15M"]
+
+
+def test_a_non_numeric_priority_is_refused_rather_than_read_as_absent():
+    raw = RICH.replace(b"CATEGORIES:WORK", b"PRIORITY:soon")
+
+    with pytest.raises(events.EventError):
+        _ref(raw)
+
+
+def test_a_valarm_without_a_trigger_is_refused():
+    raw = RICH.replace(b"TRIGGER:-PT15M\n", b"")
+
+    with pytest.raises(events.EventError):
+        _ref(raw)
