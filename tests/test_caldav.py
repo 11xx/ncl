@@ -135,6 +135,8 @@ def test_component_capability_accepts_vtodo_and_refuses_vevent_only_collections(
     task_calendar = caldav.Calendar(
         href=CALENDAR_HREF,
         display_name="Tasks",
+        description="",
+        color="",
         components=("VEVENT", "VTODO"),
         read_only=False,
         in_scope=True,
@@ -146,6 +148,8 @@ def test_component_capability_accepts_vtodo_and_refuses_vevent_only_collections(
             caldav.Calendar(
                 href=CALENDAR_HREF,
                 display_name="Events",
+                description="",
+                color="",
                 components=("VEVENT",),
                 read_only=False,
                 in_scope=True,
@@ -168,6 +172,8 @@ def test_resolve_short_name_uses_the_exact_final_path_segment():
         caldav.Calendar(
             href=HOME + "work/",
             display_name="Work",
+            description="",
+            color="",
             components=("VEVENT",),
             read_only=False,
             in_scope=True,
@@ -175,6 +181,8 @@ def test_resolve_short_name_uses_the_exact_final_path_segment():
         caldav.Calendar(
             href=HOME + "subwork/",
             display_name="Subwork",
+            description="",
+            color="",
             components=("VEVENT",),
             read_only=False,
             in_scope=True,
@@ -207,3 +215,78 @@ def test_a_non_multistatus_answer_is_refused():
     with pytest.raises(caldav.CalendarError) as error:
         _listing(status=200)
     assert error.value.code == exits.MALFORMED_RESPONSE
+
+
+COLLECTION = b"""<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"
+               xmlns:o="http://owncloud.org/ns">
+  <d:response>
+    <d:href>/remote.php/dav/calendars/alice/work/</d:href>
+    <d:propstat><d:prop>
+      <d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
+      <d:displayname>Work</d:displayname>
+      <c:calendar-description>Employment, not the search</c:calendar-description>
+      <o:calendar-color>#2196F3</o:calendar-color>
+      <d:current-user-privilege-set>
+        <d:privilege><d:write/></d:privilege>
+      </d:current-user-privilege-set>
+      <c:supported-calendar-component-set>
+        <c:comp name="VEVENT"/><c:comp name="VTODO"/>
+      </c:supported-calendar-component-set>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+</d:multistatus>
+"""
+
+ALLOWED = HOME + "work/"
+
+
+def test_a_collection_read_carries_the_description_and_colour():
+    session = FakeSession(body=COLLECTION)
+    calendar = caldav.fetch(PROFILE, session=session, href=ALLOWED)
+
+    assert session.requests[0]["method"] == "PROPFIND"
+    assert session.requests[0]["headers"]["Depth"] == "0"
+    assert calendar.display_name == "Work"
+    assert calendar.description == "Employment, not the search"
+    assert calendar.color == "#2196F3"
+    assert calendar.components == ("VEVENT", "VTODO")
+    assert calendar.read_only is False
+    assert calendar.in_scope is True
+
+
+def test_a_listing_carries_the_same_properties_as_a_collection_read():
+    calendars, _ = _listing()
+    work = next(item for item in calendars if item.href == ALLOWED)
+
+    assert work.as_dict()["description"] == ""
+    assert work.as_dict()["color"] == ""
+
+
+def test_a_collection_outside_the_allowlist_is_refused_before_the_request():
+    session = FakeSession(body=COLLECTION)
+
+    with pytest.raises(caldav.CalendarError) as refusal:
+        caldav.fetch(PROFILE, session=session, href=HOME + "personal/")
+
+    assert refusal.value.code == exits.SCOPE_DENIED
+    assert session.requests == []
+
+
+def test_a_missing_collection_is_reported_as_a_missing_target():
+    session = FakeSession(status=404, body=b"")
+
+    with pytest.raises(caldav.CalendarError) as refusal:
+        caldav.fetch(PROFILE, session=session, href=ALLOWED)
+
+    assert refusal.value.code == exits.TARGET_NOT_FOUND
+
+
+def test_a_resource_that_is_not_a_calendar_is_refused_as_the_wrong_collection():
+    body = COLLECTION.replace(b"<d:collection/><c:calendar/>", b"<d:collection/>")
+    session = FakeSession(body=body)
+
+    with pytest.raises(caldav.CalendarError) as refusal:
+        caldav.fetch(PROFILE, session=session, href=ALLOWED)
+
+    assert refusal.value.code == exits.UNSUPPORTED_COLLECTION

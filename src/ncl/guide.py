@@ -41,6 +41,7 @@ READ
   ncl cal events <calendar> --from <iso> --to <iso>
   ncl cal occurrences <calendar> --from <iso> --to <iso>
   ncl cal show <event-href>
+  ncl cal collection <calendar>
 
   The window is required, and times need an explicit UTC offset: a local time
   is ambiguous across one DST transition each year and nonexistent across the
@@ -58,6 +59,11 @@ READ
   or nonexistent TZID local boundaries and generated occurrences are refused.
   Generic event references still mark recurrence and scheduling structure as
   unwritable; only the explicit target modes below may edit a recurring resource.
+  `cal collection` answers what a calendar is rather than how to address it:
+  its description, its colour as the server spells it, and the component set it
+  accepts. That set is worth reading before writing into a collection someone
+  else made — most servers fix it at creation, so a calendar without VTODO can
+  never host a task.
 
 WORK WITH TASKS
   ncl task list <calendar> [--status <status>]
@@ -192,7 +198,11 @@ CHANGE NOTHING BY ACCIDENT
   ncl cal delete <event-href> --target resource|series
   ncl cal delete <event-href> --target occurrence --recurrence-id <wire-id>
   ncl cal delete <event-href> --target this-and-future --recurrence-id <wire-id>
+  ncl cal mkcalendar <calendar-href> --displayname <name>
+  ncl cal move <event-href> --to <calendar>
   ncl files write <file-href> --from <local-path>
+  ncl files move <file-href> --to <file-href>
+  ncl files mkcol <collection-href>
   ncl files delete <file-href>
 
   None of these change anything. Each resolves its target, freezes exactly what
@@ -202,6 +212,24 @@ CHANGE NOTHING BY ACCIDENT
   ncl apply <plan-id>           Execute or resume that frozen plan.
   ncl plan list|show|cancel     Inspect or discard a plan.
   ncl plan reconcile <plan-id>  Read the first uncertain step and classify it.
+
+  A move relocates the resource itself, which delete-and-recreate cannot: two
+  mutations leave a window where a failure loses the resource, reconstruct only
+  the properties this tool models, and either mint a new identity or leave a
+  synced client reconciling a tombstone against a fresh resource. Both endpoints
+  are checked against the allowlist, the resource keeps its final path segment
+  so existing references still resolve, and `Overwrite: F` means an occupied
+  destination refuses instead of being replaced. A move addresses the resource,
+  so a recurring master travels with every override that shares its file and no
+  occurrence can be moved away from its series.
+
+  Creating a collection is the one mutation that enlarges what the tool can
+  reach, because the allowlist is a prefix list and a new collection under an
+  allowed prefix is admitted as soon as it exists. `cal mkcalendar` accepts
+  both VEVENT and VTODO unless `--component` says otherwise, since that set is
+  usually fixed at creation. Deleting a collection has no verb, for the same
+  reason as `files delete` on one: it destroys unbounded content that no plan
+  can show.
 
   A plan contains one or more ordered frozen steps. Applying claims the plan
   before loading it, validates every action and step before the first request,

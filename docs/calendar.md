@@ -91,6 +91,47 @@ the typed view: its `RELTYPE` parameter distinguishes relations that would
 otherwise look identical, so projecting the bare UID would lose the part that
 tells them apart.
 
+## Calendar collections
+
+`ncl cal collection <calendar>` reads one collection's own properties:
+`display_name`, `description`, `color`, `components`, `read_only`, and the
+allowlist decision. `cal list` answers how to address a calendar; this answers
+what one is. The component set is the property worth reading before writing:
+most servers fix `supported-calendar-component-set` at creation, so a
+collection made without VTODO can never host a task.
+
+`ncl cal mkcalendar <href> --displayname <name>` plans the creation of one
+collection, with optional `--description`, `--color`, and repeatable
+`--component`. Absent `--component` the collection accepts both VEVENT and
+VTODO, because that set cannot be amended afterwards on most servers and the
+silent loss is the task surface. Applying issues `MKCALENDAR` and reads the
+collection back: the display name, description, and component set must match
+what was planned. The colour is reported as stored rather than asserted —
+servers normalize the value, and the stored spelling is the answer a caller
+needs rather than a verdict.
+
+Creation is the one mutation that enlarges the tool's own reach. The allowlist
+is a prefix list of hrefs, so a collection created under an allowed calendar
+home is addressable the moment it exists. That is the intended outcome, which
+is why the target passes the same allowlist check as any other href rather than
+being treated as new ground. Deleting a collection has no verb: unlike deleting
+one event, it destroys unbounded content that no plan can show.
+
+`ncl cal move <event-href> --to <calendar>` relocates one event resource with a
+single `MOVE`. Delete-and-recreate is not the same operation: it is two
+mutations with a window where a failure loses the event outright, it
+reconstructs only the properties this tool models, and it either mints a new
+UID — breaking every external reference — or reuses the old one, leaving a
+synced client to reconcile a tombstone against a fresh resource.
+
+The event keeps its final path segment at the destination, both the source and
+the destination calendar pass the allowlist, and `Overwrite: F` means an
+occupied destination refuses rather than being replaced. Applying verifies that
+the destination holds semantically the same resource that was frozen and that
+the source returns 404. A move addresses the resource, so a recurring master
+travels with every override that shares its file, and no `--target` selects an
+occurrence: an override cannot be moved away from its master.
+
 ## Reminders
 
 An update with neither alarm option preserves every existing `VALARM`. Repeating

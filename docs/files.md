@@ -62,6 +62,38 @@ uncertain. Reconciliation reads only. Partial plans do not expire; untouched
 plans retain their short freshness window. Cancelling a partial plan removes
 local progress but does not undo remote effects.
 
-The module does not create collections, copy or move resources, acquire WebDAV
-locks, manage shares, or bypass a server quota. Those are separate operations
-with separate safety contracts.
+## Relocation and collections
+
+`ncl files move <href> --to <href>` relocates one file with a single `MOVE`.
+The alternative — read, write to the new href, delete the old one — is three
+mutations with a window where both copies exist and another where neither is
+durable, and it silently drops every property the round trip does not carry.
+
+Both endpoints pass the files allowlist, and both are checked while planning:
+checking only the source would let a correct request move a resource out of the
+configured scope. `Overwrite: F` is sent on every move and is not configurable,
+so a destination that already holds something is a conflict rather than a
+target to replace. The `If-Match` header carries the source ETag observed while
+planning, which RFC 4918 applies to the source of a `MOVE`; a server that
+ignores it leaves the move unconditional on the source, which is why the
+readback is what establishes the outcome. A move is verified by reading the
+destination back as a file of the planned size and confirming the source
+returns absent — a `MOVE` relocates the resource rather than rewriting content,
+so there is no new content to compare. A server reporting 204, which means the
+destination was overwritten, is an uncertain outcome: `Overwrite: F` was sent
+to prevent exactly that.
+
+Collections are refused as move sources for the reason they are refused as
+delete targets: they hold unbounded content that no plan can meaningfully show.
+
+`ncl files mkcol <href>` creates one collection under an allowlisted root and
+verifies that the href reads back as a collection. Creation is the one mutation
+that enlarges what the tool can reach, because the allowlist is a prefix list
+and a new collection under an allowed prefix is admitted as soon as it exists.
+A parent that does not exist is reported as a missing target rather than
+created implicitly, and an href that already exists is a conflict.
+
+The module does not copy resources, acquire WebDAV locks, manage shares, or
+bypass a server quota. `COPY` is the one relocation method left out: a copy can
+be had with `read` plus `write`, losing only properties and atomicity, whereas
+a move cannot be simulated safely at all.

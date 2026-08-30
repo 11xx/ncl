@@ -36,6 +36,8 @@ class Calendar:
 
     href: str
     display_name: str
+    description: str
+    color: str
     components: tuple[str, ...]
     read_only: bool
     in_scope: bool
@@ -44,6 +46,8 @@ class Calendar:
         return {
             "href": self.href,
             "display_name": self.display_name,
+            "description": self.description,
+            "color": self.color,
             "components": list(self.components),
             "read_only": self.read_only,
             "in_scope": self.in_scope,
@@ -55,6 +59,14 @@ _PROPS = (
     "<d:displayname/>"
     "<d:current-user-privilege-set/>"
     "<c:supported-calendar-component-set/>"
+    "<c:calendar-description/>"
+    "<o:calendar-color/>"
+)
+
+_PROPFIND = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" '
+    f'xmlns:o="{OC}"><d:prop>{_PROPS}</d:prop></d:propfind>'
 )
 
 
@@ -103,6 +115,11 @@ def _components(props: dict[tuple[str, str], ET.Element]) -> tuple[str, ...]:
     return tuple(names)
 
 
+def _text(props: dict[tuple[str, str], ET.Element], name: tuple[str, str]) -> str:
+    element = props.get(name)
+    return (element.text or "").strip() if element is not None else ""
+
+
 def _read_only(props: dict[tuple[str, str], ET.Element]) -> bool:
     """Whether the account may only read this collection.
 
@@ -122,6 +139,18 @@ def _read_only(props: dict[tuple[str, str], ET.Element]) -> bool:
     return True
 
 
+def _calendar(profile: Any, href: str, props: dict[tuple[str, str], ET.Element]) -> Calendar:
+    return Calendar(
+        href=href,
+        display_name=_text(props, (DAV, "displayname")),
+        description=_text(props, (CALDAV, "calendar-description")),
+        color=_text(props, (OC, "calendar-color")),
+        components=_components(props),
+        read_only=_read_only(props),
+        in_scope=profiles.in_scope(href, list(profile.calendars)),
+    )
+
+
 def list_calendars(profile: Any, *, session: Session, calendar_home: str) -> list[Calendar]:
     """Enumerate the calendars under a discovered calendar home.
 
@@ -130,17 +159,11 @@ def list_calendars(profile: Any, *, session: Session, calendar_home: str) -> lis
     listing that hides everything unconfigured cannot be used to configure
     anything.
     """
-    body = (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        '<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">'
-        f"<d:prop>{_PROPS}</d:prop>"
-        "</d:propfind>"
-    )
     response = session.request(
         "PROPFIND",
         calendar_home,
         headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
-        data=body,
+        data=_PROPFIND,
     )
     if response.status != 207:
         raise CalendarError(
@@ -173,18 +196,68 @@ def list_calendars(profile: Any, *, session: Session, calendar_home: str) -> lis
         props = _prop_elements(entry)
         if not _is_calendar(props):
             continue
-        name_element = props.get((DAV, "displayname"))
-        display_name = (name_element.text or "").strip() if name_element is not None else ""
-        calendars.append(
-            Calendar(
-                href=href,
-                display_name=display_name,
-                components=_components(props),
-                read_only=_read_only(props),
-                in_scope=profiles.in_scope(href, list(profile.calendars)),
-            )
-        )
+        calendars.append(_calendar(profile, href, props))
     return calendars
+
+
+def fetch(profile: Any, *, session: Session, href: str) -> Calendar:
+    """Read one calendar collection's own properties.
+
+    Addressing the collection directly answers what a calendar *is* —
+    description, colour, and the component set it will accept — which a
+    listing built for addressing does not carry. The component set matters
+    most: most servers fix it at creation, so a caller that discovers a
+    missing VTODO afterwards has no remedy short of recreating the collection.
+    """
+    target = _canonical(profile, href)
+    if not profiles.in_scope(target, list(profile.calendars)):
+        raise CalendarError(
+            f"{target} is outside this profile's calendar allowlist", exits.SCOPE_DENIED
+        )
+    response = session.request(
+        "PROPFIND",
+        target,
+        headers={"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
+        data=_PROPFIND,
+    )
+    if response.status == 404:
+        raise CalendarError(f"no calendar exists at {target}", exits.TARGET_NOT_FOUND)
+    if response.status != 207:
+        raise CalendarError(
+            "the calendar collection did not answer with a Multi-Status response",
+            exits.MALFORMED_RESPONSE,
+        )
+    try:
+        root = ET.fromstring(response.body)
+    except ET.ParseError as exc:
+        raise CalendarError("the calendar collection response was not valid XML") from exc
+    if _element_name(root) != (DAV, "multistatus"):
+        raise CalendarError("the calendar collection response was not a Multi-Status response")
+
+    wanted = _segments(target)
+    for entry in root:
+        if _element_name(entry) != (DAV, "response"):
+            continue
+        href_element = next((i for i in entry if _element_name(i) == (DAV, "href")), None)
+        raw = (href_element.text or "").strip() if href_element is not None else ""
+        if not raw or _segments(_canonical(profile, raw)) != wanted:
+            continue
+        props = _prop_elements(entry)
+        if not _is_calendar(props):
+            raise CalendarError(
+                f"the resource at {target} is not a calendar collection",
+                exits.UNSUPPORTED_COLLECTION,
+            )
+        return _calendar(profile, target, props)
+    raise CalendarError(f"no calendar exists at {target}", exits.TARGET_NOT_FOUND)
+
+
+def _segments(href: str) -> tuple[str, ...]:
+    try:
+        _, segments = profiles.canonicalize_href(href)
+    except ValueError as exc:
+        raise CalendarError("the server returned a malformed calendar href") from exc
+    return segments
 
 
 def _canonical(profile: Any, value: str) -> str:
