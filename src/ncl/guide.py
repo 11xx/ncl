@@ -234,9 +234,18 @@ REACH ALLOWLISTED FILES
                                     media type, or modification time.
   ncl files stat <resource-href>    Read size, mtime, media type, and ETag.
   ncl files read <file-href>        Read UTF-8 text through redacted stdout.
+  ncl files read <file-href> --offset <n> --length <n> --output <path>
 
   File hrefs must be inside one of the profile's `files_roots`. Only content
   declared as textual and decodable as UTF-8 is sent to redacted stdout; binary,
+  A write larger than a few megabytes streams in parts through the server's
+  chunked upload rather than freezing its bytes in the plan. What the plan
+  freezes then is the source's size and SHA-256, and applying refuses if the
+  file changed underneath — nothing reaches the destination until the final
+  assembling step, so a refusal leaves it untouched. A ranged read writes its
+  window at its own offset, and a server that ignores the range and sends the
+  whole file is refused rather than misread.
+
   `files find` asks the server where a file is rather than walking the tree
   for it, and needs at least one condition: a search with none is a recursive
   listing at a cost nobody asked for. `*` and `?` are the name wildcards. A
