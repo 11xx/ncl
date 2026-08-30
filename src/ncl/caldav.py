@@ -242,6 +242,10 @@ def fetch(profile: Any, *, session: Session, href: str) -> Calendar:
         raw = (href_element.text or "").strip() if href_element is not None else ""
         if not raw or _segments(_canonical(profile, raw)) != wanted:
             continue
+        status = next((i for i in entry if _element_name(i) == (DAV, "status")), None)
+        code = _status_code(status.text if status is not None else None)
+        if code == 404:
+            raise CalendarError(f"no calendar exists at {target}", exits.TARGET_NOT_FOUND)
         props = _prop_elements(entry)
         if not _is_calendar(props):
             raise CalendarError(

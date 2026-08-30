@@ -810,6 +810,18 @@ def test_a_move_the_server_reports_as_an_overwrite_is_uncertain():
     assert refusal.value.code == exits.OUTCOME_UNCERTAIN
 
 
+def test_a_move_the_server_forbids_is_a_server_refusal_not_a_conflict():
+    transport = FakeSession(_stat(SCRIPT), _missing(DESTINATION), response(403))
+    plan = files.plan_move(
+        PROFILE, session=transport, href=SCRIPT, destination=DESTINATION
+    )
+
+    with pytest.raises(files.FileError) as refusal:
+        _apply_bundle(plan, transport)
+
+    assert refusal.value.code == exits.SERVER_ERROR
+
+
 def test_a_move_the_server_refuses_with_412_conflicts_without_moving_anything():
     transport = FakeSession(_stat(SCRIPT), _missing(DESTINATION), response(412))
     plan = files.plan_move(

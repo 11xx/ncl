@@ -290,3 +290,17 @@ def test_a_resource_that_is_not_a_calendar_is_refused_as_the_wrong_collection():
         caldav.fetch(PROFILE, session=session, href=ALLOWED)
 
     assert refusal.value.code == exits.UNSUPPORTED_COLLECTION
+
+
+def test_a_collection_missing_inside_a_multistatus_is_a_missing_target():
+    body = (
+        b'<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">'
+        b"<d:response><d:href>/remote.php/dav/calendars/alice/work/</d:href>"
+        b"<d:status>HTTP/1.1 404 Not Found</d:status></d:response></d:multistatus>"
+    )
+    session = FakeSession(body=body)
+
+    with pytest.raises(caldav.CalendarError) as refusal:
+        caldav.fetch(PROFILE, session=session, href=ALLOWED)
+
+    assert refusal.value.code == exits.TARGET_NOT_FOUND

@@ -77,11 +77,19 @@ def classify(
             "resource, which Overwrite: F was sent to refuse",
             exits.OUTCOME_UNCERTAIN,
         )
-    if status in {403, 412}:
+    if status == 412:
         raise fail(
             f"{destination} already holds a resource, or {source} changed since the "
             "plan was made; nothing was moved",
             exits.CONFLICT,
+        )
+    if status == 403:
+        # RFC 4918 gives 412 to an Overwrite: F collision and 403 to a move the
+        # server will not perform at all. Reporting the second as a conflict
+        # would tell the caller to clear a destination that is not the problem.
+        raise fail(
+            f"the server forbade moving {source} to {destination}; nothing was moved",
+            exits.SERVER_ERROR,
         )
     if status == 404:
         raise fail(f"no resource exists at {source}", exits.TARGET_NOT_FOUND)
