@@ -339,6 +339,128 @@ def test_a_round_trip_states_the_effects_it_had(monkeypatch, backend, listing):
     assert runner.mutations, "a round trip must actually write"
 
 
+class _ProbeStore:
+    """A `_run` that keeps what a round trip stores, failing where told to."""
+
+    def __init__(self, *, fail: str = "", corrupt: bool = False) -> None:
+        self.fail = fail
+        self.corrupt = corrupt
+        self.stored: str | None = None
+        self.written: list[str] = []
+        self.commands: list[list[str]] = []
+
+    def _refused(self):
+        return SimpleNamespace(returncode=1, stdout="", stderr="the store refused")
+
+    def __call__(self, command, *, input_text=None):
+        self.commands.append(list(command))
+        verb = command[1]
+        if verb == "ls" or secrets._INSPECT_PROFILE in command:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if verb in {"insert", "store"}:
+            if self.fail == "set":
+                return self._refused()
+            self.written.append((input_text or "").rstrip("\n"))
+            self.stored = "not-what-was-stored" if self.corrupt else self.written[-1]
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if verb in {"show", "lookup"}:
+            if self.fail == "get":
+                return self._refused()
+            return SimpleNamespace(returncode=0, stdout=f"{self.stored or ''}\n", stderr="")
+        if verb in {"rm", "clear"}:
+            if self.fail == "delete":
+                return self._refused()
+            self.stored = None
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected command: {command}")
+
+    @property
+    def removals(self) -> list[list[str]]:
+        return [command for command in self.commands if command[1] in {"rm", "clear"}]
+
+
+def _install_probe_store(monkeypatch, store: _ProbeStore) -> None:
+    monkeypatch.setattr(secrets, "_run", store)
+    monkeypatch.setattr(secrets.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+
+_BACKENDS = [secrets.PassBackend(), secrets.LibsecretBackend()]
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_a_completed_round_trip_claims_the_removal_it_performed(monkeypatch, backend):
+    store = _ProbeStore()
+    _install_probe_store(monkeypatch, store)
+
+    state = backend.round_trip()
+
+    assert state.usable
+    assert state.round_tripped is True
+    assert all("may remain" not in effect for effect in state.side_effects)
+    assert any("removed" in effect for effect in state.side_effects)
+    assert store.stored is None
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_a_failed_removal_says_the_entry_may_remain(monkeypatch, backend):
+    store = _ProbeStore(fail="delete")
+    _install_probe_store(monkeypatch, store)
+
+    state = backend.round_trip()
+
+    assert state.state == secrets.MISCONFIGURED
+    assert state.round_tripped is False
+    assert state.side_effects and all("may remain" in effect for effect in state.side_effects)
+    assert store.stored is not None, "the entry the report warns about is really there"
+    probe_value = store.written[0]
+    assert probe_value not in state.detail
+    assert not any(probe_value in effect for effect in state.side_effects)
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_a_failed_write_says_the_entry_may_remain_rather_than_nothing_happened(
+    monkeypatch, backend
+):
+    """A refused write may still have created the entry it was refusing to finish."""
+    store = _ProbeStore(fail="set")
+    _install_probe_store(monkeypatch, store)
+
+    state = backend.round_trip()
+
+    assert state.state == secrets.MISCONFIGURED
+    assert state.side_effects and all("may remain" in effect for effect in state.side_effects)
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_cleanup_after_a_corrupt_read_back_decides_the_wording(monkeypatch, backend):
+    cleaned = _ProbeStore(corrupt=True)
+    _install_probe_store(monkeypatch, cleaned)
+    cleaned_state = backend.round_trip()
+
+    assert cleaned_state.state == secrets.MISCONFIGURED
+    assert cleaned.removals, "residue must be removed"
+    assert all("may remain" not in effect for effect in cleaned_state.side_effects)
+
+    stuck = _ProbeStore(corrupt=True, fail="delete")
+    _install_probe_store(monkeypatch, stuck)
+    stuck_state = backend.round_trip()
+
+    assert stuck_state.state == secrets.MISCONFIGURED
+    assert all("may remain" in effect for effect in stuck_state.side_effects)
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_a_read_back_that_fails_still_reports_its_cleanup(monkeypatch, backend):
+    store = _ProbeStore(fail="get")
+    _install_probe_store(monkeypatch, store)
+
+    state = backend.round_trip()
+
+    assert state.state == secrets.MISCONFIGURED
+    assert store.removals, "a value that could not be read back is still removed"
+    assert all("may remain" not in effect for effect in state.side_effects)
+
+
 def test_a_failed_round_trip_removes_its_value_and_names_no_secret(monkeypatch):
     runner = _Commands({("pass", "ls"): (0, "", "")})
     written: list[str] = []

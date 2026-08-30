@@ -67,9 +67,12 @@ Each result names which question it answered, so an inspection is never read as
 a proof. `ncl login` keeps the real round trip regardless: Login Flow v2 returns
 the application password exactly once, so a store that turns out to be unusable
 afterwards costs a second trip through browser consent and leaves an application
-password nobody holds. A probe that fails part-way removes what it wrote,
-best-effort, and names the path that may still hold something without ever
-naming the value.
+password nobody holds. A probe that fails part-way tries to remove what it
+wrote, and its report follows what actually happened: an entry is called
+removed only once a delete has succeeded, and any failure that could have left
+one — including a refused write, which may still have created it — says a
+temporary entry may remain. The value is never named, only the entry that could
+hold it.
 
 Secret backends distinguish an absent entry from an unusable backend. `pass`
 reports absence with its explicit “not in the password store” result, while
