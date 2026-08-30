@@ -176,14 +176,16 @@ def _priority(component: Any, *, href: str) -> int | None:
 
 
 def _alarms(component: Any, *, href: str) -> tuple[str, ...]:
-    """Return each VALARM trigger in the spelling ``--alarm`` accepts.
+    """Return each VALARM trigger in the spelling it is stored with.
 
-    A relative trigger renders as the duration it was written with, so a
-    reminder read back can be passed straight to ``--alarm``. An absolute
-    trigger renders as its UTC instant instead, which this tool cannot write
-    but must not misreport as an offset. A reminder whose trigger is missing
-    or unreadable is refused: reporting a shorter list would say the event
-    carries fewer reminders than it does.
+    A relative trigger renders as the duration it was written with, and that
+    spelling is what ``--alarm`` accepts, so such a reminder can be written
+    back unchanged. An absolute trigger renders as its DATE-TIME instant, which
+    is read-only here: ``--alarm`` takes durations alone and refuses an
+    instant, and disguising one as an offset would be a worse answer than
+    reporting a value that cannot be handed back. A reminder whose trigger is
+    missing or unreadable is refused: reporting a shorter list would say the
+    event carries fewer reminders than it does.
     """
     triggers: list[str] = []
     for child in getattr(component, "subcomponents", ()):

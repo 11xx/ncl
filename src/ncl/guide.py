@@ -221,7 +221,9 @@ CHANGE NOTHING BY ACCIDENT
   so existing references still resolve, and `Overwrite: F` means an occupied
   destination refuses instead of being replaced. A move addresses the resource,
   so a recurring master travels with every override that shares its file and no
-  occurrence can be moved away from its series.
+  occurrence can be moved away from its series. A file move freezes the exact
+  content it read while planning and holds the destination to that identity
+  afterwards, so a same-sized replacement cannot pass as the file that moved.
 
   Creating a collection is the one mutation that enlarges what the tool can
   reach, because the allowlist is a prefix list and a new collection under an
@@ -288,7 +290,10 @@ CHANGE NOTHING BY ACCIDENT
 
   On update, omitting `--alarm` preserves existing reminders, `--alarm` replaces
   them with the repeatable offsets supplied, and `--clear-alarms` removes all of
-  them. The two options are mutually exclusive. A calendar client may still
+  them. The two options are mutually exclusive. `--alarm` takes durations only,
+  so a reminder read back as a relative trigger can be written again unchanged
+  while one read back as an absolute instant is read-only: preserving it means
+  leaving both options off. A calendar client may still
   hide URL or other structured fields; the projection only makes them readable
   to more clients and cannot force a client to display them.
 

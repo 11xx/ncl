@@ -14,7 +14,6 @@ import secrets as token_source
 import shutil
 import subprocess
 from collections.abc import Callable
-from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -199,6 +198,69 @@ def _decode(raw: str) -> Credential:
     return Credential(**values)
 
 
+def _discard_probe(backend: SecretBackend, profile: str, *, removed: str, residue: str) -> str:
+    """Remove a probe entry a failed round trip left, and say which happened."""
+    try:
+        backend.delete(profile, RECORD_KEY)
+    except SecretError:
+        return residue
+    return removed
+
+
+def _round_trip(
+    backend: SecretBackend, *, subject: str, removed: str, residue: str
+) -> BackendState:
+    """Store, read back, and remove one probe value, reporting what it left.
+
+    The report is the only record of what the store took on, so removal is
+    claimed only once a delete has succeeded. A write that failed may still
+    have created the entry, and every path that cannot prove the entry is gone
+    says it may remain. The probe value is never named, only the entry that
+    could hold it.
+    """
+    state = backend.inspect()
+    if not state.usable:
+        return state
+    profile = f"probe-{token_source.token_hex(12)}"
+    value = token_source.token_urlsafe(24)
+    try:
+        backend.set(profile, RECORD_KEY, value)
+    except SecretError:
+        return BackendState(
+            MISCONFIGURED,
+            f"{subject} could not store a value",
+            side_effects=(residue,),
+        )
+    try:
+        returned_the_value = backend.get(profile, RECORD_KEY) == value
+    except SecretError:
+        return BackendState(
+            MISCONFIGURED,
+            f"{subject} could not read back the value it stored",
+            side_effects=(_discard_probe(backend, profile, removed=removed, residue=residue),),
+        )
+    if not returned_the_value:
+        return BackendState(
+            MISCONFIGURED,
+            f"{subject} did not return the value it stored",
+            side_effects=(_discard_probe(backend, profile, removed=removed, residue=residue),),
+        )
+    try:
+        backend.delete(profile, RECORD_KEY)
+    except SecretError:
+        return BackendState(
+            MISCONFIGURED,
+            f"{subject} could not remove the value it stored",
+            side_effects=(residue,),
+        )
+    return BackendState(
+        READY,
+        f"{subject} stored, returned, and removed a value",
+        round_tripped=True,
+        side_effects=(removed,),
+    )
+
+
 @dataclass(frozen=True)
 class PassBackend:
     """A password-store backend using stdin for secret input."""
@@ -263,43 +325,18 @@ class PassBackend:
         This is the only check that proves a store can keep a credential, and
         the only one that changes it. Nothing calls it implicitly.
         """
-        state = self.inspect()
-        if not state.usable:
-            return state
-        effects = (
-            "wrote and removed one entry under ncl/, which a Git-backed store "
-            "records as two commits",
+        return _round_trip(
+            self,
+            subject="pass",
+            removed=(
+                "wrote and removed one entry under ncl/, which a Git-backed store "
+                "records as two commits"
+            ),
+            residue=(
+                "a temporary entry under ncl/ may remain, which a Git-backed store "
+                "records as a commit"
+            ),
         )
-        profile = f"probe-{token_source.token_hex(12)}"
-        key = RECORD_KEY
-        value = token_source.token_urlsafe(24)
-        stored = False
-        try:
-            self.set(profile, key, value)
-            stored = True
-            if self.get(profile, key) != value:
-                return BackendState(
-                    MISCONFIGURED,
-                    "pass did not return the value it stored",
-                    side_effects=effects,
-                )
-            self.delete(profile, key)
-            stored = False
-            return BackendState(
-                READY,
-                "pass stored, returned, and removed a value",
-                round_tripped=True,
-                side_effects=effects,
-            )
-        except SecretError:
-            return BackendState(
-                MISCONFIGURED, "pass could not round-trip a value", side_effects=effects
-            )
-        finally:
-            if stored:
-                # The value itself is never named, only the path that may hold it.
-                with suppress(SecretError):
-                    self.delete(profile, key)
 
 
 @dataclass(frozen=True)
@@ -367,41 +404,12 @@ class LibsecretBackend:
 
     def round_trip(self) -> BackendState:
         """Store, read back, and remove one value, saying what that cost."""
-        state = self.inspect()
-        if not state.usable:
-            return state
-        effects = ("wrote and removed one Secret Service item labelled `ncl credential`",)
-        profile = f"probe-{token_source.token_hex(12)}"
-        key = RECORD_KEY
-        value = token_source.token_urlsafe(24)
-        stored = False
-        try:
-            self.set(profile, key, value)
-            stored = True
-            if self.get(profile, key) != value:
-                return BackendState(
-                    MISCONFIGURED,
-                    "Secret Service did not return the value it stored",
-                    side_effects=effects,
-                )
-            self.delete(profile, key)
-            stored = False
-            return BackendState(
-                READY,
-                "Secret Service stored, returned, and removed a value",
-                round_tripped=True,
-                side_effects=effects,
-            )
-        except SecretError:
-            return BackendState(
-                MISCONFIGURED,
-                "Secret Service could not round-trip a value",
-                side_effects=effects,
-            )
-        finally:
-            if stored:
-                with suppress(SecretError):
-                    self.delete(profile, key)
+        return _round_trip(
+            self,
+            subject="Secret Service",
+            removed="wrote and removed one Secret Service item labelled `ncl credential`",
+            residue="a temporary Secret Service item labelled `ncl credential` may remain",
+        )
 
 
 _BACKEND_FACTORIES: dict[str, BackendFactory] = {

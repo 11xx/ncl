@@ -80,9 +80,12 @@ The typed view exists because the alternative is wrong more often than it
 looks. RFC 5545 folds a line longer than 75 octets onto continuation lines and
 escapes `,`, `;`, and newlines inside text values, so a reader that matches on
 lines returns a truncated string and reports it as the stored value. `alarms`
-holds each `VALARM` trigger in the spelling `--alarm` accepts, so a reminder
-read back can be written again unchanged; a trigger stored as an absolute
-instant is reported as that instant rather than disguised as an offset.
+holds each `VALARM` trigger in the spelling it is stored with. A relative
+trigger reads back as its RFC 5545 duration, which is what `--alarm` accepts,
+so that reminder can be written again unchanged. An absolute trigger reads back
+as its `DATE-TIME` instant, which is read-only: `--alarm` takes durations
+alone, and reporting the instant is more honest than disguising it as an
+offset.
 Repeated or comma-separated `CATEGORIES` flatten into one tag list, since both
 spellings denote the same set. A non-numeric `PRIORITY` and a `VALARM` with no
 readable trigger are refused rather than reported as absent, because a corrupt
@@ -138,6 +141,12 @@ An update with neither alarm option preserves every existing `VALARM`. Repeating
 `--alarm` replaces the complete alarm set with the supplied RFC 5545 duration
 triggers. `--clear-alarms` replaces it with an empty set. The replacement and
 clear forms are mutually exclusive.
+
+`--alarm` writes relative triggers only. An absolute `DATE-TIME` trigger read
+from an event is therefore not a value that can be given back: passing one is
+refused as not being a duration. Preserving such a reminder means leaving the
+alarm options off, which keeps every existing `VALARM` untouched — a
+replacement set written with `--alarm` cannot reproduce it.
 
 ## Portable description projection
 
