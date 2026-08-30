@@ -55,16 +55,24 @@ class Step:
     details: dict[str, Any]
 
     def as_dict(self) -> dict[str, Any]:
-        """Return metadata without exposing the private request body."""
-        return {
+        """Return metadata without exposing the private request body.
+
+        A step whose payload is itself a secret withholds its length too. For
+        an ordinary body the size is useful and tells nobody anything; for a
+        password it is the one property of the value worth guessing from, and
+        this view is what a `--json` caller passes on.
+        """
+        view = {
             "action": self.action,
             "href": self.href,
             "etag": self.etag,
             "summary": self.summary,
             "content_type": self.content_type,
             "details": self.details,
-            "payload_bytes": len(payload_bytes(self)),
         }
+        if not self.details.get("secret_payload"):
+            view["payload_bytes"] = len(payload_bytes(self))
+        return view
 
 
 @dataclass(frozen=True)

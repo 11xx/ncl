@@ -20,6 +20,7 @@ from . import (
     identity,
     login,
     mutate,
+    ocs,
     plans,
     profiles,
     recurrence,
@@ -28,6 +29,7 @@ from . import (
     scheduling,
     secrets,
     session,
+    shares,
     todos,
 )
 from .config import ConfigError
@@ -748,6 +750,64 @@ def build_parser() -> argparse.ArgumentParser:
     _add_options(files_delete)
     files_delete.add_argument("href", help="File href; collection deletion is refused")
 
+    share = commands.add_parser(
+        "share",
+        help="See and change who else can reach a file",
+        description=(
+            "Shares over the OCS sharing API. A share is the only mutation here that "
+            "changes who else can reach a resource, so creating one is planned and "
+            "applied like a write."
+        ),
+    )
+    share_commands = share.add_subparsers(dest="share_command", metavar="<subcommand>")
+
+    share_list = share_commands.add_parser("list", help="List shares, over one path or all")
+    _add_options(share_list)
+    share_list.add_argument(
+        "href", nargs="?", help="Resource href; omit to report every share this account made"
+    )
+    share_list.add_argument(
+        "--subfiles",
+        action="store_true",
+        help="Report shares inside the named collection instead of on it",
+    )
+
+    share_show = share_commands.add_parser("show", help="Read one share by id")
+    _add_options(share_show)
+    share_show.add_argument("share_id", help="Share id, as a listing reports it")
+
+    share_create = share_commands.add_parser(
+        "create", help="Plan a new share; grants nothing yet"
+    )
+    _add_options(share_create)
+    share_create.add_argument("href", help="Resource href, inside the files allowlist")
+    reach = share_create.add_mutually_exclusive_group(required=True)
+    reach.add_argument(
+        "--public", action="store_true", help="A link anyone holding it can open"
+    )
+    reach.add_argument("--user", help="Share with one account")
+    reach.add_argument("--group", help="Share with one group")
+    share_create.add_argument(
+        "--permissions",
+        choices=sorted(shares.PERMISSION_SETS),
+        default="read",
+        help="What the share grants; read unless stated",
+    )
+    share_create.add_argument(
+        "--password-from",
+        metavar="PATH",
+        help="Read a link password from a file, so it never enters argv",
+    )
+    share_create.add_argument("--expires", help="Expiry date, ISO 8601, in the future")
+    share_create.add_argument("--note", help="Note shown to the recipient")
+    share_create.add_argument("--label", help="Label for this share, shown to its owner")
+
+    share_delete = share_commands.add_parser(
+        "delete", help="Plan the revocation of one share"
+    )
+    _add_options(share_delete)
+    share_delete.add_argument("share_id", help="Share id, as a listing reports it")
+
     plan = commands.add_parser("plan",
         help="Inspect frozen mutations",
         description=(
@@ -962,11 +1022,19 @@ def _emit_plan(plan: Any, json_output: bool) -> int:
         for index, (step, progress) in enumerate(
             zip(plan.steps, plan.progress, strict=True), start=1
         ):
+            size = (
+                "payload withheld"
+                if step.details.get("secret_payload")
+                else f"{len(plans.payload_bytes(step))} bytes"
+            )
             render.emit(
                 f"  {index}. {progress.state:9} {step.action:14} "
-                f"{step.summary or step.href} ({len(plans.payload_bytes(step))} bytes)"
+                f"{step.summary or step.href} ({size})"
             )
             render.emit(f"       href    {step.href}")
+            if step.details.get("reach"):
+                render.emit(f"       grants  {', '.join(step.details.get('grants', ()))} "
+                            f"to {step.details['reach']}")
             if step.details.get("destination"):
                 render.emit(f"       to      {step.details['destination']}")
             if step.details.get("all_day"):
@@ -1037,6 +1105,7 @@ def _dispatchers() -> dict[str, plans.Dispatcher]:
             runs.validate_bundle,
         ),
         "files.": plans.Dispatcher(files.validate_step, files.execute, files.reconcile),
+        "share.": plans.Dispatcher(shares.validate_step, shares.execute, shares.reconcile),
     }
 
 
@@ -1662,6 +1731,92 @@ def _run_files(args: argparse.Namespace) -> int:
     return exits.USAGE
 
 
+def _share_password(path: str | None) -> str | None:
+    """Read a link password from a file rather than from the command line.
+
+    A password in `argv` is visible to every process on the host and lands in
+    shell history, which is the same class of exposure the credential rule
+    exists to prevent.
+    """
+    if path is None:
+        return None
+    try:
+        value = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise shares.ShareError(
+            f"the share password file could not be read: {exc.strerror}", exits.USAGE
+        ) from exc
+    password = value.strip("\n")
+    if not password:
+        raise shares.ShareError("the share password file is empty", exits.USAGE)
+    render.register_secret(password)
+    return password
+
+
+def _run_share(args: argparse.Namespace) -> int:
+    profile = _selected_profile(args)
+    transport = session.Session(profile)
+    account = identity.discover(profile, session=transport).account_name
+
+    if args.share_command == "list":
+        found = shares.list_shares(
+            profile,
+            session=transport,
+            account_name=account,
+            href=args.href,
+            subfiles=args.subfiles,
+        )
+        if args.json:
+            _json({"shares": [item.as_dict() for item in found]})
+        else:
+            for item in found:
+                reach = item.recipient or ("anyone with the link" if item.public else "")
+                render.emit(
+                    f"{item.share_id:>8}  {item.share_type:<16}  "
+                    f"{','.join(item.permissions) or 'none'}  {reach}"
+                )
+                render.emit(f"          {item.path}")
+                if item.url:
+                    render.emit(f"          {item.url}")
+        return exits.OK
+
+    if args.share_command == "show":
+        found = shares.fetch(
+            profile, session=transport, account_name=account, share_id=args.share_id
+        )
+        if args.json:
+            _json({"share": found.as_dict()})
+        else:
+            for key, value in found.as_dict().items():
+                render.emit(f"{key}: {_plain(value)}")
+        return exits.OK
+
+    if args.share_command == "create":
+        share_type = "public_link" if args.public else ("user" if args.user else "group")
+        plan = shares.plan_create(
+            profile,
+            session=transport,
+            account_name=account,
+            href=args.href,
+            share_type=share_type,
+            recipient=args.user or args.group,
+            permissions=args.permissions,
+            password=_share_password(args.password_from),
+            expires=args.expires,
+            note=args.note,
+            label=args.label,
+        )
+        return _emit_plan(plan, args.json)
+
+    if args.share_command == "delete":
+        plan = shares.plan_delete(
+            profile, session=transport, account_name=account, share_id=args.share_id
+        )
+        return _emit_plan(plan, args.json)
+
+    return exits.USAGE
+
+
 def _run_apply(args: argparse.Namespace) -> int:
     profile = _selected_profile(args)
     with plans.claim(args.plan_id):
@@ -1733,6 +1888,8 @@ def _main(argv: list[str] | None = None) -> int:
             return _run_task(args)
         if args.command == "files":
             return _run_files(args)
+        if args.command == "share":
+            return _run_share(args)
         if args.command == "plan":
             return _run_plan(args)
         if args.command == "apply":
@@ -1750,6 +1907,8 @@ def _main(argv: list[str] | None = None) -> int:
         events.EventError,
         todos.TodoError,
         files.FileError,
+        ocs.OcsError,
+        shares.ShareError,
         plans.PlanError,
     ) as exc:
         return _error(exc, json_output)
