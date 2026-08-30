@@ -213,7 +213,10 @@ def discover(
             addresses.append(address)
     if not addresses:
         raise SchedulingError(
-            "the principal has no mailto: calendar user address", exits.PRECONDITION_FAILED
+            "the principal has no mailto: calendar user address, so it can hold no "
+            "scheduling role; a server derives that address from the account's email "
+            "address, which is unset",
+            exits.PRECONDITION_FAILED,
         )
 
     return SchedulingIdentity(

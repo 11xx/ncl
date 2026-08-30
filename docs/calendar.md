@@ -338,3 +338,34 @@ would contact:
 `SCHEDULE-AGENT=CLIENT` or `NONE` moves delivery to the client or removes it.
 This tool neither performs delivery itself nor silently drops it, so it refuses
 the resource instead.
+
+
+## Free/busy
+
+Free/busy is the one scheduling question that contacts nobody. `ncl cal
+freebusy --from <iso> --to <iso>` posts a `VFREEBUSY` `REQUEST` to the
+authenticated account's schedule outbox; the server answers out of calendars
+this account may have no right to read, stores nothing, and delivers no iTIP
+message. So it sits outside the plan/apply boundary with every other read.
+
+RFC 6638 derives the originator and the recipients from the posted body rather
+than from request headers, so the `ORGANIZER` and the `ATTENDEE` list are the
+addressing. The organizer is always one of this account's own calendar user
+addresses, because the outbox belongs to this principal. With no `--attendee`
+the question is about this account.
+
+The answer is a `schedule-response` carrying one `response` per recipient, each
+with a recipient address, an iTIP `request-status`, and — when the status is a
+`2.x` success — the `VFREEBUSY` itself. Periods are reported as UTC intervals
+and an `FBTYPE`, defaulting to `BUSY` when the parameter is absent. Nothing
+else is reported: a busy period carries no summary, no attendees, and no href.
+
+Every refusal here fails toward busy. A recipient the server did not answer
+successfully is reported as unanswered with its status, never as a free
+schedule; a recipient asked about and not answered for at all is malformed; and
+a success carrying no calendar data is malformed rather than an empty day.
+
+A server that cannot resolve an address may answer with the address it was
+given rather than the one asked about. An answer whose recipient cannot be read
+therefore reports the server's `request-status` rather than the parse failure
+it caused, because the status is what explains it.
