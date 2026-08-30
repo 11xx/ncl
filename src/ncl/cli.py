@@ -33,6 +33,7 @@ from . import (
     session,
     shares,
     todos,
+    uploads,
     vcard,
 )
 from .config import ConfigError
@@ -763,6 +764,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     files_read.add_argument(
         "--force", action="store_true", help="Replace an existing --output path"
+    )
+
+    files_read.add_argument(
+        "--offset", type=int, default=0, help="First byte to read; needs --output"
+    )
+    files_read.add_argument(
+        "--length", type=int, help="How many bytes to read from the offset"
     )
 
     files_write = file_subcommands.add_parser(
@@ -1814,6 +1822,34 @@ def _run_files(args: argparse.Namespace) -> int:
     if args.files_command == "read":
         if args.force and not args.output:
             raise files.FileError("--force requires --output", exits.USAGE)
+        if args.offset or args.length is not None:
+            window, total = uploads.read_range(
+                profile,
+                session=transport,
+                href=files._scoped(profile, args.href),
+                offset=args.offset,
+                length=args.length,
+            )
+            if not args.output:
+                raise files.FileError(
+                    "a ranged read writes bytes at their own offset, so it needs --output",
+                    exits.USAGE,
+                )
+            output = uploads.append_local(args.output, window, offset=args.offset)
+            value = {
+                "output": str(output),
+                "offset": args.offset,
+                "bytes": len(window),
+                "total": total,
+            }
+            if args.json:
+                _json(value)
+            else:
+                render.emit(
+                    f"wrote {len(window)} bytes at offset {args.offset} to {output}"
+                    + (f" (of {total})" if total is not None else "")
+                )
+            return exits.OK
         reference, content = files.read_file(profile, session=transport, href=args.href)
         if args.output:
             output = files.write_local(args.output, content, force=args.force)
@@ -1831,14 +1867,30 @@ def _run_files(args: argparse.Namespace) -> int:
         return exits.OK
 
     if args.files_command == "write":
-        content = Path(args.source).expanduser().read_bytes()
-        plan = files.plan_write(
-            profile,
-            session=transport,
-            href=args.href,
-            content=content,
-            content_type=args.content_type,
-        )
+        source = Path(args.source).expanduser()
+        try:
+            measured = source.stat().st_size
+        except OSError as exc:
+            raise files.FileError(
+                f"the source file could not be read: {exc.strerror}", exits.USAGE
+            ) from exc
+        if measured > uploads.INLINE_LIMIT:
+            plan = files.plan_write_stream(
+                profile,
+                session=transport,
+                account_name=identity.discover(profile, session=transport).account_name,
+                href=args.href,
+                source=str(source),
+                content_type=args.content_type,
+            )
+        else:
+            plan = files.plan_write(
+                profile,
+                session=transport,
+                href=args.href,
+                content=source.read_bytes(),
+                content_type=args.content_type,
+            )
         return _emit_plan(plan, args.json)
 
     if args.files_command == "move":
@@ -2038,6 +2090,7 @@ def _main(argv: list[str] | None = None) -> int:
         vcard.VcardError,
         todos.TodoError,
         files.FileError,
+        uploads.UploadError,
         ocs.OcsError,
         shares.ShareError,
         plans.PlanError,

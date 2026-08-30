@@ -13,7 +13,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
-from . import etag, exits, plans, profiles, relocate
+from . import etag, exits, plans, profiles, relocate, uploads
 from .identity import DAV, _element_name, _status_code
 from .session import Session, SessionError, absolute_url
 
@@ -482,6 +482,55 @@ def _content_type(value: str) -> str:
     return candidate
 
 
+def plan_write_stream(
+    profile: Any,
+    *,
+    session: Session,
+    account_name: str,
+    href: str,
+    source: str,
+    content_type: str = "application/octet-stream",
+) -> plans.Plan:
+    """Freeze a write whose content is too large to hold in the plan.
+
+    What is frozen is the identity of the content rather than the content: the
+    source path, its size, and its SHA-256. Applying re-reads the file and
+    hashes it while sending, so a source that changed between planning and
+    applying is a refusal rather than a silent upload of something else.
+    """
+    target = _scoped(profile, href)
+    size, digest = uploads.measure(source)
+    existing = stat_resource(profile, session=session, href=target, missing_ok=True)
+    if existing is not None and existing.collection:
+        raise FileError(
+            "a collection cannot be replaced with file content",
+            exits.UNSUPPORTED_STRUCTURE,
+        )
+    if existing is not None:
+        _strong_etag(existing.etag, "a file replacement")
+    return plans.write_bundle(
+        profile=profile,
+        summary=_segments(target)[-1],
+        steps=(
+            plans.freeze_step(
+                action="files.upload",
+                href=target,
+                etag=existing.etag if existing is not None else "",
+                summary=_segments(target)[-1],
+                content_type=_content_type(content_type),
+                details={
+                    "exists": existing is not None,
+                    "size": size,
+                    "sha256": digest,
+                    "source": str(Path(source).expanduser().resolve()),
+                    "account_name": account_name,
+                    "upload_token": token_source.token_hex(16),
+                },
+            ),
+        ),
+    )
+
+
 def plan_write(
     profile: Any,
     *,
@@ -766,7 +815,7 @@ def _reconcile_mkcol(profile: Any, *, session: Session, step: plans.Step) -> dic
     return {"state": "verified" if created.collection else "uncertain"}
 
 
-_ACTIONS = {"files.write", "files.delete", "files.move", "files.mkcol"}
+_ACTIONS = {"files.write", "files.upload", "files.delete", "files.move", "files.mkcol"}
 
 
 def _strong_etag(value: str, operation: str) -> str:
@@ -803,6 +852,27 @@ def validate_step(step: plans.Step) -> None:
         if body:
             raise plans.PlanError("file deletion steps must not carry a payload", exits.PLAN_STALE)
         _strong_etag(step.etag, "a file deletion")
+        return
+    if step.action == "files.upload":
+        if body:
+            raise plans.PlanError(
+                "a streamed write freezes its source's identity, not its bytes",
+                exits.PLAN_STALE,
+            )
+        _content_type(step.content_type)
+        _frozen_digest(step)
+        size = step.details.get("size")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise plans.PlanError("a streamed write needs a frozen size", exits.PLAN_STALE)
+        for name in ("source", "account_name", "upload_token"):
+            if not str(step.details.get(name) or ""):
+                raise plans.PlanError(
+                    f"a streamed write needs a frozen {name}", exits.PLAN_STALE
+                )
+        if not isinstance(step.details.get("exists"), bool):
+            raise plans.PlanError(
+                "file write steps need an exists classification", exits.PLAN_STALE
+            )
         return
     _content_type(step.content_type)
     exists = step.details.get("exists")
@@ -845,6 +915,42 @@ def _refuse_redirect(response: Any, *, action: str, href: str) -> None:
         )
 
 
+def _execute_upload(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
+    """Stream a large file into place, then confirm what landed."""
+    target = _file_target(profile, step)
+    details = step.details
+    etag = uploads.stream_upload(
+        profile,
+        session=session,
+        account_name=str(details["account_name"]),
+        source=str(details["source"]),
+        destination=target,
+        size=int(details["size"]),
+        digest=str(details["sha256"]),
+        token=str(details["upload_token"]),
+        overwrite=bool(details.get("exists")),
+    )
+    # Past the assembling MOVE the file exists, so every way of failing to
+    # confirm it is uncertainty rather than failure.
+    try:
+        written = stat_resource(profile, session=session, href=target)
+        assert written is not None
+        if written.size != int(details["size"]):
+            raise FileError(
+                f"the assembled file is {written.size} bytes, not {details['size']}",
+                exits.OUTCOME_UNCERTAIN,
+            )
+    except FileError as exc:
+        raise FileError(exc.message, exits.OUTCOME_UNCERTAIN) from exc
+    return {
+        "action": step.action,
+        "href": target,
+        "etag": etag or written.etag,
+        "size": written.size,
+        "verified": True,
+    }
+
+
 def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
     """Execute one frozen file step and verify the exact resource."""
     validate_step(step)
@@ -852,6 +958,8 @@ def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, An
         return _execute_move(profile, session=session, step=step)
     if step.action == "files.mkcol":
         return _execute_mkcol(profile, session=session, step=step)
+    if step.action == "files.upload":
+        return _execute_upload(profile, session=session, step=step)
     target = _file_target(profile, step)
     if step.action == "files.write":
         condition = {"If-Match": step.etag} if step.etag else {"If-None-Match": "*"}
@@ -917,6 +1025,26 @@ def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, An
         ) from exc
 
 
+def _reconcile_upload(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
+    """Settle a streamed write without reading the whole file into memory.
+
+    An absent destination means the assembling MOVE never happened, so nothing
+    landed. A present one is only verified once its bytes hash to what the plan
+    froze: a matching length is not a matching file.
+    """
+    target = _file_target(profile, step)
+    size = int(step.details["size"])
+    stored = stat_resource(profile, session=session, href=target, missing_ok=True)
+    if stored is None:
+        return {"state": "pending"}
+    if stored.collection or stored.size != size:
+        return {"state": "uncertain", "size": stored.size}
+    digest = uploads.remote_digest(profile, session=session, href=target, size=size)
+    if digest == _frozen_digest(step):
+        return {"state": "verified", "etag": stored.etag, "size": stored.size}
+    return {"state": "uncertain", "size": stored.size}
+
+
 def reconcile(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
     """Read the exact file and classify the frozen file operation."""
     validate_step(step)
@@ -924,6 +1052,8 @@ def reconcile(profile: Any, *, session: Session, step: plans.Step) -> dict[str, 
         return _reconcile_move(profile, session=session, step=step)
     if step.action == "files.mkcol":
         return _reconcile_mkcol(profile, session=session, step=step)
+    if step.action == "files.upload":
+        return _reconcile_upload(profile, session=session, step=step)
     target = _file_target(profile, step)
     try:
         stored, content = read_file(profile, session=session, href=target)

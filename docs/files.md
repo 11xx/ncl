@@ -69,8 +69,43 @@ Which conditions a server answers is not uniform. A rejected search is reported
 as possibly naming an unsupported condition rather than as a malformed request,
 because that is the difference the caller can act on.
 
-Reads currently buffer one complete response in memory. Recursive traversal,
-range reads, and streaming large objects are not implemented.
+## Objects larger than memory
+
+A single `PUT` needs its whole body at once — in this process, and in the plan
+that froze it, where a payload is stored base64-encoded. That is right for a
+note and wrong for a video: freezing a gigabyte would cost a gigabyte and a
+third on disk before anything was sent.
+
+Above `uploads.INLINE_LIMIT`, `ncl files write` freezes the *identity* of the
+content instead of the content: the source path, its size, and its SHA-256.
+Applying re-reads the file and hashes it while sending, and refuses if what it
+read is not what the plan promised — a plan that quietly uploaded whatever the
+path happens to hold now would not be a frozen plan. Below the limit nothing
+changes, and the exact bytes stay in the plan.
+
+The transfer itself is Nextcloud's chunked upload: an upload directory is
+created, numbered parts are `PUT` into it, and a `MOVE` of the directory's
+`.file` pseudo-resource assembles them at the destination in one server-side
+operation, consuming the directory. Parts are named zero-padded so a server
+ordering them lexicographically and one ordering them numerically assemble the
+same bytes. Nothing exists at the destination until that final `MOVE`, so a
+failure part-way through leaves the destination untouched; the upload directory
+is removed on the way out, and failing to remove it never replaces the error
+that caused it.
+
+Reconciling a streamed write reads the stored file back in windows and hashes
+it, rather than pulling it into memory. A matching length is not a matching
+file — two different files of one length are the ordinary case — so a
+destination whose bytes do not hash to the frozen identity stays uncertain.
+
+`ncl files read --offset <n> [--length <n>]` reads one window, and writes it at
+its own offset in `--output`, because a ranged read is normally one of several.
+A server may ignore `Range` and answer `200` with the whole entity; that is
+legal, and returning it as though it were the requested window would misplace
+every byte the caller then indexes, so it is refused instead.
+
+Recursive traversal is still not implemented; `ncl files find` answers the
+question it was usually wanted for.
 
 ## Mutations
 
