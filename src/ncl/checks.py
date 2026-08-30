@@ -213,10 +213,7 @@ def _run_authenticated(profile: Any, checks: list[Check], *, transport: Any = No
                 _skip(f"calendar-home:{profile.name}", "credential lookup failed"),
             )
         )
-        for field, entries in (
-            ("calendars", profile.calendars),
-            ("files_roots", profile.files_roots),
-        ):
+        for field, entries in config.allowlists(profile):
             for index, _entry in enumerate(entries):
                 checks.append(
                     _skip(
@@ -234,10 +231,7 @@ def _run_authenticated(profile: Any, checks: list[Check], *, transport: Any = No
                 _skip(f"calendar-home:{profile.name}", detail),
             )
         )
-        for field, entries in (
-            ("calendars", profile.calendars),
-            ("files_roots", profile.files_roots),
-        ):
+        for field, entries in config.allowlists(profile):
             for index, _entry in enumerate(entries):
                 checks.append(_skip(f"remote:{profile.name}:{field}:{index}", detail))
         return
@@ -258,10 +252,7 @@ def _run_authenticated(profile: Any, checks: list[Check], *, transport: Any = No
             )
         )
         checks.append(_skip(f"calendar-home:{profile.name}", "principal discovery failed"))
-        for field, entries in (
-            ("calendars", profile.calendars),
-            ("files_roots", profile.files_roots),
-        ):
+        for field, entries in config.allowlists(profile):
             for index, _entry in enumerate(entries):
                 checks.append(
                     _skip(
@@ -274,7 +265,7 @@ def _run_authenticated(profile: Any, checks: list[Check], *, transport: Any = No
     checks.append(_check(f"credential:{profile.name}", "pass", "stored credential was accepted"))
     checks.append(_check(f"principal:{profile.name}", "pass", f"resolved {result.account_name!r}"))
     checks.append(_check(f"calendar-home:{profile.name}", "pass", result.calendar_home))
-    for field, entries in (("calendars", profile.calendars), ("files_roots", profile.files_roots)):
+    for field, entries in config.allowlists(profile):
         for index, entry in enumerate(entries):
             name = f"remote:{profile.name}:{field}:{index}"
             if field == "calendars" and not identity.in_calendar_home(entry, result.calendar_home):
@@ -382,13 +373,13 @@ def run(
             else:
                 checks.append(_skip(name, "not selected by this profile"))
 
-        for field, entries in (
-            ("calendars", profile.calendars),
-            ("files_roots", profile.files_roots),
-        ):
+        for field, entries in config.allowlists(profile):
             name = f"allowlist:{profile.name}:{field}"
             if not entries:
-                checks.append(_check(name, "fail", "allowlist is empty"))
+                if field in config.REQUIRED_ALLOWLISTS:
+                    checks.append(_check(name, "fail", "allowlist is empty"))
+                else:
+                    checks.append(_skip(name, "not configured; this profile reaches none"))
                 continue
             try:
                 for entry in entries:
