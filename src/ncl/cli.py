@@ -2208,6 +2208,11 @@ def _main(argv: list[str] | None = None) -> int:
         plans.PlanError,
     ) as exc:
         return _error(exc, json_output)
+    except BrokenPipeError:
+        # A closed pipe is an OSError, and the handler below would report it as
+        # a failure of the command. It is the reader's decision, so it belongs
+        # to the stream owner rather than to any command's error mapping.
+        raise
     except (OSError, ValueError) as exc:
         return _error(exc, json_output)
 
@@ -2222,11 +2227,17 @@ def main(argv: list[str] | None = None) -> int:
         with render.redacted_standard_streams():
             try:
                 return _main(argv)
+            except BrokenPipeError:
+                return render.closed_pipe()
             except Exception:
                 # An interpreter traceback is formatted after the stream wrapper
                 # has restored the original streams, so it could expose a
                 # registered value.
                 return _unexpected_error()
+    except BrokenPipeError:
+        # Restoring the streams flushes them, so the closed pipe can surface
+        # here instead.
+        return render.closed_pipe()
     except Exception:
         # Cleanup failures happen after restoration and must not expose a
         # traceback either.

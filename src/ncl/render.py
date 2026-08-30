@@ -5,10 +5,11 @@ from __future__ import annotations
 import base64
 import errno
 import json
+import os
 import sys
 from bisect import bisect_right
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from typing import Any
 
 _MARKER = "[redacted]"
@@ -300,3 +301,35 @@ def emit(value: Any, *, end: str = "\n", error: bool = False) -> None:
 def emit_error(value: Any, *, end: str = "\n") -> None:
     """Render one value to stderr after recursively redacting secrets."""
     emit(value, end=end, error=True)
+
+
+#: What a shell reports for a process killed by SIGPIPE. Exiting with it says
+#: the output was cut short rather than that the command failed, which is the
+#: distinction a caller in a pipeline needs.
+SIGPIPE_EXIT = 141
+
+
+def closed_pipe() -> int:
+    """End quietly when whatever was reading the output has stopped.
+
+    `ncl ... | head` closes the pipe as soon as it has its lines, and every
+    later write raises. That is the reader's decision rather than a failure of
+    the command, and reporting it as an unexpected error tells the caller to
+    investigate something that worked.
+
+    Python flushes the standard streams again at interpreter exit, so stdout is
+    pointed at the null device first; otherwise the same broken pipe reappears
+    as an unraisable exception after everything has finished. This lives beside
+    the stream wrappers because they are what holds the buffered writes that
+    the flush would otherwise fail on.
+    """
+    with suppress(OSError):
+        sys.stdout.flush()
+    with suppress(OSError, ValueError):
+        descriptor = sys.stdout.fileno()
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, descriptor)
+        finally:
+            os.close(devnull)
+    return SIGPIPE_EXIT
