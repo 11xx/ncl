@@ -134,3 +134,38 @@ def test_the_conflict_response_holds_for_every_situation_that_raises_it():
     assert "etag" not in response
     assert "read it again" not in response
     assert "nothing was overwritten" in response
+
+
+def test_a_reader_that_stops_early_is_not_an_unexpected_failure(monkeypatch, capsys):
+    """`ncl ... | head` closes the pipe; that is the reader's decision, not a fault."""
+    from ncl import cli, render
+
+    def _refuse(*args, **kwargs):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(cli, "_main", _refuse)
+
+    code = cli.main(["cal", "list"])
+
+    assert code == render.SIGPIPE_EXIT
+    assert code != exits.ERROR
+    # Nothing is said about it: the caller asked for fewer lines and got them.
+    assert "Unexpected failure" not in capsys.readouterr().err
+
+
+def test_a_pipe_closed_while_the_streams_are_restored_is_also_quiet(monkeypatch, capsys):
+    """Restoring the wrapped streams flushes them, so the break can surface there."""
+    from contextlib import contextmanager
+
+    from ncl import cli, render
+
+    @contextmanager
+    def _breaking():
+        yield
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(render, "redacted_standard_streams", _breaking)
+    monkeypatch.setattr(cli, "_main", lambda argv: exits.OK)
+
+    assert cli.main(["cal", "list"]) == render.SIGPIPE_EXIT
+    assert "Unexpected failure" not in capsys.readouterr().err
