@@ -1866,6 +1866,35 @@ def test_an_absolute_alarm_trigger_is_reported_as_an_instant():
     assert _ref(raw).alarms == ("20260901T090000Z",)
 
 
+def test_a_relative_trigger_is_reusable_and_an_absolute_one_is_read_only():
+    """The documented alarm contract, checked end to end against the writer."""
+    relative = _ref().alarms
+    assert relative == ("-PT15M",)
+    # A relative trigger read back is a value `--alarm` accepts.
+    assert b"TRIGGER:-PT15M" in mutate.build_event(
+        uid="alarm@example",
+        summary="Reminder",
+        start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+        end=dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
+        alarms=relative,
+    ).encode()
+
+    absolute = _ref(
+        RICH.replace(b"TRIGGER:-PT15M", b"TRIGGER;VALUE=DATE-TIME:20260901T090000Z")
+    ).alarms
+    assert absolute == ("20260901T090000Z",)
+    with pytest.raises(events.EventError) as refused:
+        mutate.build_event(
+            uid="alarm@example",
+            summary="Reminder",
+            start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+            end=dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
+            alarms=absolute,
+        )
+    assert refused.value.code == exits.USAGE
+    assert "duration" in refused.value.message
+
+
 def test_cal_show_json_carries_the_content_fields(monkeypatch, capsys):
     payload = mutate.build_event(
         uid="content@example",

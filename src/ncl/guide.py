@@ -288,7 +288,10 @@ CHANGE NOTHING BY ACCIDENT
 
   On update, omitting `--alarm` preserves existing reminders, `--alarm` replaces
   them with the repeatable offsets supplied, and `--clear-alarms` removes all of
-  them. The two options are mutually exclusive. A calendar client may still
+  them. The two options are mutually exclusive. `--alarm` takes durations only,
+  so a reminder read back as a relative trigger can be written again unchanged
+  while one read back as an absolute instant is read-only: preserving it means
+  leaving both options off. A calendar client may still
   hide URL or other structured fields; the projection only makes them readable
   to more clients and cannot force a client to display them.
 
