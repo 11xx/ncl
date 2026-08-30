@@ -13,7 +13,7 @@ from typing import Any
 
 import icalendar
 
-from . import etag, events, exits, ical_semantics, plans, profiles
+from . import caldav, etag, events, exits, ical_semantics, plans, profiles, relocate
 from .caldav import CalendarError
 from .events import EventError
 from .session import Session, SessionError
@@ -718,7 +718,342 @@ def _verify_deleted(session: Session, href: str) -> None:
     )
 
 
-_ACTIONS = {"cal.create", "cal.update", "cal.delete"}
+#: The component types a calendar advertises when the caller names none. Most
+#: servers fix `supported-calendar-component-set` at creation, so a collection
+#: made without VTODO can never host a task; defaulting to both keeps a caller
+#: from losing the task surface on a property that cannot be amended.
+DEFAULT_COMPONENTS = ("VEVENT", "VTODO")
+
+
+def _mkcalendar_body(
+    *, display_name: str, description: str, color: str, components: tuple[str, ...]
+) -> str:
+    properties = [f"<d:displayname>{_xml_text(display_name)}</d:displayname>"]
+    if description:
+        properties.append(
+            f"<c:calendar-description>{_xml_text(description)}</c:calendar-description>"
+        )
+    if color:
+        properties.append(f"<o:calendar-color>{_xml_text(color)}</o:calendar-color>")
+    comps = "".join(f'<c:comp name="{_xml_text(name)}"/>' for name in components)
+    properties.append(
+        f"<c:supported-calendar-component-set>{comps}</c:supported-calendar-component-set>"
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<c:mkcalendar xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" '
+        f'xmlns:o="{caldav.OC}"><d:set><d:prop>{"".join(properties)}</d:prop></d:set>'
+        "</c:mkcalendar>"
+    )
+
+
+def _xml_text(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _collection_target(profile: Any, href: str) -> str:
+    target = events._canonical(profile, href)
+    if not target.endswith("/"):
+        target += "/"
+    if not profiles.in_scope(target, list(profile.calendars)):
+        raise CalendarError(
+            f"{target} is outside this profile's calendar allowlist", exits.SCOPE_DENIED
+        )
+    return target
+
+
+def plan_mkcalendar(
+    profile: Any,
+    *,
+    session: Session,
+    href: str,
+    display_name: str,
+    description: str = "",
+    color: str = "",
+    components: tuple[str, ...] = DEFAULT_COMPONENTS,
+) -> plans.Plan:
+    """Freeze the creation of one calendar collection.
+
+    Creation is the one mutation that enlarges the tool's own reach: the
+    allowlist is a prefix list, so a collection made under an allowed calendar
+    home is addressable the moment it exists. That is the intended outcome, and
+    it is why the target is checked against the allowlist like any other href
+    rather than treated as new ground.
+    """
+    if not display_name.strip():
+        raise CalendarError("a calendar needs a display name", exits.USAGE)
+    unknown = [name for name in components if name not in {"VEVENT", "VTODO", "VJOURNAL"}]
+    if unknown:
+        raise CalendarError(
+            f"unsupported calendar component {unknown[0]!r}", exits.USAGE
+        )
+    if not components:
+        raise CalendarError("a calendar needs at least one component type", exits.USAGE)
+    target = _collection_target(profile, href)
+    try:
+        existing = caldav.fetch(profile, session=session, href=target)
+    except CalendarError as exc:
+        if exc.code not in {exits.TARGET_NOT_FOUND, exits.UNSUPPORTED_COLLECTION}:
+            raise
+        existing = None
+    if existing is not None:
+        raise CalendarError(
+            f"a calendar already exists at {target}; nothing was created", exits.CONFLICT
+        )
+    payload = _mkcalendar_body(
+        display_name=display_name,
+        description=description,
+        color=color,
+        components=components,
+    )
+    return plans.write_bundle(
+        profile=profile,
+        summary=display_name,
+        steps=(
+            plans.freeze_step(
+                action="cal.mkcalendar",
+                href=target,
+                etag="",
+                summary=display_name,
+                payload=payload.encode("utf-8"),
+                content_type="application/xml; charset=utf-8",
+                details={
+                    "display_name": display_name,
+                    "description": description,
+                    "color": color,
+                    "components": list(components),
+                },
+            ),
+        ),
+    )
+
+
+def plan_move(
+    profile: Any,
+    *,
+    session: Session,
+    href: str,
+    destination_calendar_href: str,
+) -> plans.Plan:
+    """Freeze the relocation of one event resource into another calendar.
+
+    A move addresses the resource, so a recurring master travels with every
+    override that shares its file and an occurrence cannot be moved away from
+    its series. Delete-and-recreate is not the same operation: it opens a
+    window where a failure loses the event, reconstructs only the properties
+    this tool models, and either mints a new UID or leaves a synced client
+    reconciling a tombstone against a fresh resource.
+    """
+    reference, raw = events.fetch(profile, session=session, href=href)
+    if not reference.etag:
+        raise EventError(
+            "the server returned no ETag for this event, so a move cannot be made "
+            "conditional",
+            exits.MALFORMED_RESPONSE,
+        )
+    source_etag = events.strong_etag(reference.etag)
+    destination_calendar = _collection_target(profile, destination_calendar_href)
+    if destination_calendar == reference.calendar_href:
+        raise EventError(
+            f"the event already lives in {destination_calendar}", exits.USAGE
+        )
+    destination = relocate.child_href(destination_calendar, reference.href)
+    if not profiles.in_scope(destination, list(profile.calendars)):
+        raise CalendarError(
+            f"{destination} is outside this profile's calendar allowlist",
+            exits.SCOPE_DENIED,
+        )
+    try:
+        events.fetch(profile, session=session, href=destination)
+    except EventError as exc:
+        if exc.code != exits.TARGET_NOT_FOUND:
+            raise
+    else:
+        raise EventError(
+            f"{destination} already holds an event; nothing was moved", exits.CONFLICT
+        )
+    return plans.write_bundle(
+        profile=profile,
+        summary=reference.summary,
+        steps=(
+            plans.freeze_step(
+                action="cal.move",
+                href=reference.href,
+                etag=source_etag,
+                summary=reference.summary,
+                payload=raw,
+                content_type="text/calendar; charset=utf-8",
+                details={
+                    "calendar_href": reference.calendar_href,
+                    "destination": destination,
+                    "destination_calendar_href": destination_calendar,
+                    "uid": reference.uid,
+                    "start": reference.start,
+                    "end": reference.end,
+                },
+            ),
+        ),
+    )
+
+
+def _move_destination(profile: Any, step: plans.Step) -> str:
+    destination = events._canonical(profile, str(step.details.get("destination", "")))
+    if not profiles.in_scope(destination, list(profile.calendars)):
+        raise CalendarError(
+            f"{destination} is outside this profile's calendar allowlist",
+            exits.SCOPE_DENIED,
+        )
+    return destination
+
+
+def _execute_mkcalendar(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
+    target = _collection_target(profile, step.href)
+    response = session.request(
+        "MKCALENDAR",
+        target,
+        headers={"Content-Type": step.content_type},
+        data=plans.payload_bytes(step),
+        max_redirects=0,
+    )
+    _refuse_redirect(response, action="collection creation", href=target)
+    relocate.classify_creation(
+        response.status,
+        fail=CalendarError,
+        href=target,
+    )
+    try:
+        stored = caldav.fetch(profile, session=session, href=target)
+    except CalendarError as exc:
+        raise CalendarError(
+            "the server accepted the calendar, but its readback could not be verified",
+            exits.OUTCOME_UNCERTAIN,
+        ) from exc
+    mismatches = _collection_mismatches(stored, step)
+    if mismatches:
+        raise CalendarError(
+            f"the server stored something different at {target}: " + "; ".join(mismatches),
+            exits.OUTCOME_UNCERTAIN,
+        )
+    return {
+        "action": step.action,
+        "href": target,
+        "display_name": stored.display_name,
+        "description": stored.description,
+        # Reported, never asserted: servers normalize a colour, and the stored
+        # spelling is the answer the caller needs rather than a verdict.
+        "color": stored.color,
+        "components": list(stored.components),
+        "in_scope": stored.in_scope,
+        "verified": True,
+    }
+
+
+def _collection_mismatches(stored: Any, step: plans.Step) -> list[str]:
+    mismatches: list[str] = []
+    for field, planned in (
+        ("display_name", step.details.get("display_name", "")),
+        ("description", step.details.get("description", "")),
+    ):
+        if getattr(stored, field) != planned:
+            mismatches.append(f"{field} {getattr(stored, field)!r} != {planned!r}")
+    planned_components = tuple(step.details.get("components", ()))
+    if planned_components and set(stored.components) != set(planned_components):
+        mismatches.append(
+            f"components {list(stored.components)!r} != {list(planned_components)!r}"
+        )
+    return mismatches
+
+
+def _execute_move(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
+    source = _calendar_target(profile, step)
+    destination = _move_destination(profile, step)
+    response = session.request(
+        "MOVE",
+        source,
+        headers=relocate.headers(destination, etag=step.etag),
+        max_redirects=0,
+    )
+    _refuse_redirect(response, action="move", href=source)
+    relocate.classify(
+        response.status,
+        fail=EventError,
+        source=source,
+        destination=destination,
+    )
+    try:
+        stored, stored_raw = events.fetch(profile, session=session, href=destination)
+    except (EventError, SessionError, ValueError, IndexError, TypeError) as exc:
+        raise EventError(
+            "the server accepted the move, but the destination could not be read back",
+            exits.OUTCOME_UNCERTAIN,
+        ) from exc
+    if _semantic_calendar(stored_raw) != _semantic_calendar(plans.payload_bytes(step)):
+        raise EventError(
+            f"the resource at {destination} is not the one that was moved",
+            exits.OUTCOME_UNCERTAIN,
+        )
+    _verify_deleted(session, source)
+    return {
+        "action": step.action,
+        "href": destination,
+        "moved_from": source,
+        "uid": stored.uid,
+        "etag": stored.etag,
+        "summary": stored.summary,
+        "calendar_href": stored.calendar_href,
+        "verified": True,
+    }
+
+
+def _reconcile_mkcalendar(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
+    target = _collection_target(profile, step.href)
+    try:
+        stored = caldav.fetch(profile, session=session, href=target)
+    except CalendarError as exc:
+        if exc.code == exits.TARGET_NOT_FOUND:
+            return {"state": "pending"}
+        raise CalendarError(
+            "the calendar creation could not be reconciled", exits.OUTCOME_UNCERTAIN
+        ) from exc
+    return {"state": "uncertain" if _collection_mismatches(stored, step) else "verified"}
+
+
+def _reconcile_move(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
+    source = _calendar_target(profile, step)
+    destination = _move_destination(profile, step)
+    frozen = plans.payload_bytes(step)
+    try:
+        _, moved = events.fetch(profile, session=session, href=destination)
+    except EventError as exc:
+        if exc.code != exits.TARGET_NOT_FOUND:
+            raise
+        moved = None
+    except (ValueError, IndexError, TypeError) as exc:
+        raise EventError(
+            "the move readback could not be reconciled", exits.OUTCOME_UNCERTAIN
+        ) from exc
+    try:
+        events.fetch(profile, session=session, href=source)
+    except EventError as exc:
+        if exc.code != exits.TARGET_NOT_FOUND:
+            raise
+        source_present = False
+    else:
+        source_present = True
+    if moved is None:
+        # Neither endpoint changed: the move never reached the server.
+        return {"state": "pending" if source_present else "uncertain"}
+    if source_present or _semantic_calendar(moved) != _semantic_calendar(frozen):
+        return {"state": "uncertain"}
+    return {"state": "verified"}
+
+
+_ACTIONS = {"cal.create", "cal.update", "cal.delete", "cal.mkcalendar", "cal.move"}
 
 
 def validate_step(step: plans.Step) -> None:
@@ -726,6 +1061,25 @@ def validate_step(step: plans.Step) -> None:
     if step.action not in _ACTIONS:
         raise plans.PlanError(f"unknown calendar plan action {step.action!r}", exits.USAGE)
     body = plans.payload_bytes(step)
+    if step.action == "cal.mkcalendar":
+        if not step.content_type or not body:
+            raise plans.PlanError(
+                "a calendar creation step needs its frozen request body", exits.PLAN_STALE
+            )
+        if step.etag:
+            raise plans.PlanError(
+                "calendar creations cannot carry an ETag", exits.PLAN_STALE
+            )
+        return
+    if step.action == "cal.move":
+        if not body:
+            raise plans.PlanError(
+                "a move step needs the frozen resource it relocates", exits.PLAN_STALE
+            )
+        if not str(step.details.get("destination", "")):
+            raise plans.PlanError("a move step needs a destination", exits.PLAN_STALE)
+        events.strong_etag(step.etag)
+        return
     if step.action == "cal.delete":
         if body:
             raise plans.PlanError(
@@ -753,6 +1107,10 @@ def _calendar_target(profile: Any, step: plans.Step) -> str:
 def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
     """Execute one frozen calendar step and verify the exact resource."""
     validate_step(step)
+    if step.action == "cal.mkcalendar":
+        return _execute_mkcalendar(profile, session=session, step=step)
+    if step.action == "cal.move":
+        return _execute_move(profile, session=session, step=step)
     target = _calendar_target(profile, step)
     if step.action == "cal.delete":
         response = session.request(
@@ -862,6 +1220,10 @@ def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, An
 def reconcile(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
     """Read the exact event and classify the frozen calendar operation."""
     validate_step(step)
+    if step.action == "cal.mkcalendar":
+        return _reconcile_mkcalendar(profile, session=session, step=step)
+    if step.action == "cal.move":
+        return _reconcile_move(profile, session=session, step=step)
     target = _calendar_target(profile, step)
     try:
         stored, raw = events.fetch(profile, session=session, href=target)

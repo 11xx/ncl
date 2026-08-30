@@ -718,3 +718,197 @@ def test_apply_refuses_profile_configuration_drift_before_any_request(changed):
     assert error.value.code == exits.PLAN_STALE
     assert transport.requests == []
     plans.consume(plan.plan_id)
+
+
+DESTINATION = ROOT + "archive/vm%402-example"
+
+
+def _stat(href, *, collection=False, size="12", etag='"v1"'):
+    return response(207, multistatus(entry(href, collection=collection, size=size, etag=etag)))
+
+
+def _missing(href):
+    return response(207, multistatus(failed_entry(href)))
+
+
+def test_a_move_freezes_both_hrefs_and_refuses_to_overwrite_the_destination():
+    transport = FakeSession(
+        _stat(SCRIPT),
+        _missing(DESTINATION),
+        response(201),
+        _stat(DESTINATION, etag='"v2"'),
+        _missing(SCRIPT),
+    )
+
+    plan = files.plan_move(
+        PROFILE, session=transport, href=SCRIPT, destination=DESTINATION
+    )
+    step = plan.steps[0]
+
+    assert step.action == "files.move"
+    assert step.href == SCRIPT
+    assert step.details["destination"] == DESTINATION
+
+    result = _apply_bundle(plan, transport)
+    move = next(item for item in transport.requests if item["method"] == "MOVE")
+
+    assert move["url"] == SCRIPT
+    assert move["headers"]["Destination"] == DESTINATION
+    assert move["headers"]["Overwrite"] == "F"
+    assert move["headers"]["If-Match"] == '"v1"'
+    assert result["verified"] is True
+    assert result["moved_from"] == SCRIPT
+
+
+def test_a_move_onto_an_occupied_destination_is_refused_while_planning():
+    transport = FakeSession(_stat(SCRIPT), _stat(DESTINATION))
+
+    with pytest.raises(files.FileError) as refusal:
+        files.plan_move(PROFILE, session=transport, href=SCRIPT, destination=DESTINATION)
+
+    assert refusal.value.code == exits.CONFLICT
+    assert not any(item["method"] == "MOVE" for item in transport.requests)
+
+
+def test_a_collection_cannot_be_moved():
+    transport = FakeSession(_stat(ROOT + "archive/", collection=True, size=""))
+
+    with pytest.raises(files.FileError) as refusal:
+        files.plan_move(
+            PROFILE, session=transport, href=ROOT + "archive/", destination=DESTINATION
+        )
+
+    assert refusal.value.code == exits.UNSUPPORTED_STRUCTURE
+
+
+def test_a_destination_outside_the_allowlist_is_refused_before_any_request():
+    transport = FakeSession()
+
+    with pytest.raises(files.FileError) as refusal:
+        files.plan_move(
+            PROFILE,
+            session=transport,
+            href=SCRIPT,
+            destination="https://cloud.example.invalid/remote.php/dav/files/alice/other/x",
+        )
+
+    assert refusal.value.code == exits.SCOPE_DENIED
+    assert transport.requests == []
+
+
+def test_a_move_the_server_reports_as_an_overwrite_is_uncertain():
+    transport = FakeSession(
+        _stat(SCRIPT), _missing(DESTINATION), response(204)
+    )
+    plan = files.plan_move(
+        PROFILE, session=transport, href=SCRIPT, destination=DESTINATION
+    )
+
+    with pytest.raises(files.FileError) as refusal:
+        _apply_bundle(plan, transport)
+
+    assert refusal.value.code == exits.OUTCOME_UNCERTAIN
+
+
+def test_a_move_the_server_forbids_is_a_server_refusal_not_a_conflict():
+    transport = FakeSession(_stat(SCRIPT), _missing(DESTINATION), response(403))
+    plan = files.plan_move(
+        PROFILE, session=transport, href=SCRIPT, destination=DESTINATION
+    )
+
+    with pytest.raises(files.FileError) as refusal:
+        _apply_bundle(plan, transport)
+
+    assert refusal.value.code == exits.SERVER_ERROR
+
+
+def test_a_move_the_server_refuses_with_412_conflicts_without_moving_anything():
+    transport = FakeSession(_stat(SCRIPT), _missing(DESTINATION), response(412))
+    plan = files.plan_move(
+        PROFILE, session=transport, href=SCRIPT, destination=DESTINATION
+    )
+
+    with pytest.raises(files.FileError) as refusal:
+        _apply_bundle(plan, transport)
+
+    assert refusal.value.code == exits.CONFLICT
+
+
+def test_a_move_whose_source_survives_is_uncertain_rather_than_verified():
+    transport = FakeSession(
+        _stat(SCRIPT),
+        _missing(DESTINATION),
+        response(201),
+        _stat(DESTINATION, etag='"v2"'),
+        _stat(SCRIPT),
+    )
+    plan = files.plan_move(
+        PROFILE, session=transport, href=SCRIPT, destination=DESTINATION
+    )
+
+    with pytest.raises(files.FileError) as refusal:
+        _apply_bundle(plan, transport)
+
+    assert refusal.value.code == exits.OUTCOME_UNCERTAIN
+
+
+def test_a_collection_is_created_and_read_back_as_one():
+    collection = ROOT + "archive/"
+    transport = FakeSession(
+        _missing(collection),
+        response(201),
+        _stat(collection, collection=True, size=""),
+    )
+
+    plan = files.plan_mkcol(PROFILE, session=transport, href=collection)
+    result = _apply_bundle(plan, transport)
+    created = next(item for item in transport.requests if item["method"] == "MKCOL")
+
+    assert created["url"] == collection
+    assert result["collection"] is True
+    assert result["verified"] is True
+
+
+def test_creating_a_collection_that_exists_is_refused_while_planning():
+    collection = ROOT + "archive/"
+    transport = FakeSession(_stat(collection, collection=True, size=""))
+
+    with pytest.raises(files.FileError) as refusal:
+        files.plan_mkcol(PROFILE, session=transport, href=collection)
+
+    assert refusal.value.code == exits.CONFLICT
+
+
+def test_a_collection_the_server_reports_as_a_file_is_uncertain():
+    collection = ROOT + "archive/"
+    transport = FakeSession(_missing(collection), response(201), _stat(collection))
+    plan = files.plan_mkcol(PROFILE, session=transport, href=collection)
+
+    with pytest.raises(files.FileError) as refusal:
+        _apply_bundle(plan, transport)
+
+    assert refusal.value.code == exits.OUTCOME_UNCERTAIN
+
+
+def test_a_move_that_never_reached_the_server_reconciles_as_pending():
+    transport = FakeSession(_stat(SCRIPT), _missing(DESTINATION))
+    plan = files.plan_move(
+        PROFILE, session=transport, href=SCRIPT, destination=DESTINATION
+    )
+    reader = FakeSession(_missing(DESTINATION), _stat(SCRIPT))
+
+    assert files.reconcile(PROFILE, session=reader, step=plan.steps[0]) == {
+        "state": "pending"
+    }
+
+
+def test_a_completed_move_reconciles_as_verified():
+    transport = FakeSession(_stat(SCRIPT), _missing(DESTINATION))
+    plan = files.plan_move(
+        PROFILE, session=transport, href=SCRIPT, destination=DESTINATION
+    )
+    reader = FakeSession(_stat(DESTINATION, etag='"v2"'), _missing(SCRIPT))
+
+    assert files.reconcile(PROFILE, session=reader, step=plan.steps[0]) == {
+        "state": "verified"
+    }

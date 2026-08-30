@@ -13,7 +13,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
-from . import etag, exits, plans, profiles
+from . import etag, exits, plans, profiles, relocate
 from .identity import DAV, _element_name, _status_code
 from .session import Session, SessionError, absolute_url
 
@@ -482,7 +482,147 @@ def plan_delete(profile: Any, *, session: Session, href: str) -> plans.Plan:
     )
 
 
-_ACTIONS = {"files.write", "files.delete"}
+def plan_move(profile: Any, *, session: Session, href: str, destination: str) -> plans.Plan:
+    """Freeze the relocation of one file, never a collection.
+
+    Read-then-write-then-delete is not a move. It is three mutations with a
+    window where both copies exist and another where neither is durable, it
+    drops every property the round trip does not carry, and a failure between
+    the write and the delete leaves the caller to work out which half landed.
+    `MOVE` relocates the resource itself, so there is no intermediate state to
+    reason about.
+
+    A collection is refused for the reason its deletion is: it holds unbounded
+    content that no plan can meaningfully show.
+    """
+    source = _scoped(profile, href)
+    target = _scoped(profile, destination)
+    if _segments(source) == _segments(target):
+        raise FileError(f"the file already lives at {target}", exits.USAGE)
+    existing = stat_resource(profile, session=session, href=source)
+    assert existing is not None
+    if existing.collection:
+        raise FileError("collection moves are not supported", exits.UNSUPPORTED_STRUCTURE)
+    occupant = stat_resource(profile, session=session, href=target, missing_ok=True)
+    if occupant is not None:
+        raise FileError(
+            f"{target} already holds a resource; nothing was moved", exits.CONFLICT
+        )
+    return plans.write_bundle(
+        profile=profile,
+        summary=existing.name,
+        steps=(
+            plans.freeze_step(
+                action="files.move",
+                href=source,
+                etag=_strong_etag(existing.etag, "a file move"),
+                summary=existing.name,
+                details={"destination": target, "size": existing.size},
+            ),
+        ),
+    )
+
+
+def plan_mkcol(profile: Any, *, session: Session, href: str) -> plans.Plan:
+    """Freeze the creation of one collection under an allowlisted root."""
+    target = _scoped(profile, href)
+    if stat_resource(profile, session=session, href=target, missing_ok=True) is not None:
+        raise FileError(f"{target} already exists; nothing was created", exits.CONFLICT)
+    return plans.write_bundle(
+        profile=profile,
+        summary=_segments(target)[-1],
+        steps=(
+            plans.freeze_step(
+                action="files.mkcol",
+                href=target,
+                etag="",
+                summary=_segments(target)[-1],
+                details={},
+            ),
+        ),
+    )
+
+
+def _move_destination(profile: Any, step: plans.Step) -> str:
+    return _scoped(profile, str(step.details.get("destination", "")))
+
+
+def _execute_move(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
+    source = _file_target(profile, step)
+    destination = _move_destination(profile, step)
+    response = session.request(
+        "MOVE",
+        source,
+        headers=relocate.headers(destination, etag=step.etag),
+        max_redirects=0,
+    )
+    _refuse_redirect(response, action="move", href=source)
+    relocate.classify(
+        response.status, fail=FileError, source=source, destination=destination
+    )
+    moved = stat_resource(profile, session=session, href=destination, missing_ok=True)
+    if moved is None or moved.collection or moved.size != step.details.get("size"):
+        raise FileError(
+            f"the resource at {destination} is not the file that was moved",
+            exits.OUTCOME_UNCERTAIN,
+        )
+    if stat_resource(profile, session=session, href=source, missing_ok=True) is not None:
+        raise FileError(
+            f"the server still reports a file at {source} after the move",
+            exits.OUTCOME_UNCERTAIN,
+        )
+    return {
+        "action": step.action,
+        "href": destination,
+        "moved_from": source,
+        "etag": moved.etag,
+        "size": moved.size,
+        "verified": True,
+    }
+
+
+def _execute_mkcol(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
+    target = _file_target(profile, step)
+    response = session.request("MKCOL", target, max_redirects=0)
+    _refuse_redirect(response, action="collection creation", href=target)
+    relocate.classify_creation(response.status, fail=FileError, href=target)
+    created = stat_resource(profile, session=session, href=target, missing_ok=True)
+    if created is None or not created.collection:
+        raise FileError(
+            f"the server accepted the collection, but {target} does not read back as one",
+            exits.OUTCOME_UNCERTAIN,
+        )
+    return {
+        "action": step.action,
+        "href": target,
+        "collection": True,
+        "verified": True,
+    }
+
+
+def _reconcile_move(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
+    source = _file_target(profile, step)
+    destination = _move_destination(profile, step)
+    moved = stat_resource(profile, session=session, href=destination, missing_ok=True)
+    remaining = stat_resource(profile, session=session, href=source, missing_ok=True)
+    if moved is None:
+        # Neither endpoint changed: the move never reached the server.
+        return {"state": "pending" if remaining is not None else "uncertain"}
+    if remaining is not None or moved.collection or moved.size != step.details.get("size"):
+        return {"state": "uncertain"}
+    return {"state": "verified"}
+
+
+def _reconcile_mkcol(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
+    created = stat_resource(
+        profile, session=session, href=_file_target(profile, step), missing_ok=True
+    )
+    if created is None:
+        return {"state": "pending"}
+    return {"state": "verified" if created.collection else "uncertain"}
+
+
+_ACTIONS = {"files.write", "files.delete", "files.move", "files.mkcol"}
 
 
 def _strong_etag(value: str, operation: str) -> str:
@@ -500,6 +640,20 @@ def validate_step(step: plans.Step) -> None:
     if step.action not in _ACTIONS:
         raise plans.PlanError(f"unknown file plan action {step.action!r}", exits.USAGE)
     body = plans.payload_bytes(step)
+    if step.action == "files.move":
+        if body:
+            raise plans.PlanError("file move steps must not carry a payload", exits.PLAN_STALE)
+        if not str(step.details.get("destination", "")):
+            raise plans.PlanError("a move step needs a destination", exits.PLAN_STALE)
+        _strong_etag(step.etag, "a file move")
+        return
+    if step.action == "files.mkcol":
+        if body or step.etag:
+            raise plans.PlanError(
+                "collection creation steps carry neither a payload nor an ETag",
+                exits.PLAN_STALE,
+            )
+        return
     if step.action == "files.delete":
         if body:
             raise plans.PlanError("file deletion steps must not carry a payload", exits.PLAN_STALE)
@@ -549,6 +703,10 @@ def _refuse_redirect(response: Any, *, action: str, href: str) -> None:
 def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
     """Execute one frozen file step and verify the exact resource."""
     validate_step(step)
+    if step.action == "files.move":
+        return _execute_move(profile, session=session, step=step)
+    if step.action == "files.mkcol":
+        return _execute_mkcol(profile, session=session, step=step)
     target = _file_target(profile, step)
     if step.action == "files.write":
         condition = {"If-Match": step.etag} if step.etag else {"If-None-Match": "*"}
@@ -617,6 +775,10 @@ def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, An
 def reconcile(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
     """Read the exact file and classify the frozen file operation."""
     validate_step(step)
+    if step.action == "files.move":
+        return _reconcile_move(profile, session=session, step=step)
+    if step.action == "files.mkcol":
+        return _reconcile_mkcol(profile, session=session, step=step)
     target = _file_target(profile, step)
     try:
         stored, content = read_file(profile, session=session, href=target)

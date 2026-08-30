@@ -190,6 +190,14 @@ def build_parser() -> argparse.ArgumentParser:
     cal_list = cal_commands.add_parser("list", help="Discover calendars, with href and scope")
     _add_options(cal_list)
 
+    cal_collection = cal_commands.add_parser(
+        "collection", help="Read one calendar collection's own properties"
+    )
+    _add_options(cal_collection)
+    cal_collection.add_argument(
+        "calendar", help="Calendar href, or an unambiguous display name"
+    )
+
     cal_events = cal_commands.add_parser(
         "events",
         help="List events with structured URL/status over a required window",
@@ -351,6 +359,32 @@ def build_parser() -> argparse.ArgumentParser:
     cal_delete.add_argument(
         "--recurrence-id",
         help="Exact occurrence identity from `cal occurrences`",
+    )
+
+    cal_mkcalendar = cal_commands.add_parser(
+        "mkcalendar", help="Plan a new calendar collection; changes nothing yet"
+    )
+    _add_options(cal_mkcalendar)
+    cal_mkcalendar.add_argument("href", help="Href for the new collection, under the calendar home")
+    cal_mkcalendar.add_argument("--displayname", required=True, help="Name shown by clients")
+    cal_mkcalendar.add_argument("--description", default="", help="What the calendar is for")
+    cal_mkcalendar.add_argument(
+        "--color", default="", help="Collection colour, stored as the server spells it"
+    )
+    cal_mkcalendar.add_argument(
+        "--component", action="append", default=[], dest="components",
+        choices=["VEVENT", "VTODO", "VJOURNAL"],
+        help="Component type the collection accepts; repeatable (default VEVENT and VTODO)",
+    )
+
+    cal_move = cal_commands.add_parser(
+        "move", help="Plan a move into another calendar; changes nothing yet"
+    )
+    _add_options(cal_move)
+    cal_move.add_argument("href", help="Event resource href")
+    cal_move.add_argument(
+        "--to", dest="destination", required=True,
+        help="Destination calendar href, or an unambiguous display name",
     )
 
     cal_appointment = cal_commands.add_parser(
@@ -673,6 +707,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--content-type", default="application/octet-stream", help="Stored media type"
     )
 
+    files_move = file_subcommands.add_parser(
+        "move", help="Plan a move to another href; changes nothing yet"
+    )
+    _add_options(files_move)
+    files_move.add_argument("href", help="Source file href; collection moves are refused")
+    files_move.add_argument(
+        "--to", dest="destination", required=True, help="Destination file href"
+    )
+
+    files_mkcol = file_subcommands.add_parser(
+        "mkcol", help="Plan a new collection; changes nothing yet"
+    )
+    _add_options(files_mkcol)
+    files_mkcol.add_argument("href", help="Href for the new collection")
+
     files_delete = file_subcommands.add_parser(
         "delete", help="Plan deletion of one file; changes nothing yet"
     )
@@ -898,6 +947,8 @@ def _emit_plan(plan: Any, json_output: bool) -> int:
                 f"{step.summary or step.href} ({len(plans.payload_bytes(step))} bytes)"
             )
             render.emit(f"       href    {step.href}")
+            if step.details.get("destination"):
+                render.emit(f"       to      {step.details['destination']}")
             if step.details.get("all_day"):
                 render.emit(
                     f"       all-day {step.details.get('start', '')} .. "
@@ -984,6 +1035,16 @@ def _run_cal(args: argparse.Namespace) -> int:
                 scope = "allowed" if calendar.in_scope else "not-allowlisted"
                 render.emit(f"{access} {scope:15} {calendar.display_name}")
                 render.emit(f"      {calendar.href}")
+        return exits.OK
+
+    if args.cal_command == "collection":
+        href = _resolved_calendar(profile, transport, args.calendar)
+        collection = caldav.fetch(profile, session=transport, href=href)
+        if args.json:
+            _json({"calendar": collection.as_dict()})
+        else:
+            for key, value in collection.as_dict().items():
+                render.emit(f"{key}: {_plain(value)}")
         return exits.OK
 
     if args.cal_command == "events":
@@ -1117,6 +1178,28 @@ def _run_cal(args: argparse.Namespace) -> int:
             href=args.href,
             target=target,
             recurrence_id=getattr(args, "recurrence_id", "") or "",
+        )
+        return _emit_plan(plan, args.json)
+
+    if args.cal_command == "mkcalendar":
+        plan = mutate.plan_mkcalendar(
+            profile,
+            session=transport,
+            href=args.href,
+            display_name=args.displayname,
+            description=args.description,
+            color=args.color,
+            components=tuple(args.components) or mutate.DEFAULT_COMPONENTS,
+        )
+        return _emit_plan(plan, args.json)
+
+    if args.cal_command == "move":
+        destination = _resolved_calendar(profile, transport, args.destination)
+        plan = mutate.plan_move(
+            profile,
+            session=transport,
+            href=args.href,
+            destination_calendar_href=destination,
         )
         return _emit_plan(plan, args.json)
 
@@ -1515,6 +1598,16 @@ def _run_files(args: argparse.Namespace) -> int:
             content=content,
             content_type=args.content_type,
         )
+        return _emit_plan(plan, args.json)
+
+    if args.files_command == "move":
+        plan = files.plan_move(
+            profile, session=transport, href=args.href, destination=args.destination
+        )
+        return _emit_plan(plan, args.json)
+
+    if args.files_command == "mkcol":
+        plan = files.plan_mkcol(profile, session=transport, href=args.href)
         return _emit_plan(plan, args.json)
 
     if args.files_command == "delete":
