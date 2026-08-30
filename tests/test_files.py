@@ -1032,3 +1032,142 @@ def test_a_completed_move_reconciles_as_verified():
     assert files.reconcile(PROFILE, session=reader, step=plan.steps[0]) == {
         "state": "verified"
     }
+
+
+def nextcloud_collection(href: str, *, etag: str = '"6a7fe35516ec7"') -> str:
+    """A collection exactly as Nextcloud answers a depth-one PROPFIND.
+
+    The properties that describe an entity body are reported as nonexistent in
+    their own `404` propstat rather than omitted, which is what RFC 4918 asks
+    of a server whose resource has no such property.
+    """
+    return f"""<d:response><d:href>{href}</d:href>
+    <d:propstat><d:prop>
+      <d:resourcetype><d:collection/></d:resourcetype>
+      <d:getlastmodified>Sat, 15 Aug 2026 03:56:05 GMT</d:getlastmodified>
+      <d:getetag>{etag}</d:getetag>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+    <d:propstat><d:prop><d:getcontentlength/><d:getcontenttype/></d:prop>
+      <d:status>HTTP/1.1 404 Not Found</d:status></d:propstat>
+    </d:response>"""
+
+
+def test_list_reads_a_collection_whose_body_properties_do_not_apply():
+    body = multistatus(
+        nextcloud_collection(ROOT),
+        nextcloud_collection(ROOT + "Documents/", etag='"6a7fe355ce64c"'),
+        entry(ROOT + "Readme.md", size="197", content_type="text/markdown"),
+    )
+    transport = FakeSession(response(207, body))
+
+    found = files.list_collection(PROFILE, session=transport, href=ROOT)
+
+    assert [(item.name, item.collection, item.size) for item in found] == [
+        ("Documents", True, None),
+        ("Readme.md", False, 197),
+    ]
+    assert found[0].etag == '"6a7fe355ce64c"'
+    assert found[0].content_type == ""
+
+
+def test_stat_reads_a_collection_whose_body_properties_do_not_apply():
+    transport = FakeSession(response(207, multistatus(nextcloud_collection(ROOT))))
+
+    found = files.stat_resource(PROFILE, session=transport, href=ROOT)
+
+    assert found.collection is True
+    assert found.size is None
+    assert found.content_type == ""
+
+
+def test_a_file_reporting_no_size_is_refused():
+    body = multistatus(
+        f"""<d:response><d:href>{SCRIPT}</d:href>
+        <d:propstat><d:prop>
+          <d:resourcetype/>
+          <d:getlastmodified>Wed, 19 Aug 2026 20:00:00 GMT</d:getlastmodified>
+          <d:getetag>"v1"</d:getetag>
+          <d:getcontenttype>text/plain</d:getcontenttype>
+        </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+        <d:propstat><d:prop><d:getcontentlength/></d:prop>
+          <d:status>HTTP/1.1 404 Not Found</d:status></d:propstat>
+        </d:response>"""
+    )
+
+    with pytest.raises(files.FileError, match="no getcontentlength") as error:
+        files.stat_resource(PROFILE, session=FakeSession(response(207, body)), href=SCRIPT)
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+
+
+def test_a_collection_reporting_no_etag_is_refused():
+    body = multistatus(
+        f"""<d:response><d:href>{ROOT}</d:href>
+        <d:propstat><d:prop>
+          <d:resourcetype><d:collection/></d:resourcetype>
+          <d:getlastmodified>Wed, 19 Aug 2026 20:00:00 GMT</d:getlastmodified>
+        </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+        <d:propstat><d:prop>
+          <d:getetag/><d:getcontentlength/><d:getcontenttype/>
+        </d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat>
+        </d:response>"""
+    )
+
+    with pytest.raises(files.FileError, match="no getetag"):
+        files.stat_resource(PROFILE, session=FakeSession(response(207, body)), href=ROOT)
+
+
+def test_a_withheld_size_is_still_a_refusal_rather_than_an_absence():
+    """A `403` is the server declining to answer, which is not a property that does not exist."""
+    body = multistatus(
+        f"""<d:response><d:href>{SCRIPT}</d:href>
+        <d:propstat><d:prop>
+          <d:resourcetype/>
+          <d:getlastmodified>Wed, 19 Aug 2026 20:00:00 GMT</d:getlastmodified>
+          <d:getetag>"v1"</d:getetag>
+        </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+        <d:propstat><d:prop><d:getcontentlength/><d:getcontenttype/></d:prop>
+          <d:status>HTTP/1.1 403 Forbidden</d:status></d:propstat>
+        </d:response>"""
+    )
+
+    with pytest.raises(files.FileError, match="not returned successfully"):
+        files.stat_resource(PROFILE, session=FakeSession(response(207, body)), href=SCRIPT)
+
+
+def test_a_property_reported_both_present_and_absent_is_malformed():
+    body = multistatus(
+        f"""<d:response><d:href>{SCRIPT}</d:href>
+        <d:propstat><d:prop>
+          <d:resourcetype/>
+          <d:getcontentlength>12</d:getcontentlength>
+          <d:getlastmodified>Wed, 19 Aug 2026 20:00:00 GMT</d:getlastmodified>
+          <d:getetag>"v1"</d:getetag>
+        </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+        <d:propstat><d:prop><d:getcontentlength/></d:prop>
+          <d:status>HTTP/1.1 404 Not Found</d:status></d:propstat>
+        </d:response>"""
+    )
+
+    with pytest.raises(files.FileError, match="repeated property getcontentlength"):
+        files.stat_resource(PROFILE, session=FakeSession(response(207, body)), href=SCRIPT)
+
+
+def test_a_file_without_a_media_type_is_read_rather_than_refused():
+    body = multistatus(
+        f"""<d:response><d:href>{SCRIPT}</d:href>
+        <d:propstat><d:prop>
+          <d:resourcetype/>
+          <d:getcontentlength>12</d:getcontentlength>
+          <d:getlastmodified>Wed, 19 Aug 2026 20:00:00 GMT</d:getlastmodified>
+          <d:getetag>"v1"</d:getetag>
+        </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+        <d:propstat><d:prop><d:getcontenttype/></d:prop>
+          <d:status>HTTP/1.1 404 Not Found</d:status></d:propstat>
+        </d:response>"""
+    )
+
+    found = files.stat_resource(PROFILE, session=FakeSession(response(207, body)), href=SCRIPT)
+
+    assert found.content_type == ""
+    assert found.size == 12

@@ -17,9 +17,21 @@ slash, or `..`.
 collection's immediate children. `ncl files stat <resource>` uses depth zero.
 Both expose stable hrefs, resource type, size where applicable, modification
 time, ETag, and media type. A depth-one response naming a resource outside the
-requested collection is malformed rather than extra discovery. Every requested
-property must be returned successfully, each response needs a resource type,
-and duplicate resource hrefs are malformed rather than alternate observations.
+requested collection is malformed rather than extra discovery. Each response
+needs a resource type, and duplicate resource hrefs are malformed rather than
+alternate observations.
+
+A `PROPFIND` asks for properties that do not apply to every resource it
+reaches, and a server says so with a `404` propstat rather than by omission: a
+collection has no entity body, so it reports no content length and no media
+type. That is an answer, and it is read as absence. Every other failing status
+is the server declining to say, which stays a refusal — a size withheld by a
+`403` is not a size of zero.
+
+Absence is then allowed only where it leaves the resource addressable. A
+collection may lack a content length and a media type, and any resource may
+lack a media type. A file reporting no content length or no ETag is refused,
+because both are what a later conditional write is built from.
 
 `ncl files read <file>` sends `GET`. Content declared as a textual media type
 and encoded as UTF-8 can be emitted through the CLI's redacting text stream or

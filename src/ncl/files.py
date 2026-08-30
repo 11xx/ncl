@@ -129,8 +129,20 @@ def _size(value: str, *, collection: bool) -> int | None:
     return None if collection else parsed
 
 
-def _prop_elements(response: ET.Element) -> dict[tuple[str, str], ET.Element]:
+def _prop_elements(
+    response: ET.Element,
+) -> tuple[dict[tuple[str, str], ET.Element], frozenset[tuple[str, str]]]:
+    """Split one response's properties into those returned and those that do not exist.
+
+    A `PROPFIND` names properties that may not apply to every resource it
+    reaches, and RFC 4918 has the server say so with a `404` propstat rather
+    than by omission — a collection has no content length to report. So `404`
+    is an answer, recorded as absence, while every other failing status is the
+    server declining to say and stays a refusal: a size withheld by a `403` is
+    not a size of zero.
+    """
     found: dict[tuple[str, str], ET.Element] = {}
+    absent: set[tuple[str, str]] = set()
     for propstat in response:
         if _element_name(propstat) != (DAV, "propstat"):
             continue
@@ -153,14 +165,48 @@ def _prop_elements(response: ET.Element) -> dict[tuple[str, str], ET.Element]:
             name = _element_name(element)
             if name not in _PROPERTIES:
                 continue
+            if name in found or name in absent:
+                raise FileError(f"the WebDAV response repeated property {name[1]}")
+            if code == 404:
+                absent.add(name)
+                continue
             if not 200 <= code < 300:
                 raise FileError(
                     f"the WebDAV property {name[1]} was not returned successfully"
                 )
-            if name in found:
-                raise FileError(f"the WebDAV response repeated property {name[1]}")
             found[name] = element
-    return found
+    return found, frozenset(absent)
+
+
+#: Properties a collection is entitled not to have. A collection carries no
+#: entity body, so its length and media type describe nothing; every other
+#: property this tool asks for identifies the resource or dates it, and a
+#: resource that cannot be identified is not one this tool will act on.
+_COLLECTION_OPTIONAL = frozenset({(DAV, "getcontentlength"), (DAV, "getcontenttype")})
+
+#: Properties any resource may lack. A server is free to store no media type
+#: for a file it cannot classify, and reporting that as malformed would refuse
+#: a listing over a detail no caller depends on.
+_ALWAYS_OPTIONAL = frozenset({(DAV, "getcontenttype")})
+
+
+def _require_applicable(
+    absent: frozenset[tuple[str, str]], *, collection: bool
+) -> None:
+    """Refuse an absence that would leave the resource unusable.
+
+    Size and ETag are what a conditional write is built from, so a file
+    reporting either as nonexistent is not a file this tool can safely address
+    later. The same absence on a collection is the server answering correctly.
+    """
+    optional = _ALWAYS_OPTIONAL | (_COLLECTION_OPTIONAL if collection else frozenset())
+    required = sorted(name[1] for name in absent - optional)
+    if required:
+        kind = "collection" if collection else "resource"
+        raise FileError(
+            f"the WebDAV {kind} reports no {', '.join(required)}, which this tool needs "
+            "to address it"
+        )
 
 
 def _file_ref(
@@ -183,7 +229,7 @@ def _file_ref(
     if response_code is not None and not 200 <= response_code < 300:
         return href, None, response_code
 
-    props = _prop_elements(entry)
+    props, absent = _prop_elements(entry)
     if not props:
         raise FileError("the WebDAV response returned no successful properties")
     resource_type = props.get((DAV, "resourcetype"))
@@ -192,6 +238,7 @@ def _file_ref(
     collection = any(
         _element_name(item) == (DAV, "collection") for item in resource_type
     )
+    _require_applicable(absent, collection=collection)
     size_element = props.get((DAV, "getcontentlength"))
     modified_element = props.get((DAV, "getlastmodified"))
     etag_element = props.get((DAV, "getetag"))
