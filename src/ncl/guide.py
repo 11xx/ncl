@@ -99,6 +99,24 @@ SEE AND CHANGE WHO ELSE CAN REACH A FILE
   server granted beyond the plan — Nextcloud adds the share bit to every public
   link.
 
+READ CONTACTS
+  ncl contacts books
+  ncl contacts list <book>
+  ncl contacts find <book> <term>
+  ncl contacts show <contact-href>
+
+  Address books are DAV collections beside the calendars, bounded by their own
+  `addressbooks` allowlist. That key is optional, and absent means none is
+  reachable — an unstated scope is empty, never open.
+
+  A contact is addressed by href. Two people share a name far more often than
+  two events share a summary, so a contact resolved by name is the wrong person
+  rather than a missing one. Listing makes one bounded report, and a card's
+  photo is reported as present rather than inlined: it is routinely a hundred
+  kilobytes of base64 and answers nothing that was asked. `contacts show`
+  returns the raw vCard beside the typed view, and structure the view does not
+  model is named rather than dropped. Contacts are read-only here.
+
 WORK WITH TASKS
   ncl task list <calendar> [--status <status>]
   ncl task show <task-href>

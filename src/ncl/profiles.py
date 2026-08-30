@@ -126,6 +126,7 @@ def fingerprint(profile: Any) -> str:
             "secret_backend": profile.secret_backend,
             "calendars": list(profile.calendars),
             "files_roots": list(profile.files_roots),
+            "addressbooks": list(getattr(profile, "addressbooks", ())),
         }
     else:
         # Small protocol fakes can identify a profile by name only. Real

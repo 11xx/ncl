@@ -12,6 +12,7 @@ from . import (
     appointments,
     caldav,
     checks,
+    contacts,
     events,
     exits,
     files,
@@ -32,6 +33,7 @@ from . import (
     session,
     shares,
     todos,
+    vcard,
 )
 from .config import ConfigError
 
@@ -506,6 +508,38 @@ def build_parser() -> argparse.ArgumentParser:
     appointment_update.add_argument(
         "--description", help="Replacement appointment prose; omission preserves it"
     )
+
+    contact = commands.add_parser(
+        "contacts",
+        help="Read address books and the people in them",
+        description=(
+            "Contacts over CardDAV. An address book is a DAV collection discovered "
+            "from the same principal as a calendar and bounded by its own allowlist."
+        ),
+    )
+    contact_commands = contact.add_subparsers(dest="contacts_command", metavar="<subcommand>")
+
+    contacts_books = contact_commands.add_parser(
+        "books", help="Discover address books, with href and scope"
+    )
+    _add_options(contacts_books)
+
+    contacts_list = contact_commands.add_parser("list", help="List one address book")
+    _add_options(contacts_list)
+    contacts_list.add_argument("book", help="Address book href, or an unambiguous name")
+
+    contacts_find = contact_commands.add_parser(
+        "find", help="Filter one address book by name, mail, phone, or organisation"
+    )
+    _add_options(contacts_find)
+    contacts_find.add_argument("book", help="Address book href, or an unambiguous name")
+    contacts_find.add_argument("term", help="Text to match, case-insensitively")
+
+    contacts_show = contact_commands.add_parser(
+        "show", help="Read one contact, with its raw vCard"
+    )
+    _add_options(contacts_show)
+    contacts_show.add_argument("href", help="Contact resource href")
 
     task = commands.add_parser(
         "task",
@@ -1400,6 +1434,66 @@ def _run_cal(args: argparse.Namespace) -> int:
     return exits.USAGE
 
 
+def _resolved_book(profile, transport, target: str) -> str:
+    principal = identity.discover(profile, session=transport).principal_url
+    home = contacts.home(profile, session=transport, principal_url=principal)
+    books = contacts.list_books(profile, session=transport, home_href=home)
+    return contacts.resolve(books, target).href
+
+
+def _run_contacts(args: argparse.Namespace) -> int:
+    profile = _selected_profile(args)
+    transport = session.Session(profile)
+
+    if args.contacts_command == "books":
+        principal = identity.discover(profile, session=transport).principal_url
+        home = contacts.home(profile, session=transport, principal_url=principal)
+        books = contacts.list_books(profile, session=transport, home_href=home)
+        if args.json:
+            _json({"addressbooks": [book.as_dict() for book in books]})
+        else:
+            for book in books:
+                access = "ro" if book.read_only else "rw"
+                scope = "allowed" if book.in_scope else "not-allowlisted"
+                render.emit(f"{access} {scope:15} {book.display_name}")
+                render.emit(f"      {book.href}")
+        return exits.OK
+
+    if args.contacts_command in {"list", "find"}:
+        href = _resolved_book(profile, transport, args.book)
+        found = contacts.list_contacts(profile, session=transport, book_href=href)
+        if args.contacts_command == "find":
+            found = contacts.search(found, term=args.term)
+        if args.json:
+            _json({"contacts": [item.as_dict() for item in found]})
+        else:
+            for item in found:
+                marks = "  [photo]" if item.has_photo else ""
+                if item.unsupported:
+                    marks += f"  [{', '.join(item.unsupported)}]"
+                render.emit(f"{item.full_name or item.uid}{marks}")
+                if item.emails:
+                    render.emit(f"      {', '.join(item.emails)}")
+                render.emit(f"      {item.href}")
+        return exits.OK
+
+    if args.contacts_command == "show":
+        reference, raw = contacts.fetch(profile, session=transport, href=args.href)
+        if args.json:
+            _json(
+                {
+                    "contact": reference.as_dict(),
+                    "vcard": raw.decode("utf-8", "replace"),
+                }
+            )
+        else:
+            for key, value in reference.as_dict().items():
+                render.emit(f"{key}: {_plain(value)}")
+        return exits.OK
+
+    return exits.USAGE
+
+
 def _run_task_run(args: argparse.Namespace) -> int:
     profile = _selected_profile(args)
     transport = session.Session(profile)
@@ -1917,6 +2011,8 @@ def _main(argv: list[str] | None = None) -> int:
             return _run_whoami(args)
         if args.command == "cal":
             return _run_cal(args)
+        if args.command == "contacts":
+            return _run_contacts(args)
         if args.command == "task":
             return _run_task(args)
         if args.command == "files":
@@ -1938,6 +2034,8 @@ def _main(argv: list[str] | None = None) -> int:
         scheduling.SchedulingError,
         caldav.CalendarError,
         events.EventError,
+        contacts.ContactError,
+        vcard.VcardError,
         todos.TodoError,
         files.FileError,
         ocs.OcsError,

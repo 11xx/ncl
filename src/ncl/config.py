@@ -32,12 +32,16 @@ class Profile:
     secret_backend: str
     calendars: tuple[str, ...]
     files_roots: tuple[str, ...]
+    #: Address books this profile may reach. Absent means none: an unstated
+    #: scope is an empty allowlist, never an open one.
+    addressbooks: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         values = asdict(self)
         values.pop("name")
         values["calendars"] = list(self.calendars)
         values["files_roots"] = list(self.files_roots)
+        values["addressbooks"] = list(self.addressbooks)
         return values
 
 
@@ -145,6 +149,7 @@ def _validate_profile(name: str, raw: Any) -> Profile:
         "secret_backend",
         "calendars",
         "files_roots",
+        "addressbooks",
     }
     _keys(table, allowed, context)
 
@@ -161,6 +166,9 @@ def _validate_profile(name: str, raw: Any) -> Profile:
     files_roots = _string_list(
         _required(table, "files_roots", context), f"{context}.files_roots"
     )
+    addressbooks = _string_list(
+        table.get("addressbooks", []), f"{context}.addressbooks"
+    )
 
     return Profile(
         name=name,
@@ -168,6 +176,27 @@ def _validate_profile(name: str, raw: Any) -> Profile:
         secret_backend=backend,
         calendars=calendars,
         files_roots=files_roots,
+        addressbooks=addressbooks,
+    )
+
+
+#: Scopes a profile must state. A required scope left empty is a profile that
+#: reaches nothing and was probably meant to; an optional one left empty is a
+#: surface this profile does not use, which is not a fault to report.
+REQUIRED_ALLOWLISTS = frozenset({"calendars", "files_roots"})
+
+
+def allowlists(profile: Profile) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Every named scope a profile bounds, in one place.
+
+    Each is checked, probed, and fingerprinted identically, so adding one
+    should mean adding it here rather than finding every site that enumerated
+    the others.
+    """
+    return (
+        ("calendars", profile.calendars),
+        ("files_roots", profile.files_roots),
+        ("addressbooks", profile.addressbooks),
     )
 
 
@@ -191,10 +220,7 @@ def validate(raw: Any, path: Path | str = "<config>") -> Config:
     from .profiles import canonicalize_href
 
     for profile in profiles.values():
-        for field, entries in (
-            ("calendars", profile.calendars),
-            ("files_roots", profile.files_roots),
-        ):
+        for field, entries in allowlists(profile):
             for index, entry in enumerate(entries):
                 try:
                     canonicalize_href(entry)
