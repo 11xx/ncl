@@ -212,11 +212,20 @@ ORDERED CHECKPOINT RUNS
 
 REACH ALLOWLISTED FILES
   ncl files list <collection-href>  List one collection, without recursion.
+  ncl files find <collection-href>  Search a subtree server-side, by name,
+                                    media type, or modification time.
   ncl files stat <resource-href>    Read size, mtime, media type, and ETag.
   ncl files read <file-href>        Read UTF-8 text through redacted stdout.
 
   File hrefs must be inside one of the profile's `files_roots`. Only content
   declared as textual and decodable as UTF-8 is sent to redacted stdout; binary,
+  `files find` asks the server where a file is rather than walking the tree
+  for it, and needs at least one condition: a search with none is a recursive
+  listing at a cost nobody asked for. `*` and `?` are the name wildcards. A
+  result outside the searched subtree or outside the allowlist is a refusal,
+  not a filtered row — the server chose what matched, so its answer is where
+  a scope escape would arrive.
+
   unknown, or non-UTF-8 content requires `files read --output <path>` to write
   its exact bytes to a local file. Every file request stays on its exact href
   and refuses redirects. An existing output path is refused unless `--force`

@@ -42,6 +42,33 @@ credential redaction. A local output path is not replaced unless `--force` is
 present. Every file request, including a listing, must answer for its exact
 href; redirects are refused.
 
+`ncl files find <collection>` asks the server where a file is instead of
+walking the tree for it. It sends a WebDAV `SEARCH` to the DAV root — which is
+where Nextcloud accepts one — scoped by a path relative to that root rather
+than by the collection href everything else here is addressed by, so the two
+are converted in one place.
+
+At least one of `--name`, `--content-type`, or `--modified-since` is required.
+A search with no condition is a recursive listing wearing a search's clothes
+and returns the whole subtree at a cost the caller did not ask for. In `--name`
+the wildcards are `*` and `?`; a literal `%` or `_` in a filename survives
+rather than becoming a wildcard nobody asked for. Every literal is escaped into
+the request body as text, so a pattern cannot close the element around it and
+change which query the server ran.
+
+The scope check is the load-bearing part. A search names a subtree and the
+server decides what matches, which makes the answer the one place a resource
+outside the allowlist can enter through a request that was itself in scope.
+Every result is checked against both the requested subtree and the allowlist,
+and a result outside either is a refusal rather than a filtered-out row: a
+server returning what it was not asked for is not a server whose other answers
+can be trusted. A row the server reports as failed is malformed rather than
+skipped.
+
+Which conditions a server answers is not uniform. A rejected search is reported
+as possibly naming an unsupported condition rather than as a malformed request,
+because that is the difference the caller can act on.
+
 Reads currently buffer one complete response in memory. Recursive traversal,
 range reads, and streaming large objects are not implemented.
 
