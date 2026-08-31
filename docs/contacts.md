@@ -45,11 +45,17 @@ right until a value contains a semicolon.
   and a card ends where the component it opened is closed rather than at the
   first `END` — otherwise a card holding a nested component is cut in half and
   its remainder read as a second contact.
+- A property inside a nested component belongs to that component, not to the
+  card: it is skipped rather than reported or refused.
 - A declared `VERSION` must be one this reader implements: `2.1`, `3.0`, or
-  `4.0`. Escaping and structured values differ between versions, so reading an
-  unimplemented one yields values that look right. A card declaring no version
-  is read anyway — a listing is every card in a book at once, and refusing one
-  card for an absent property costs the whole book.
+  `4.0`. Escaping and structured values differ between versions, so a card
+  declaring one this reader does not implement cannot be read under these
+  rules, and refusing it is refusing to report values it would get wrong. A
+  card declaring no version is read: the rules here are the ones it is asking
+  for.
+- A refusal names the card's href. A listing reads every card in a book, so a
+  message saying only what was wrong leaves the operator without which card
+  to fix.
 
 ## Reading contacts
 

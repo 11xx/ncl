@@ -152,12 +152,12 @@ def _parameters(segment: str) -> tuple[str, dict[str, tuple[str, ...]]]:
     return name, parameters
 
 
-#: The versions this reader implements. A card announcing anything else is
-#: refused rather than read under these rules: escaping and structured values
-#: differ between versions, so reading an unimplemented one produces values
-#: that look right. A card announcing nothing is read anyway — a listing is
-#: one request for every card in a book, so refusing a card for an absent
-#: property would cost the whole book to gain nothing about the cards in it.
+#: The versions this reader implements. Escaping and structured values differ
+#: between them, so a card declaring a version outside this set cannot be read
+#: under these rules: refusing it is refusing to report values it would get
+#: wrong. A card declaring no version is a different case and is read — the
+#: rules here are the ones it is asking for, and nothing about it is
+#: unreadable.
 VERSIONS = frozenset({"2.1", "3.0", "4.0"})
 
 
@@ -169,6 +169,14 @@ def parse(raw: bytes) -> list[Property]:
     contact, and accepts a card whose inner component was closed with the
     outer one's name — neither of which is a vCard, and both of which reach
     the caller as a contact with no fields rather than as an error.
+
+    A property inside a nested component belongs to that component, not to the
+    card, so it is skipped rather than reported or refused. Callers read a
+    whole address book in one request, and a card holding an `X-ABLABEL` group
+    is ordinary enough that refusing it would cost the book.
+
+    This reads one card. Two concatenated cards reach it as one property list;
+    callers go through `cards()`, which splits them.
     """
     lines = unfold(raw)
     if not lines:
@@ -180,13 +188,14 @@ def parse(raw: bytes) -> list[Property]:
         if not separator:
             raise VcardError("a vCard line carried no value")
         name, parameters = _parameters(segment)
-        component = value.strip().upper()
         if name == "BEGIN":
+            component = value.strip().upper()
             if not components and component != "VCARD":
                 raise VcardError(f"the resource opened {component or 'nothing'}, not a vCard")
             components.append(component)
             continue
         if name == "END":
+            component = value.strip().upper()
             if not components:
                 raise VcardError("the vCard ended a component it had not begun")
             if components[-1] != component:
@@ -196,8 +205,10 @@ def parse(raw: bytes) -> list[Property]:
                 )
             components.pop()
             continue
-        if len(components) != 1:
+        if not components:
             raise VcardError("a vCard property lay outside its own card")
+        if len(components) > 1:
+            continue
         properties.append(
             Property(
                 name=name,
@@ -208,8 +219,12 @@ def parse(raw: bytes) -> list[Property]:
     if components:
         raise VcardError("the vCard did not end")
     for declared in every(properties, "VERSION"):
-        if declared.value.strip() not in VERSIONS:
-            raise VcardError(f"the vCard declared unsupported version {declared.value.strip()!r}")
+        version = declared.value.strip()
+        if version and version not in VERSIONS:
+            raise VcardError(
+                f"the vCard declared version {version!r}; "
+                f"this reads {', '.join(sorted(VERSIONS))}"
+            )
     return properties
 
 
