@@ -23,12 +23,13 @@ from __future__ import annotations
 
 import hashlib
 import re
+import xml.etree.ElementTree as ET
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from . import exits
+from . import etag, exits
 from .session import Session
 
 #: Above this, a write streams from its source rather than freezing its bytes.
@@ -42,6 +43,12 @@ INLINE_LIMIT = 8 * 1024 * 1024
 CHUNK_SIZE = 10 * 1024 * 1024
 
 #: Where Nextcloud assembles a chunked upload.
+_DAV = "DAV:"
+_ETAG_PROPFIND = (
+    b'<?xml version="1.0" encoding="utf-8"?>'
+    b'<d:propfind xmlns:d="DAV:"><d:prop><d:getetag/></d:prop></d:propfind>'
+)
+
 UPLOAD_ROOT = "/remote.php/dav/uploads/"
 
 #: The pseudo-resource whose MOVE assembles the parts.
@@ -103,6 +110,31 @@ def _parts(path: Path, *, size: int, digest: str):
         )
 
 
+def _destination_etag(session: Session, destination: str) -> str | None:
+    """Read the destination's current ETag, or None when it is gone."""
+    response = session.request(
+        "PROPFIND",
+        destination,
+        headers={"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
+        data=_ETAG_PROPFIND,
+        max_redirects=0,
+    )
+    if response.status == 404:
+        return None
+    if response.status != 207:
+        raise UploadError(
+            f"the destination could not be read before assembly ({response.status})",
+            exits.SERVER_ERROR,
+        )
+    root = ET.fromstring(response.body)
+    found = root.find(f".//{{{_DAV}}}getetag")
+    if found is None or not (found.text or "").strip():
+        raise UploadError(
+            "the destination reported no ETag before assembly", exits.MALFORMED_RESPONSE
+        )
+    return (found.text or "").strip()
+
+
 def upload_directory(account_name: str, token: str) -> str:
     return f"{UPLOAD_ROOT}{quote(account_name, safe='')}/{quote(token, safe='')}/"
 
@@ -122,11 +154,25 @@ def stream_upload(
 ) -> str:
     """Send one file in parts and assemble it, returning the resulting ETag.
 
-    Every part is present before the destination can change. A creation remains
-    absent until the assembling `MOVE`. A replacement conditionally removes only
-    the frozen destination revision, then assembles with overwrite disabled; an
-    unconfirmed result after that deletion is uncertainty. An unfinished upload
-    directory is removed without replacing the error that stopped the transfer.
+    Every part is present before the destination can change, so a creation
+    remains absent until the assembling `MOVE` and a replacement is one
+    request wide.
+
+    A replacement assembles onto the occupant with `Overwrite: T`, which keeps
+    the destination's file identifier. That identifier is what Nextcloud keys
+    version history, shares, tags, and comments to, and re-creating the path
+    discards all of them; assembling over it also files the replaced revision
+    as a version, which is a stronger residue than the trash.
+
+    The cost is that the server enforces no precondition here: it ignores a
+    tagged `If` condition on an assembly destination, so the frozen ETag is
+    re-read immediately before the `MOVE` rather than asserted during it. A
+    write that lands between that read and the `MOVE` is displaced without
+    being refused — into version history, where it is recoverable. An
+    unconfirmed result is uncertainty for the same reason.
+
+    An unfinished upload directory is removed without replacing the error that
+    stopped the transfer.
     """
     path = Path(source).expanduser()
     directory = upload_directory(account_name, token)
@@ -166,40 +212,35 @@ def stream_upload(
                 )
 
         if overwrite:
-            # Nextcloud's upload assembly endpoint ignores a tagged WebDAV `If`
-            # condition on the destination. Remove only the revision the plan
-            # observed, then use Overwrite: F so a new occupant can never be
-            # replaced in the interval before assembly.
-            replacement_started = True
-            removed = session.request(
-                "DELETE",
-                destination,
-                headers={"If-Match": expected_etag},
-                max_redirects=0,
-            )
-            if removed.status in {404, 412}:
-                replacement_started = False
+            # The assembly endpoint ignores a tagged WebDAV `If` condition on
+            # the destination, so this is a look immediately before the write
+            # rather than a condition the server enforces. It closes the long
+            # window between planning and applying; it cannot close the last
+            # instant, which the docstring says plainly.
+            current = _destination_etag(session, destination)
+            if current is None:
+                raise UploadError(
+                    f"{destination} no longer exists; nothing was assembled",
+                    exits.CONFLICT,
+                )
+            if etag.normalize_strong(current) != etag.normalize_strong(expected_etag):
                 raise UploadError(
                     f"{destination} changed since the plan was made; nothing was assembled",
                     exits.CONFLICT,
                 )
-            if removed.status not in {200, 204}:
-                replacement_started = False
-                raise UploadError(
-                    f"the planned destination could not be removed ({removed.status})",
-                    exits.SERVER_ERROR,
-                )
+            replacement_started = True
 
-        headers = {"Destination": destination, "Overwrite": "F"}
+        headers = {"Destination": destination, "Overwrite": "T" if overwrite else "F"}
         assembly_started = True
         assembled = session.request(
             "MOVE", f"{directory}{ASSEMBLY}", headers=headers, max_redirects=0
         )
         if assembled.status == 412:
             assembly_started = False
+            replacement_started = False
             raise UploadError(
                 f"{destination} gained a resource before assembly; nothing was overwritten",
-                exits.OUTCOME_UNCERTAIN if replacement_started else exits.CONFLICT,
+                exits.CONFLICT,
             )
         if assembled.status not in {201, 204}:
             assembly_started = False

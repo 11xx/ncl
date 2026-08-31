@@ -34,6 +34,15 @@ def source(tmp_path):
     return path
 
 
+def etag_response(value: str = '"planned"') -> bytes:
+    return (
+        '<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"><d:response>'
+        f"<d:href>{TARGET}</d:href><d:propstat><d:prop><d:getetag>{value}</d:getetag>"
+        "</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>"
+        "</d:response></d:multistatus>"
+    ).encode()
+
+
 def transport_for(*responses):
     fake = FakeTransport(list(responses))
     return session.Session(PROFILE, transport=fake), fake
@@ -96,10 +105,17 @@ def test_the_assembling_move_carries_the_destination_and_refuses_to_overwrite(so
     assert assembling["headers"]["Overwrite"] == "F"
 
 
-def test_a_streamed_replacement_removes_only_the_revision_the_plan_observed(source):
+def test_a_streamed_replacement_assembles_over_the_occupant(source):
+    """The destination keeps its file identifier, so its history keeps it too.
+
+    Nextcloud keys version history, shares, tags, and comments to the file id,
+    which is the filecache row for the path: re-creating the path discards all
+    of them. Assembling over the occupant also files the replaced revision as
+    a version, which outlives the trash.
+    """
     size, digest = uploads.measure(source)
     transport, fake = transport_for(
-        response(201), response(201), response(204), response(201)
+        response(201), response(201), response(207, etag_response()), response(204)
     )
 
     uploads.stream_upload(
@@ -115,15 +131,22 @@ def test_a_streamed_replacement_removes_only_the_revision_the_plan_observed(sour
         expected_etag='"planned"',
     )
 
-    assert [item["method"] for item in fake.requests] == ["MKCOL", "PUT", "DELETE", "MOVE"]
-    assert fake.requests[2]["headers"]["If-Match"] == '"planned"'
-    assert fake.requests[3]["headers"]["Overwrite"] == "F"
+    assert [item["method"] for item in fake.requests] == ["MKCOL", "PUT", "PROPFIND", "MOVE"]
+    assert "DELETE" not in [item["method"] for item in fake.requests]
+    assert fake.requests[3]["headers"]["Overwrite"] == "T"
+    assert fake.requests[3]["headers"]["Destination"] == TARGET
 
 
-def test_a_newer_destination_revision_is_not_removed_or_overwritten(source):
+def test_a_newer_destination_revision_is_not_overwritten(source):
+    """Read immediately before the MOVE, because the server enforces nothing here.
+
+    This closes the window between planning and applying. It cannot close the
+    last instant — that residual race is what the design trades for keeping the
+    file's identity, and a write lost to it lands in version history.
+    """
     size, digest = uploads.measure(source)
     transport, fake = transport_for(
-        response(201), response(201), response(412), response(204)
+        response(201), response(201), response(207, etag_response('"newer"')), response(204)
     )
 
     with pytest.raises(uploads.UploadError, match="changed since the plan") as error:
@@ -141,13 +164,39 @@ def test_a_newer_destination_revision_is_not_removed_or_overwritten(source):
         )
 
     assert error.value.code == exits.CONFLICT
-    assert [item["method"] for item in fake.requests] == ["MKCOL", "PUT", "DELETE", "DELETE"]
+    assert [item["method"] for item in fake.requests] == ["MKCOL", "PUT", "PROPFIND", "DELETE"]
 
 
-def test_a_replacement_interrupted_after_deletion_is_uncertain(source):
+def test_a_destination_that_vanished_before_assembly_is_a_conflict(source):
     size, digest = uploads.measure(source)
     transport, _ = transport_for(
-        response(201), response(201), response(204), response(412), response(204)
+        response(201), response(201), response(404), response(204)
+    )
+
+    with pytest.raises(uploads.UploadError, match="no longer exists") as error:
+        uploads.stream_upload(
+            PROFILE,
+            session=transport,
+            account_name=ACCOUNT,
+            source=source,
+            destination=TARGET,
+            size=size,
+            digest=digest,
+            token="tok",
+            overwrite=True,
+            expected_etag='"planned"',
+        )
+
+    assert error.value.code == exits.CONFLICT
+
+
+def test_a_replacement_whose_assembly_is_unconfirmed_is_uncertain(source):
+    """The MOVE is the only step that touches the destination, and a server
+    error leaves no way to tell whether it landed."""
+    size, digest = uploads.measure(source)
+    transport, _ = transport_for(
+        response(201), response(201), response(207, etag_response()), response(500),
+        response(204),
     )
 
     with pytest.raises(uploads.UploadError) as error:
