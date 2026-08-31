@@ -46,6 +46,7 @@ CREATABLE = {"user": 0, "group": 1, "public_link": 3}
 
 #: The WebDAV permission bits OCS packs into one integer.
 _PERMISSION_BITS = ((1, "read"), (2, "update"), (4, "create"), (8, "delete"), (16, "share"))
+_PERMISSION_MASK = sum(bit for bit, _name in _PERMISSION_BITS)
 
 #: What each named permission set grants. `read` is the only safe default: a
 #: share created with more reach than asked for is not discoverable by reading
@@ -149,6 +150,11 @@ def _permissions(value: Any) -> tuple[str, ...]:
         value = int(value)
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ShareError("a share reported permissions this tool cannot read")
+    unknown = value & ~_PERMISSION_MASK
+    if unknown:
+        raise ShareError(
+            f"a share reported unmodelled permission bits {unknown}; its reach is unknown"
+        )
     return tuple(name for bit, name in _PERMISSION_BITS if value & bit)
 
 
@@ -334,6 +340,12 @@ def plan_delete(
 ) -> plans.Plan:
     """Freeze the removal of one share, after reading what it currently grants."""
     share = fetch(profile, session=session, account_name=account_name, share_id=share_id)
+    if not profiles.in_scope(share.href, profile.files_roots):
+        raise ShareError(
+            f"share {share.share_id} is outside this profile's files allowlist, so it can "
+            "be seen but not revoked",
+            exits.SCOPE_DENIED,
+        )
     return plans.write_bundle(
         profile=profile,
         summary=f"revoke the {share.share_type} share of {share.path}",

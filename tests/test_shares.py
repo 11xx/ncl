@@ -151,6 +151,15 @@ def test_a_listing_reads_the_reach_of_each_share():
     assert found[0].public is True
 
 
+def test_unknown_permission_bits_are_refused_instead_of_hidden():
+    with pytest.raises(shares.ShareError, match="unmodelled permission bits 32"):
+        shares.list_shares(
+            PROFILE,
+            session=transport_for(ocs_response([share_record(permissions=33)])),
+            account_name=ACCOUNT,
+        )
+
+
 def test_a_share_type_this_tool_does_not_create_is_still_reported():
     """A listing answers who can already see a file, so it hides nothing it cannot write."""
     found = shares.list_shares(
@@ -322,6 +331,32 @@ def test_creating_sends_the_frozen_form_including_the_password():
     assert "shareWith=bob" in body
     assert "permissions=15" in body
     assert "password=s3cret" in body
+
+
+def test_planning_a_revocation_requires_the_share_to_be_allowlisted():
+    outside = share_record(id="77", path="/private/secret.txt")
+
+    with pytest.raises(shares.ShareError, match="seen but not revoked") as error:
+        shares.plan_delete(
+            PROFILE,
+            session=transport_for(ocs_response(outside)),
+            account_name=ACCOUNT,
+            share_id="77",
+        )
+
+    assert error.value.code == exits.SCOPE_DENIED
+
+
+def test_planning_a_revocation_freezes_the_allowlisted_share():
+    plan = shares.plan_delete(
+        PROFILE,
+        session=transport_for(ocs_response(share_record())),
+        account_name=ACCOUNT,
+        share_id="7",
+    )
+
+    assert plan.steps[0].action == "share.delete"
+    assert plan.steps[0].href == HREF
 
 
 def test_revoking_a_share_that_is_already_gone_is_the_outcome_it_wanted():

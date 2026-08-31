@@ -317,6 +317,15 @@ def test_a_duration_period_is_resolved_to_its_end_instant():
     assert periods[0].end == "2026-09-01T10:30:00+00:00"
 
 
+def test_a_floating_period_is_refused_instead_of_using_the_host_timezone():
+    with pytest.raises(scheduling.SchedulingError, match="without a timezone offset"):
+        freebusy._calendar_periods(
+            "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//x//EN\nBEGIN:VFREEBUSY\nUID:a@b\n"
+            "DTSTAMP:20260901T000000Z\nFREEBUSY:20260901T090000/20260901T100000\n"
+            "END:VFREEBUSY\nEND:VCALENDAR"
+        )
+
+
 def test_the_cli_reports_each_recipient_and_its_periods(monkeypatch, tmp_path, capsys):
     import json
 

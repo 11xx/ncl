@@ -22,9 +22,11 @@ would not be a frozen plan.
 from __future__ import annotations
 
 import hashlib
+import re
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from . import exits
 from .session import Session
@@ -102,7 +104,7 @@ def _parts(path: Path, *, size: int, digest: str):
 
 
 def upload_directory(account_name: str, token: str) -> str:
-    return f"{UPLOAD_ROOT}{account_name}/{token}/"
+    return f"{UPLOAD_ROOT}{quote(account_name, safe='')}/{quote(token, safe='')}/"
 
 
 def stream_upload(
@@ -116,15 +118,22 @@ def stream_upload(
     digest: str,
     token: str,
     overwrite: bool,
+    expected_etag: str,
 ) -> str:
     """Send one file in parts and assemble it, returning the resulting ETag.
 
-    Nothing exists at the destination until the assembling `MOVE`, so a failure
-    part-way through leaves the destination untouched and an upload directory
-    behind, which this removes.
+    Every part is present before the destination can change. A creation remains
+    absent until the assembling `MOVE`. A replacement conditionally removes only
+    the frozen destination revision, then assembles with overwrite disabled; an
+    unconfirmed result after that deletion is uncertainty. An unfinished upload
+    directory is removed without replacing the error that stopped the transfer.
     """
     path = Path(source).expanduser()
     directory = upload_directory(account_name, token)
+    if overwrite and not expected_etag:
+        raise UploadError("a streamed replacement needs the destination ETag", exits.CONFLICT)
+    if not overwrite and expected_etag:
+        raise UploadError("a streamed creation cannot carry a destination ETag", exits.CONFLICT)
     created = session.request("MKCOL", directory)
     if created.status == 405:
         raise UploadError(
@@ -137,6 +146,8 @@ def stream_upload(
             exits.UNSUPPORTED_STRUCTURE,
         )
 
+    replacement_started = False
+    assembly_started = False
     try:
         for index, block in _parts(path, size=size, digest=digest):
             # Five digits orders a hundred gigabytes of parts lexicographically
@@ -154,30 +165,62 @@ def stream_upload(
                     exits.SERVER_ERROR,
                 )
 
-        headers = {
-            "Destination": destination,
-            "Overwrite": "T" if overwrite else "F",
-        }
+        if overwrite:
+            # Nextcloud's upload assembly endpoint ignores a tagged WebDAV `If`
+            # condition on the destination. Remove only the revision the plan
+            # observed, then use Overwrite: F so a new occupant can never be
+            # replaced in the interval before assembly.
+            replacement_started = True
+            removed = session.request(
+                "DELETE",
+                destination,
+                headers={"If-Match": expected_etag},
+                max_redirects=0,
+            )
+            if removed.status in {404, 412}:
+                replacement_started = False
+                raise UploadError(
+                    f"{destination} changed since the plan was made; nothing was assembled",
+                    exits.CONFLICT,
+                )
+            if removed.status not in {200, 204}:
+                replacement_started = False
+                raise UploadError(
+                    f"the planned destination could not be removed ({removed.status})",
+                    exits.SERVER_ERROR,
+                )
+
+        headers = {"Destination": destination, "Overwrite": "F"}
+        assembly_started = True
         assembled = session.request(
             "MOVE", f"{directory}{ASSEMBLY}", headers=headers, max_redirects=0
         )
         if assembled.status == 412:
+            assembly_started = False
             raise UploadError(
-                f"{destination} already holds a resource; nothing was overwritten",
-                exits.CONFLICT,
+                f"{destination} gained a resource before assembly; nothing was overwritten",
+                exits.OUTCOME_UNCERTAIN if replacement_started else exits.CONFLICT,
             )
         if assembled.status not in {201, 204}:
+            assembly_started = False
             raise UploadError(
                 f"the upload could not be assembled ({assembled.status})",
-                exits.OUTCOME_UNCERTAIN if assembled.status >= 500 else exits.SERVER_ERROR,
+                exits.OUTCOME_UNCERTAIN if replacement_started else exits.SERVER_ERROR,
             )
         return (assembled.header("OC-ETag") or assembled.header("ETag") or "").strip()
-    except Exception:
+    except Exception as exc:
         # The assembling MOVE consumes the directory, so this only ever runs
         # for an upload that did not finish; failing to clean up must not
         # replace the error that got here.
         with suppress(Exception):
             session.request("DELETE", directory)
+        if (replacement_started or assembly_started) and getattr(
+            exc, "code", None
+        ) != exits.OUTCOME_UNCERTAIN:
+            raise UploadError(
+                "the destination may have changed, but the streamed write was not confirmed",
+                exits.OUTCOME_UNCERTAIN,
+            ) from exc
         raise
 
 
@@ -218,26 +261,50 @@ def read_range(
         raise UploadError(
             f"the ranged read answered {response.status}", exits.MALFORMED_RESPONSE
         )
-    total = _total_size(response.header("Content-Range"))
-    if length is not None and len(response.body) != length:
+    returned_start, returned_end, total = _content_range(response.header("Content-Range"))
+    if returned_start != offset:
         raise UploadError(
-            f"the server returned {len(response.body)} bytes for a {length}-byte range",
+            f"the server returned bytes starting at {returned_start}, not {offset}",
+            exits.MALFORMED_RESPONSE,
+        )
+    returned_length = returned_end - returned_start + 1
+    if len(response.body) != returned_length:
+        raise UploadError(
+            "the response body length did not match its Content-Range",
+            exits.MALFORMED_RESPONSE,
+        )
+    if (
+        length is not None
+        and returned_length != length
+        and (total is None or returned_end != total - 1 or returned_length > length)
+    ):
+        raise UploadError(
+            f"the server returned {returned_length} bytes for a {length}-byte range",
             exits.MALFORMED_RESPONSE,
         )
     return response.body, total
 
 
+_CONTENT_RANGE = re.compile(r"bytes ([0-9]+)-([0-9]+)/([0-9]+|\*)")
+
+
+def _content_range(value: str | None) -> tuple[int, int, int | None]:
+    """Read and validate the interval described by one 206 response."""
+    candidate = (value or "").strip()
+    matched = _CONTENT_RANGE.fullmatch(candidate)
+    if matched is None or any(len(part) > 20 for part in matched.groups()[:2]):
+        raise UploadError("the server returned a malformed Content-Range")
+    start = int(matched.group(1))
+    end = int(matched.group(2))
+    total = None if matched.group(3) == "*" else int(matched.group(3))
+    if end < start or (total is not None and (len(matched.group(3)) > 20 or end >= total)):
+        raise UploadError("the server returned a malformed Content-Range")
+    return start, end, total
+
+
 def _total_size(value: str | None) -> int | None:
     """Read the entity length out of a `Content-Range`, when it states one."""
-    if not value:
-        return None
-    _, _, rest = value.partition("/")
-    candidate = rest.strip()
-    if not candidate or candidate == "*":
-        return None
-    if not candidate.isascii() or not candidate.isdigit() or len(candidate) > 20:
-        raise UploadError("the server returned a malformed Content-Range")
-    return int(candidate)
+    return _content_range(value)[2]
 
 
 def append_local(path: str | Path, content: bytes, *, offset: int) -> Path:

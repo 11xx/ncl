@@ -68,7 +68,8 @@ READ
   because the server is answering for a calendar the caller may not read. A
   recipient the server declined to answer for is reported as unanswered and
   never as an empty schedule: those two readings differ by exactly the meeting
-  the answer would be used to book.
+  the answer would be used to book. A floating period is refused rather than
+  interpreted through this machine's timezone.
 
   `cal collection` answers what a calendar is rather than how to address it:
   its description, its colour as the server spells it, and the component set it
@@ -88,9 +89,10 @@ UNDO A DELETION OR AN OVERWRITE
   came from and where restoring would put it back. An entry from outside the
   allowlist is listed — seeing what was deleted is a read — and never restored.
 
-  A restore onto an occupied path is refused before anything is sent: the
-  server would restore beside the occupant under a name nobody asked for, so
-  the plan could not keep its promise. Move what is there first.
+  A restore onto an occupied path is refused before the MOVE: the server would
+  restore beside the occupant under a name nobody asked for, so the plan could
+  not keep its promise. The restored resource must carry the file identifier
+  observed in the trash; source absence alone cannot prove where it landed.
 
   `trash purge` is the narrowest gate in the tool. Everything else leaves a
   copy somewhere; this removes the last one, and the bin is where the remedy
@@ -112,7 +114,9 @@ SEE AND CHANGE WHO ELSE CAN REACH A FILE
   An unscoped listing reports every share this account made, including over
   paths the allowlist does not admit and types this tool cannot create. The
   allowlist bounds what may be reached; a listing that hid a public link
-  because its path was unconfigured would answer the wrong question.
+  because its path was unconfigured would answer the wrong question. Revoking
+  one still requires its file href to be allowlisted, and unknown permission
+  bits are refused rather than hidden.
 
   A link password comes from `--password-from <file>`, never an argument, and
   its length is withheld from plan output along with its value. `--permissions`
@@ -258,18 +262,23 @@ REACH ALLOWLISTED FILES
   ncl files read <file-href> --offset <n> --length <n> --output <path>
 
   File hrefs must be inside one of the profile's `files_roots`. Only content
-  declared as textual and decodable as UTF-8 is sent to redacted stdout; binary,
+  declared as textual and decodable as UTF-8 is sent to redacted stdout; binary
+  and non-UTF-8 content needs `--output`.
+
   A write larger than a few megabytes streams in parts through the server's
   chunked upload rather than freezing its bytes in the plan. What the plan
   freezes then is the source's size and SHA-256, and applying refuses if the
-  file changed underneath — nothing reaches the destination until the final
-  assembling step, so a refusal leaves it untouched. A ranged read writes its
-  window at its own offset, and a server that ignores the range and sends the
-  whole file is refused rather than misread.
+  file changed underneath. A replacement conditionally deletes only the ETag
+  the plan observed before assembling with overwrite disabled; after that
+  deletion any unconfirmed outcome is uncertain and the old revision remains
+  in trash. Applying hashes the assembled bytes in windows. A ranged read
+  writes its window at its own offset only when `Content-Range` confirms that
+  interval; a server that ignores or shifts the range is refused.
 
   `files find` asks the server where a file is rather than walking the tree
   for it, and needs at least one condition: a search with none is a recursive
-  listing at a cost nobody asked for. `*` and `?` are the name wildcards. A
+  listing at a cost nobody asked for. A server cannot enlarge `--limit`; an
+  oversized answer is refused. `*` and `?` are the name wildcards. A
   result outside the searched subtree or outside the allowlist is a refusal,
   not a filtered row — the server chose what matched, so its answer is where
   a scope escape would arrive.

@@ -143,6 +143,17 @@ def test_a_failed_result_row_is_malformed_rather_than_skipped():
         search.find(PROFILE, session=transport, href=ROOT, name="*.md")
 
 
+def test_a_server_cannot_silently_exceed_the_requested_limit():
+    transport, _ = transport_for(
+        response(207, multistatus(entry(ROOT + "a.md"), entry(ROOT + "b.md")))
+    )
+
+    with pytest.raises(files.FileError, match="requested limit of 1") as error:
+        search.find(PROFILE, session=transport, href=ROOT, name="*", limit=1)
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+
+
 def test_a_rejected_search_says_the_server_may_not_support_a_condition():
     transport, _ = transport_for(response(400))
 

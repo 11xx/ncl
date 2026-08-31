@@ -119,8 +119,12 @@ def _period(value: Any) -> tuple[dt.datetime, dt.datetime]:
         finish = begin + finish
     if not isinstance(finish, dt.datetime):
         raise SchedulingError("a FREEBUSY period does not end at an instant")
-    if finish < begin:
-        raise SchedulingError("a FREEBUSY period ends before it starts")
+    if begin.tzinfo is None or begin.utcoffset() is None:
+        raise SchedulingError("a FREEBUSY period starts without a timezone offset")
+    if finish.tzinfo is None or finish.utcoffset() is None:
+        raise SchedulingError("a FREEBUSY period ends without a timezone offset")
+    if finish <= begin:
+        raise SchedulingError("a FREEBUSY period does not end after it starts")
     return begin, finish
 
 

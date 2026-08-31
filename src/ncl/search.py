@@ -222,4 +222,9 @@ def find(
             # The searched collection is not one of its own results.
             continue
         found.append(reference)
+        if limit is not None and len(found) > limit:
+            raise FileError(
+                f"the server returned more than the requested limit of {limit}",
+                exits.MALFORMED_RESPONSE,
+            )
     return sorted(found, key=lambda item: item.href)
