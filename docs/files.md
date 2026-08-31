@@ -91,13 +91,23 @@ operation, consuming the directory. Parts are named zero-padded so a server
 ordering them lexicographically and one ordering them numerically assemble the
 same bytes. Nothing exists at the destination until that final `MOVE`, so a
 failure part-way through a creation leaves the destination untouched. A
-replacement uploads every part first, conditionally deletes only the destination
-revision whose ETag the plan froze, then assembles with `Overwrite: F`. A newer
-revision is never overwritten, and a resource that appears between deletion and
-assembly is left in place. Once the conditional deletion succeeds, any
-unconfirmed outcome is uncertain, and the removed revision is recoverable from
-the trash only where the trashbin app is enabled and its retention has not
-already expired the entry. That residual window is what this design costs. The upload directory is removed on the way out, and failing to
+replacement uploads every part first, re-reads the destination ETag, and
+assembles onto the occupant with `Overwrite: T`.
+
+Overwriting rather than re-creating is what keeps the destination's file
+identifier, and Nextcloud keys version history, shares, tags, and comments to
+that identifier: a replacement that removed the path first would take all of
+them with it, silently, on exactly the large files most likely to have them.
+Assembling over the occupant also files the replaced revision as a version.
+
+The server enforces no precondition on that assembly — it ignores a tagged
+`If` condition on the destination — so the frozen ETag is checked immediately
+before the `MOVE` rather than asserted during it. That closes the window
+between planning and applying, not the last instant of it: a write landing
+inside that instant is displaced without being refused, into version history
+where it is recoverable. An unconfirmed assembly is uncertain for the same
+reason. That residual race is what this design costs, and it buys a residue
+stronger than the trash. The upload directory is removed on the way out, and failing to
 remove it never replaces the error that caused it.
 
 Applying and reconciling a streamed write read the stored file back in windows

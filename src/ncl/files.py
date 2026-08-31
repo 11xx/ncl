@@ -1044,9 +1044,10 @@ def _reconcile_upload(profile: Any, *, session: Session, step: plans.Step) -> di
     """Settle a streamed write without reading the whole file into memory.
 
     On a creation, an absent destination means the assembling MOVE never
-    happened and nothing landed. On a replacement it means the opposite: the
-    conditional deletion succeeded and the assembly did not, so the outcome is
-    uncertain and the old revision is in the trash. A present destination is
+    happened and nothing landed. On a replacement the destination existed when
+    the plan was frozen, so an absent one means somebody else removed it and
+    this write cannot be told apart from one that landed and was deleted
+    after — which is uncertainty rather than failure. A present destination is
     only verified once its bytes hash to what the plan froze: a matching
     length is not a matching file.
     """
