@@ -151,13 +151,24 @@ def test_a_listing_reads_the_reach_of_each_share():
     assert found[0].public is True
 
 
-def test_unknown_permission_bits_are_refused_instead_of_hidden():
-    with pytest.raises(shares.ShareError, match="unmodelled permission bits 32"):
-        shares.list_shares(
-            PROFILE,
-            session=transport_for(ocs_response([share_record(permissions=33)])),
-            account_name=ACCOUNT,
-        )
+def test_an_unmodelled_permission_bit_is_named_and_does_not_end_the_listing():
+    """One share this tool cannot fully read must not hide the ones it can.
+
+    The unscoped listing answers "who can see my files", so refusing the whole
+    response over a bit above the modelled set answers it with silence. The
+    name reports the reach instead, as an unrecognised share type does.
+    """
+    found = shares.list_shares(
+        PROFILE,
+        session=transport_for(
+            ocs_response([share_record(permissions=33), share_record(id="2")])
+        ),
+        account_name=ACCOUNT,
+    )
+
+    assert len(found) == 2
+    assert found[0].permissions == ("read", "unmodelled:32")
+    assert found[1].permissions == ("read", "share")
 
 
 def test_a_share_type_this_tool_does_not_create_is_still_reported():

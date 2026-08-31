@@ -123,8 +123,13 @@ def _period(value: Any) -> tuple[dt.datetime, dt.datetime]:
         raise SchedulingError("a FREEBUSY period starts without a timezone offset")
     if finish.tzinfo is None or finish.utcoffset() is None:
         raise SchedulingError("a FREEBUSY period ends without a timezone offset")
-    if finish <= begin:
-        raise SchedulingError("a FREEBUSY period does not end after it starts")
+    # A zero-length period is what RFC 5545 produces from a VEVENT with a
+    # DATE-TIME DTSTART and no DTEND, so an ordinary calendar makes them. Only
+    # a period that ends before it starts is unreadable, and this module fails
+    # toward busy — refusing here discards every recipient's answer, not one
+    # period.
+    if finish < begin:
+        raise SchedulingError("a FREEBUSY period ends before it starts")
     return begin, finish
 
 

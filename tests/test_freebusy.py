@@ -317,6 +317,37 @@ def test_a_duration_period_is_resolved_to_its_end_instant():
     assert periods[0].end == "2026-09-01T10:30:00+00:00"
 
 
+def test_a_zero_length_period_is_read_rather_than_ending_the_answer():
+    """RFC 5545 makes these from any VEVENT with a DATE-TIME start and no end.
+
+    The refusal escapes the per-recipient loop, so rejecting one discards every
+    recipient's availability — and this module's rule is that a refusal fails
+    toward busy, not toward no answer.
+    """
+    periods = freebusy._calendar_periods(
+        "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//x//EN\nBEGIN:VFREEBUSY\nUID:a@b\n"
+        "DTSTAMP:20260901T000000Z\nFREEBUSY:20260901T090000Z/20260901T090000Z\n"
+        "END:VFREEBUSY\nEND:VCALENDAR"
+    )
+
+    assert [period.start for period in periods] == ["2026-09-01T09:00:00+00:00"]
+    assert periods[0].end == "2026-09-01T09:00:00+00:00"
+
+
+def test_a_period_ending_before_it_starts_is_still_refused():
+    """Read through _period: the iCalendar parser rejects the reversed literal
+    itself, so this is the only way to reach the ordering check."""
+    import datetime as dt
+
+    begin = dt.datetime(2026, 9, 1, 10, tzinfo=dt.UTC)
+    finish = dt.datetime(2026, 9, 1, 9, tzinfo=dt.UTC)
+
+    with pytest.raises(scheduling.SchedulingError, match="ends before it starts"):
+        freebusy._period((begin, finish))
+
+    assert freebusy._period((begin, begin)) == (begin, begin)
+
+
 def test_a_floating_period_is_refused_instead_of_using_the_host_timezone():
     with pytest.raises(scheduling.SchedulingError, match="without a timezone offset"):
         freebusy._calendar_periods(

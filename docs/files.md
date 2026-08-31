@@ -95,8 +95,9 @@ replacement uploads every part first, conditionally deletes only the destination
 revision whose ETag the plan froze, then assembles with `Overwrite: F`. A newer
 revision is never overwritten, and a resource that appears between deletion and
 assembly is left in place. Once the conditional deletion succeeds, any
-unconfirmed outcome is uncertain and the removed revision remains recoverable
-from the trash. The upload directory is removed on the way out, and failing to
+unconfirmed outcome is uncertain, and the removed revision is recoverable from
+the trash only where the trashbin app is enabled and its retention has not
+already expired the entry. That residual window is what this design costs. The upload directory is removed on the way out, and failing to
 remove it never replaces the error that caused it.
 
 Applying and reconciling a streamed write read the stored file back in windows

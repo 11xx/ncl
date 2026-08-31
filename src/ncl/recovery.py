@@ -173,6 +173,18 @@ def _file_identifier(value: str) -> str:
     return value
 
 
+def _optional_file_identifier(value: str) -> str:
+    """Read an identifier where absence is legible rather than fatal.
+
+    Listing the trash is a read, and the guide promises it shows every entry —
+    including ones outside the allowlist, which can never be restored at all.
+    An entry the server describes without an identifier is still an entry
+    somebody wants to see, so it is listed without one and refused later, at
+    the restore that actually needs it.
+    """
+    return _file_identifier(value) if value else ""
+
+
 def trash_root(account_name: str) -> str:
     return f"{TRASH_ROOT}{quote(account_name, safe='')}/trash/"
 
@@ -230,7 +242,7 @@ def list_trash(profile: Any, *, session: Session, account_name: str) -> list[Tra
                 original_href=original,
                 deleted_at=_deleted_at(_text(props, (NC, "trashbin-deletion-time"))),
                 size=_size(_text(props, (DAV, "getcontentlength"))),
-                file_id=_file_identifier(_text(props, (OC, "fileid"))),
+                file_id=_optional_file_identifier(_text(props, (OC, "fileid"))),
                 collection=resource_type is not None
                 and any(_element_name(c) == (DAV, "collection") for c in resource_type),
                 in_scope=profiles.in_scope(original, profile.files_roots),
@@ -273,6 +285,16 @@ def plan_restore(
     entry = _restorable(
         _entry(profile, list_trash(profile, session=session, account_name=account_name), href)
     )
+    if not entry.file_id:
+        # The restore is verified by identity: source absence alone cannot
+        # prove where the file landed. Without one there is nothing to check
+        # the result against, so the plan is refused rather than made
+        # unverifiable.
+        raise FileError(
+            f"{entry.original_location} carries no file identifier, so a restore of it "
+            "could not be verified",
+            exits.MALFORMED_RESPONSE,
+        )
     occupant = stat_resource(
         profile, session=session, href=entry.original_href, missing_ok=True
     )

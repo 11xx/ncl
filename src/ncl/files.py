@@ -1043,9 +1043,12 @@ def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, An
 def _reconcile_upload(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
     """Settle a streamed write without reading the whole file into memory.
 
-    An absent destination means the assembling MOVE never happened, so nothing
-    landed. A present one is only verified once its bytes hash to what the plan
-    froze: a matching length is not a matching file.
+    On a creation, an absent destination means the assembling MOVE never
+    happened and nothing landed. On a replacement it means the opposite: the
+    conditional deletion succeeded and the assembly did not, so the outcome is
+    uncertain and the old revision is in the trash. A present destination is
+    only verified once its bytes hash to what the plan froze: a matching
+    length is not a matching file.
     """
     target = _file_target(profile, step)
     size = int(step.details["size"])
