@@ -302,10 +302,6 @@ def _content_range(value: str | None) -> tuple[int, int, int | None]:
     return start, end, total
 
 
-def _total_size(value: str | None) -> int | None:
-    """Read the entity length out of a `Content-Range`, when it states one."""
-    return _content_range(value)[2]
-
 
 def append_local(path: str | Path, content: bytes, *, offset: int) -> Path:
     """Write a window's bytes at their own offset in a local file.

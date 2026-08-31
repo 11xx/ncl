@@ -47,8 +47,11 @@ cannot create is still listed, and one it has no name for is labelled
 `unsupported:<n>` rather than dropped.
 
 Permissions are reported as names decoded from the bitmask OCS packs them into:
-`read`, `update`, `create`, `delete`, `share`. A bit outside that model is a
-refusal rather than silently narrower reach.
+`read`, `update`, `create`, `delete`, `share`. A bit outside that model is
+named `unmodelled:<n>`, on the same reasoning as an unrecognised share type:
+the reach is reported rather than dropped, and one share this tool cannot
+fully read does not make the listing unanswerable. A plan reconciled against
+such a share reports the extra bit as reach the preview did not promise.
 
 ## Creating and revoking
 

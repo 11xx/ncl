@@ -35,7 +35,11 @@ restore onto an occupied path is refused while planning and checked again
 immediately before the move, naming the remedy: move or delete what is there
 first.
 
-Each trash entry carries Nextcloud's stable file identifier. Past the `MOVE`,
+A trash entry normally carries Nextcloud's stable file identifier. One
+described without it is still listed — the bin is where a person looks for what
+they deleted, so a single unreadable entry must not hide the rest — and its
+restore is refused at planning time, where the identifier is what the promise
+rests on. Past the `MOVE`,
 the resource at the promised location must carry that same identifier; source
 absence alone is not proof, because an interloper could have won the final race
 and caused the restore to land under another name. A location or identity that

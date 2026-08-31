@@ -146,16 +146,23 @@ def ocs_path(profile: Any, *, account_name: str, href: str) -> str:
 
 
 def _permissions(value: Any) -> tuple[str, ...]:
+    """Name the permissions a share grants, including any this tool cannot name.
+
+    An unmodelled bit is reported as `unmodelled:<n>` rather than refused, the
+    way an unrecognised share type is reported as `unsupported:<n>`. This runs
+    over every record in a listing, and the unscoped listing exists to answer
+    "who can see my files" — one share carrying a bit this tool does not model
+    must not be able to make that question unanswerable. The name still says
+    the reach is wider than the rest of the tuple accounts for, and `_widened`
+    reports it as reach a plan did not promise.
+    """
     if isinstance(value, str) and value.strip().lstrip("-").isdigit():
         value = int(value)
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ShareError("a share reported permissions this tool cannot read")
+    named = tuple(name for bit, name in _PERMISSION_BITS if value & bit)
     unknown = value & ~_PERMISSION_MASK
-    if unknown:
-        raise ShareError(
-            f"a share reported unmodelled permission bits {unknown}; its reach is unknown"
-        )
-    return tuple(name for bit, name in _PERMISSION_BITS if value & bit)
+    return (*named, f"unmodelled:{unknown}") if unknown else named
 
 
 def _text(record: dict[str, Any], key: str) -> str:

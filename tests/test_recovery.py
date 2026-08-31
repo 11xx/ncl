@@ -89,6 +89,33 @@ def test_a_trash_entry_reports_where_it_came_from():
     assert entries[0].in_scope is True
 
 
+def test_an_entry_without_an_identifier_is_listed_and_refused_only_at_the_restore():
+    """The same rule as an out-of-scope entry: sight is a read, the restore is gated.
+
+    A restore is verified by identity, so an entry carrying none cannot be
+    restored — but refusing it while listing loses every other entry in the
+    bin, which is the one place a person looks for what they deleted.
+    """
+    nameless = trash_entry(
+        href=TRASH + "old.md.d1788000002", location="work/old.md", name="old.md", file_id=""
+    )
+    transport, _ = transport_for(response(207, multistatus(trash_entry(), nameless)))
+
+    entries = recovery.list_trash(PROFILE, session=transport, account_name=ACCOUNT)
+
+    assert len(entries) == 2
+    assert [entry.file_id for entry in entries if entry.name == "old.md"] == [""]
+
+    transport, _ = transport_for(response(207, multistatus(trash_entry(), nameless)))
+    with pytest.raises(files.FileError, match="carries no file identifier"):
+        recovery.plan_restore(
+            PROFILE,
+            session=transport,
+            account_name=ACCOUNT,
+            href=TRASH + "old.md.d1788000002",
+        )
+
+
 def test_the_bin_lists_entries_it_may_not_restore():
     """Seeing what was deleted is a read; the allowlist gates the restore, not the sight."""
     outside = trash_entry(
