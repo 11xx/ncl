@@ -9,6 +9,7 @@ a listing.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 from test_auth import FakeTransport, home_response, principal_response, response
@@ -146,6 +147,56 @@ def test_a_card_that_never_ends_is_refused():
 def test_a_line_without_a_value_is_refused():
     with pytest.raises(vcard.VcardError, match="carried no value"):
         vcard.parse(b"BEGIN:VCARD\r\nFN\r\nEND:VCARD\r\n")
+
+
+def test_a_resource_that_is_not_a_card_is_refused():
+    raw = b"BEGIN:WRONG\r\nVERSION:3.0\r\nUID:1\r\nFN:Nobody\r\nEND:WRONG\r\n"
+
+    with pytest.raises(vcard.VcardError, match="not a vCard"):
+        contacts.reference(PROFILE, book_href=BOOK, href=CARD_HREF, etag="", raw=raw)
+
+
+def test_a_component_closed_under_another_name_is_refused():
+    raw = b"BEGIN:VCARD\r\nVERSION:3.0\r\nUID:1\r\nBEGIN:X-INNER\r\nEND:VCARD\r\nEND:X-INNER\r\n"
+
+    with pytest.raises(vcard.VcardError, match="while X-INNER was open"):
+        contacts.reference(PROFILE, book_href=BOOK, href=CARD_HREF, etag="", raw=raw)
+
+
+def test_a_nested_component_does_not_split_the_card():
+    raw = (
+        b"BEGIN:VCARD\r\nVERSION:3.0\r\nUID:1\r\nFN:Leon Green\r\n"
+        b"BEGIN:X-INNER\r\nX-FOO:1\r\nEND:X-INNER\r\nEMAIL:leon@example.invalid\r\n"
+        b"END:VCARD\r\n"
+    )
+
+    found = contacts.reference(PROFILE, book_href=BOOK, href=CARD_HREF, etag="", raw=raw)
+
+    assert found.full_name == "Leon Green"
+    assert found.emails == ("leon@example.invalid",)
+    assert not vcard.has(vcard.cards(raw)[0], "X-FOO")
+
+
+def test_a_card_this_reader_refuses_is_named_by_its_href():
+    raw = b"BEGIN:VCARD\r\nVERSION:9.9\r\nUID:1\r\nFN:Leon Green\r\nEND:VCARD\r\n"
+
+    with pytest.raises(vcard.VcardError, match=re.escape(CARD_HREF)):
+        contacts.reference(PROFILE, book_href=BOOK, href=CARD_HREF, etag="", raw=raw)
+
+
+def test_a_blank_version_is_read_as_undeclared():
+    raw = b"BEGIN:VCARD\r\nVERSION:\r\nUID:1\r\nFN:Leon Green\r\nEND:VCARD\r\n"
+
+    found = contacts.reference(PROFILE, book_href=BOOK, href=CARD_HREF, etag="", raw=raw)
+
+    assert found.full_name == "Leon Green"
+
+
+def test_a_version_this_reader_does_not_implement_is_refused():
+    raw = b"BEGIN:VCARD\r\nVERSION:9.9\r\nUID:1\r\nFN:Leon Green\r\nEND:VCARD\r\n"
+
+    with pytest.raises(vcard.VcardError, match=re.escape("this reads 2.1, 3.0, 4.0")):
+        contacts.reference(PROFILE, book_href=BOOK, href=CARD_HREF, etag="", raw=raw)
 
 
 # --- references --------------------------------------------------------------

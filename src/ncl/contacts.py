@@ -286,7 +286,15 @@ _UNSUPPORTED = ("MEMBER", "KIND", "RELATED", "GEO", "X-ADDRESSBOOKSERVER-KIND")
 
 def reference(profile: Any, *, book_href: str, href: str, etag: str, raw: bytes) -> ContactRef:
     """Reduce one card to the fields it is found and addressed by."""
-    parsed = vcard.cards(raw)
+    try:
+        parsed = vcard.cards(raw)
+    except vcard.VcardError as exc:
+        # A listing reads every card in a book, so a refusal that names only
+        # what was wrong leaves the operator without the one thing they need
+        # to act: which card.
+        raise vcard.VcardError(
+            f"the card at {href} could not be read: {exc.message}", exc.code
+        ) from exc
     if len(parsed) != 1:
         raise ContactError(
             f"the resource at {href} holds {len(parsed)} cards; this tool addresses one "
