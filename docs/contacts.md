@@ -46,7 +46,8 @@ right until a value contains a semicolon.
   first `END` — otherwise a card holding a nested component is cut in half and
   its remainder read as a second contact.
 - A property inside a nested component belongs to that component, not to the
-  card: it is skipped rather than reported or refused.
+  card: it is skipped rather than refused, and the raw card carries it to a
+  caller that needs it.
 - A declared `VERSION` must be one this reader implements: `2.1`, `3.0`, or
   `4.0`. Escaping and structured values differ between versions, so a card
   declaring one this reader does not implement cannot be read under these

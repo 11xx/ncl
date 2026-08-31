@@ -171,9 +171,10 @@ def parse(raw: bytes) -> list[Property]:
     the caller as a contact with no fields rather than as an error.
 
     A property inside a nested component belongs to that component, not to the
-    card, so it is skipped rather than reported or refused. Callers read a
-    whole address book in one request, and a card holding an `X-ABLABEL` group
-    is ordinary enough that refusing it would cost the book.
+    card, so it is skipped rather than refused. Callers read a whole address
+    book in one request, and refusing a card for a component this view does
+    not model would cost the book to say nothing about the contacts in it.
+    Nothing is lost: the raw card travels beside the reference.
 
     This reads one card. Two concatenated cards reach it as one property list;
     callers go through `cards()`, which splits them.
