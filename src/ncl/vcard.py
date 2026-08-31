@@ -152,27 +152,51 @@ def _parameters(segment: str) -> tuple[str, dict[str, tuple[str, ...]]]:
     return name, parameters
 
 
+#: The versions this reader implements. A card announcing anything else is
+#: refused rather than read under these rules: escaping and structured values
+#: differ between versions, so reading an unimplemented one produces values
+#: that look right. A card announcing nothing is read anyway — a listing is
+#: one request for every card in a book, so refusing a card for an absent
+#: property would cost the whole book to gain nothing about the cards in it.
+VERSIONS = frozenset({"2.1", "3.0", "4.0"})
+
+
 def parse(raw: bytes) -> list[Property]:
-    """Read one vCard into its properties, in the order they appear."""
+    """Read one vCard into its properties, in the order they appear.
+
+    A component marker carries the name of what it opens or closes, and both
+    are checked. Ignoring them accepts `BEGIN:WRONG ... END:WRONG` as a
+    contact, and accepts a card whose inner component was closed with the
+    outer one's name — neither of which is a vCard, and both of which reach
+    the caller as a contact with no fields rather than as an error.
+    """
     lines = unfold(raw)
     if not lines:
         raise VcardError("the vCard was empty")
     properties: list[Property] = []
-    depth = 0
+    components: list[str] = []
     for line in lines:
         segment, separator, value = line.partition(":")
         if not separator:
             raise VcardError("a vCard line carried no value")
         name, parameters = _parameters(segment)
+        component = value.strip().upper()
         if name == "BEGIN":
-            depth += 1
+            if not components and component != "VCARD":
+                raise VcardError(f"the resource opened {component or 'nothing'}, not a vCard")
+            components.append(component)
             continue
         if name == "END":
-            depth -= 1
-            if depth < 0:
+            if not components:
                 raise VcardError("the vCard ended a component it had not begun")
+            if components[-1] != component:
+                raise VcardError(
+                    f"the vCard closed {component or 'nothing'} "
+                    f"while {components[-1]} was open"
+                )
+            components.pop()
             continue
-        if depth != 1:
+        if len(components) != 1:
             raise VcardError("a vCard property lay outside its own card")
         properties.append(
             Property(
@@ -181,8 +205,11 @@ def parse(raw: bytes) -> list[Property]:
                 value="" if name in BINARY_PROPERTIES else _unescape(value),
             )
         )
-    if depth != 0:
+    if components:
         raise VcardError("the vCard did not end")
+    for declared in every(properties, "VERSION"):
+        if declared.value.strip() not in VERSIONS:
+            raise VcardError(f"the vCard declared unsupported version {declared.value.strip()!r}")
     return properties
 
 
@@ -224,13 +251,28 @@ def has(properties: list[Property], name: str) -> bool:
 
 
 def cards(raw: bytes) -> list[list[Property]]:
-    """Read every card in one resource, which is normally exactly one."""
+    """Read every card in one resource, which is normally exactly one.
+
+    A card ends where the component it opened is closed, not at the first
+    `END` in the file. A card carrying a nested component would otherwise be
+    cut in half, and its remainder read as a second contact.
+    """
     parsed: list[list[Property]] = []
     current: list[str] = []
+    depth = 0
     for line in unfold(raw):
-        name = line.partition(":")[0].split(";", 1)[0].strip().upper()
+        segment = line.partition(":")[0]
+        name = segment.split(";", 1)[0].rsplit(".", 1)[-1].strip().upper()
         current.append(line)
-        if name == "END":
+        if name == "BEGIN":
+            depth += 1
+            continue
+        if name != "END":
+            continue
+        depth -= 1
+        if depth < 0:
+            raise VcardError("the vCard ended a component it had not begun")
+        if depth == 0:
             parsed.append(parse("\r\n".join(current).encode("utf-8")))
             current = []
     if current:

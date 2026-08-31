@@ -148,6 +148,39 @@ def test_a_line_without_a_value_is_refused():
         vcard.parse(b"BEGIN:VCARD\r\nFN\r\nEND:VCARD\r\n")
 
 
+def test_a_resource_that_is_not_a_card_is_refused():
+    raw = b"BEGIN:WRONG\r\nVERSION:3.0\r\nUID:1\r\nFN:Nobody\r\nEND:WRONG\r\n"
+
+    with pytest.raises(vcard.VcardError, match="not a vCard"):
+        contacts.reference(PROFILE, book_href=BOOK, href=CARD_HREF, etag="", raw=raw)
+
+
+def test_a_component_closed_under_another_name_is_refused():
+    raw = b"BEGIN:VCARD\r\nVERSION:3.0\r\nUID:1\r\nBEGIN:X-INNER\r\nEND:VCARD\r\nEND:X-INNER\r\n"
+
+    with pytest.raises(vcard.VcardError, match="while X-INNER was open"):
+        contacts.reference(PROFILE, book_href=BOOK, href=CARD_HREF, etag="", raw=raw)
+
+
+def test_a_nested_component_does_not_split_the_card():
+    raw = (
+        b"BEGIN:VCARD\r\nVERSION:3.0\r\nUID:1\r\nFN:Leon Green\r\n"
+        b"BEGIN:X-INNER\r\nEND:X-INNER\r\nEMAIL:leon@example.invalid\r\nEND:VCARD\r\n"
+    )
+
+    found = contacts.reference(PROFILE, book_href=BOOK, href=CARD_HREF, etag="", raw=raw)
+
+    assert found.full_name == "Leon Green"
+    assert found.emails == ("leon@example.invalid",)
+
+
+def test_a_version_this_reader_does_not_implement_is_refused():
+    raw = b"BEGIN:VCARD\r\nVERSION:9.9\r\nUID:1\r\nFN:Leon Green\r\nEND:VCARD\r\n"
+
+    with pytest.raises(vcard.VcardError, match="unsupported version"):
+        contacts.reference(PROFILE, book_href=BOOK, href=CARD_HREF, etag="", raw=raw)
+
+
 # --- references --------------------------------------------------------------
 
 

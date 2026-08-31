@@ -40,6 +40,16 @@ right until a value contains a semicolon.
 - `PHOTO`, `LOGO`, `SOUND`, and `KEY` are recorded as present and never as
   content. A listing that inlined a photo would be dominated by base64 nobody
   asked for.
+- A component marker carries the name of what it opens or closes, and both are
+  checked. The outermost component is `VCARD` or the resource is not a card,
+  and a card ends where the component it opened is closed rather than at the
+  first `END` — otherwise a card holding a nested component is cut in half and
+  its remainder read as a second contact.
+- A declared `VERSION` must be one this reader implements: `2.1`, `3.0`, or
+  `4.0`. Escaping and structured values differ between versions, so reading an
+  unimplemented one yields values that look right. A card declaring no version
+  is read anyway — a listing is every card in a book at once, and refusing one
+  card for an absent property costs the whole book.
 
 ## Reading contacts
 
