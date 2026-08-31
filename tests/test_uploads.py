@@ -12,9 +12,9 @@ import hashlib
 
 import pytest
 from test_auth import FakeTransport, response
-from test_files import PROFILE, ROOT, entry, multistatus
+from test_files import PROFILE, ROOT, configure, entry, multistatus
 
-from ncl import exits, files, plans, secrets, session, uploads
+from ncl import cli, exits, files, plans, secrets, session, uploads
 
 ACCOUNT = "alice"
 TARGET = ROOT + "big.bin"
@@ -64,6 +64,7 @@ def test_parts_are_named_so_lexicographic_and_numeric_order_agree(source, monkey
         digest=digest,
         token="tok",
         overwrite=False,
+        expected_etag="",
     )
 
     names = [item["url"].rsplit("/", 1)[-1] for item in fake.requests[1:-1]]
@@ -85,6 +86,7 @@ def test_the_assembling_move_carries_the_destination_and_refuses_to_overwrite(so
         digest=digest,
         token="tok",
         overwrite=False,
+        expected_etag="",
     )
 
     assembling = fake.requests[-1]
@@ -92,6 +94,83 @@ def test_the_assembling_move_carries_the_destination_and_refuses_to_overwrite(so
     assert assembling["url"].endswith("/.file")
     assert assembling["headers"]["Destination"] == TARGET
     assert assembling["headers"]["Overwrite"] == "F"
+
+
+def test_a_streamed_replacement_removes_only_the_revision_the_plan_observed(source):
+    size, digest = uploads.measure(source)
+    transport, fake = transport_for(
+        response(201), response(201), response(204), response(201)
+    )
+
+    uploads.stream_upload(
+        PROFILE,
+        session=transport,
+        account_name=ACCOUNT,
+        source=source,
+        destination=TARGET,
+        size=size,
+        digest=digest,
+        token="tok",
+        overwrite=True,
+        expected_etag='"planned"',
+    )
+
+    assert [item["method"] for item in fake.requests] == ["MKCOL", "PUT", "DELETE", "MOVE"]
+    assert fake.requests[2]["headers"]["If-Match"] == '"planned"'
+    assert fake.requests[3]["headers"]["Overwrite"] == "F"
+
+
+def test_a_newer_destination_revision_is_not_removed_or_overwritten(source):
+    size, digest = uploads.measure(source)
+    transport, fake = transport_for(
+        response(201), response(201), response(412), response(204)
+    )
+
+    with pytest.raises(uploads.UploadError, match="changed since the plan") as error:
+        uploads.stream_upload(
+            PROFILE,
+            session=transport,
+            account_name=ACCOUNT,
+            source=source,
+            destination=TARGET,
+            size=size,
+            digest=digest,
+            token="tok",
+            overwrite=True,
+            expected_etag='"planned"',
+        )
+
+    assert error.value.code == exits.CONFLICT
+    assert [item["method"] for item in fake.requests] == ["MKCOL", "PUT", "DELETE", "DELETE"]
+
+
+def test_a_replacement_interrupted_after_deletion_is_uncertain(source):
+    size, digest = uploads.measure(source)
+    transport, _ = transport_for(
+        response(201), response(201), response(204), response(412), response(204)
+    )
+
+    with pytest.raises(uploads.UploadError) as error:
+        uploads.stream_upload(
+            PROFILE,
+            session=transport,
+            account_name=ACCOUNT,
+            source=source,
+            destination=TARGET,
+            size=size,
+            digest=digest,
+            token="tok",
+            overwrite=True,
+            expected_etag='"planned"',
+        )
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+
+
+def test_upload_directory_quotes_account_and_token_as_path_segments():
+    assert uploads.upload_directory("alice/admin", "a/b") == (
+        "/remote.php/dav/uploads/alice%2Fadmin/a%2Fb/"
+    )
 
 
 def test_a_source_that_changed_after_planning_is_never_assembled(source):
@@ -110,6 +189,7 @@ def test_a_source_that_changed_after_planning_is_never_assembled(source):
             digest=digest,
             token="tok",
             overwrite=False,
+            expected_etag="",
         )
 
     assert error.value.code == exits.CONFLICT
@@ -133,6 +213,7 @@ def test_a_source_that_grew_is_refused_before_the_whole_file_is_sent(source, mon
             digest=digest,
             token="tok",
             overwrite=False,
+            expected_etag="",
         )
 
     assert "MOVE" not in [item["method"] for item in fake.requests]
@@ -153,6 +234,7 @@ def test_a_failed_upload_removes_its_own_directory(source):
             digest=digest,
             token="tok",
             overwrite=False,
+            expected_etag="",
         )
 
     assert fake.requests[-1]["method"] == "DELETE"
@@ -174,6 +256,7 @@ def test_a_transport_failure_mid_upload_still_removes_the_directory(source):
             digest=digest,
             token="tok",
             overwrite=False,
+            expected_etag="",
         )
 
     assert fake.requests[-1]["method"] == "DELETE"
@@ -194,6 +277,7 @@ def test_an_occupied_destination_is_a_conflict(source):
             digest=digest,
             token="tok",
             overwrite=False,
+            expected_etag="",
         )
 
     assert error.value.code == exits.CONFLICT
@@ -214,6 +298,7 @@ def test_a_server_without_chunked_upload_says_so(source):
             digest=digest,
             token="tok",
             overwrite=False,
+            expected_etag="",
         )
 
     assert error.value.code == exits.UNSUPPORTED_STRUCTURE
@@ -261,8 +346,58 @@ def test_a_short_window_is_malformed():
         response(206, b"12", headers={"Content-Range": "bytes 0-4/100"})
     )
 
-    with pytest.raises(uploads.UploadError, match="returned 2 bytes"):
+    with pytest.raises(uploads.UploadError, match="body length"):
         uploads.read_range(PROFILE, session=transport, href=TARGET, offset=0, length=5)
+
+
+def test_a_range_for_the_wrong_offset_is_refused():
+    transport, _ = transport_for(
+        response(206, b"12345", headers={"Content-Range": "bytes 0-4/100"})
+    )
+
+    with pytest.raises(uploads.UploadError, match="starting at 0, not 10"):
+        uploads.read_range(PROFILE, session=transport, href=TARGET, offset=10, length=5)
+
+
+def test_the_cli_does_not_write_a_range_returned_for_the_wrong_offset(
+    monkeypatch, tmp_path
+):
+    configure(monkeypatch, tmp_path)
+    fake = FakeTransport(
+        [response(206, b"12345", headers={"Content-Range": "bytes 0-4/100"})]
+    )
+    monkeypatch.setattr(session, "UrllibTransport", lambda: fake)
+    output = tmp_path / "window.bin"
+
+    code = cli.main(
+        [
+            "files",
+            "read",
+            TARGET,
+            "--offset",
+            "10",
+            "--length",
+            "5",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert code == exits.MALFORMED_RESPONSE
+    assert not output.exists()
+
+
+def test_a_range_may_end_early_only_at_the_end_of_the_file():
+    transport, _ = transport_for(
+        response(206, b"end", headers={"Content-Range": "bytes 97-99/100"})
+    )
+
+    window, total = uploads.read_range(
+        PROFILE, session=transport, href=TARGET, offset=97, length=5
+    )
+
+    assert window == b"end"
+    assert total == 100
 
 
 def test_a_range_beyond_the_file_is_a_usage_error():
@@ -320,6 +455,98 @@ def test_a_streamed_step_carrying_a_payload_is_stale(source):
 
     with pytest.raises(plans.PlanError, match="not its bytes"):
         files.validate_step(step)
+
+
+def test_a_streamed_replacement_without_the_frozen_etag_is_stale(source):
+    size, digest = uploads.measure(source)
+    step = plans.freeze_step(
+        action="files.upload",
+        href=TARGET,
+        etag="",
+        summary="big.bin",
+        content_type="application/octet-stream",
+        details={
+            "exists": True,
+            "size": size,
+            "sha256": digest,
+            "source": str(source),
+            "account_name": ACCOUNT,
+            "upload_token": "t",
+        },
+    )
+
+    with pytest.raises(files.FileError, match="streamed file replacement"):
+        files.validate_step(step)
+
+
+def test_applying_a_streamed_write_hashes_the_assembled_bytes(source):
+    size, digest = uploads.measure(source)
+    step = plans.freeze_step(
+        action="files.upload",
+        href=TARGET,
+        etag="",
+        summary="big.bin",
+        content_type="application/octet-stream",
+        details={
+            "exists": False,
+            "size": size,
+            "sha256": digest,
+            "source": str(source),
+            "account_name": ACCOUNT,
+            "upload_token": "t",
+        },
+    )
+    transport, fake = transport_for(
+        response(201),
+        response(201),
+        response(201, headers={"ETag": '"stored"'}),
+        response(207, multistatus(entry(TARGET, size=str(size)))),
+        response(
+            206,
+            source.read_bytes(),
+            headers={"Content-Range": f"bytes 0-{size - 1}/{size}"},
+        ),
+    )
+
+    result = files.execute(PROFILE, session=transport, step=step)
+
+    assert result["verified"] is True
+    assert [request["method"] for request in fake.requests][-2:] == ["PROPFIND", "GET"]
+
+
+def test_same_sized_wrong_assembled_bytes_are_uncertain(source):
+    size, digest = uploads.measure(source)
+    step = plans.freeze_step(
+        action="files.upload",
+        href=TARGET,
+        etag="",
+        summary="big.bin",
+        content_type="application/octet-stream",
+        details={
+            "exists": False,
+            "size": size,
+            "sha256": digest,
+            "source": str(source),
+            "account_name": ACCOUNT,
+            "upload_token": "t",
+        },
+    )
+    transport, _ = transport_for(
+        response(201),
+        response(201),
+        response(201),
+        response(207, multistatus(entry(TARGET, size=str(size)))),
+        response(
+            206,
+            b"x" * size,
+            headers={"Content-Range": f"bytes 0-{size - 1}/{size}"},
+        ),
+    )
+
+    with pytest.raises(files.FileError) as error:
+        files.execute(PROFILE, session=transport, step=step)
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
 
 
 def test_reconcile_calls_a_matching_length_uncertain_until_the_bytes_agree(source):

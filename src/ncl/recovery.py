@@ -29,7 +29,7 @@ from urllib.parse import quote, unquote, urlsplit
 from . import exits, plans, profiles, relocate
 from .files import FileError, _canonical, _segments
 from .identity import DAV, _element_name, _status_code
-from .session import Session
+from .session import Session, SessionError
 
 #: Nextcloud's own namespace, where the trash properties live.
 NC = "http://nextcloud.org/ns"
@@ -50,6 +50,7 @@ class TrashEntry:
     original_href: str
     deleted_at: str
     size: int | None
+    file_id: str
     collection: bool
     in_scope: bool
 
@@ -61,6 +62,7 @@ class TrashEntry:
             "original_href": self.original_href,
             "deleted_at": self.deleted_at,
             "size": self.size,
+            "file_id": self.file_id,
             "collection": self.collection,
             "in_scope": self.in_scope,
         }
@@ -90,8 +92,9 @@ class Version:
 
 _TRASH_PROPFIND = (
     '<?xml version="1.0" encoding="UTF-8"?>'
-    f'<d:propfind xmlns:d="DAV:" xmlns:nc="{NC}"><d:prop>'
+    f'<d:propfind xmlns:d="DAV:" xmlns:nc="{NC}" xmlns:o="{OC}"><d:prop>'
     "<d:resourcetype/><d:getcontentlength/>"
+    "<o:fileid/>"
     "<nc:trashbin-filename/><nc:trashbin-original-location/><nc:trashbin-deletion-time/>"
     "</d:prop></d:propfind>"
 )
@@ -164,6 +167,12 @@ def _size(value: str) -> int | None:
     return int(value)
 
 
+def _file_identifier(value: str) -> str:
+    if not value or not value.isascii() or not value.isdigit() or len(value) > 20:
+        raise FileError("the server returned a malformed file identifier")
+    return value
+
+
 def trash_root(account_name: str) -> str:
     return f"{TRASH_ROOT}{quote(account_name, safe='')}/trash/"
 
@@ -221,6 +230,7 @@ def list_trash(profile: Any, *, session: Session, account_name: str) -> list[Tra
                 original_href=original,
                 deleted_at=_deleted_at(_text(props, (NC, "trashbin-deletion-time"))),
                 size=_size(_text(props, (DAV, "getcontentlength"))),
+                file_id=_file_identifier(_text(props, (OC, "fileid"))),
                 collection=resource_type is not None
                 and any(_element_name(c) == (DAV, "collection") for c in resource_type),
                 in_scope=profiles.in_scope(original, profile.files_roots),
@@ -289,6 +299,7 @@ def plan_restore(
                     "original_location": entry.original_location,
                     "deleted_at": entry.deleted_at,
                     "size": entry.size,
+                    "file_id": entry.file_id,
                 },
             ),
         ),
@@ -459,6 +470,15 @@ def validate_step(step: plans.Step) -> None:
         return
     if not str(step.details.get("destination") or ""):
         raise plans.PlanError("a recovery step needs a destination", exits.PLAN_STALE)
+    if step.action == "trash.restore":
+        try:
+            _file_identifier(str(step.details.get("file_id") or ""))
+        except FileError as exc:
+            raise plans.PlanError(
+                "a trash restore needs a valid file identifier", exits.PLAN_STALE
+            ) from exc
+        if not str(step.details.get("original_href") or ""):
+            raise plans.PlanError("a trash restore needs its original href", exits.PLAN_STALE)
 
 
 def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
@@ -477,36 +497,48 @@ def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, An
         return {"action": step.action, "href": source, "verified": "destroyed"}
 
     destination = _canonical(profile, str(step.details["destination"]))
-    # The restore endpoints are virtual targets that always report themselves as
-    # existing, so `Overwrite: F` makes every restore a 412. The protection that
-    # header would give is obtained at planning time instead, by refusing a
-    # restore whose original location is occupied.
-    response = session.request(
-        "MOVE",
-        source,
-        headers={"Destination": destination},
-        max_redirects=0,
-    )
-    relocate.classify(
-        response.status, fail=FileError, source=source, destination=destination
-    )
     landed = step.details.get("original_href") or step.details.get("file_href")
     if step.action == "trash.restore":
         from .files import stat_resource
 
-        # Past the MOVE something has been restored; the only question left is
-        # where, so a location that cannot be confirmed is uncertainty.
-        try:
-            written = stat_resource(profile, session=session, href=str(landed))
-        except FileError as exc:
+        if stat_resource(profile, session=session, href=str(landed), missing_ok=True) is not None:
             raise FileError(
-                f"the restore was accepted but {landed} cannot be confirmed", 
+                f"{landed} became occupied since the plan was made; nothing was restored",
+                exits.CONFLICT,
+            )
+    # The restore endpoints are virtual targets that always report themselves as
+    # existing, so `Overwrite: F` makes every restore a 412. The protection that
+    # header would give is enforced by checking immediately before the MOVE and
+    # by verifying the restored resource's server identity afterwards.
+    try:
+        response = session.request(
+            "MOVE",
+            source,
+            headers={"Destination": destination},
+            max_redirects=0,
+        )
+    except SessionError as exc:
+        raise FileError(
+            "the restore request was sent but its outcome could not be confirmed",
+            exits.OUTCOME_UNCERTAIN,
+        ) from exc
+    relocate.classify(
+        response.status, fail=FileError, source=source, destination=destination
+    )
+    if step.action == "trash.restore":
+        # Past the MOVE something has been restored; the file id distinguishes
+        # that entry from an interloper that raced into the promised path.
+        try:
+            restored_id = file_id(profile, session=session, href=str(landed))
+        except Exception as exc:
+            raise FileError(
+                f"the restore was accepted but {landed} cannot be confirmed",
                 exits.OUTCOME_UNCERTAIN,
             ) from exc
-        if written is None:
+        if restored_id != step.details["file_id"]:
             raise FileError(
-                f"the restore was accepted but nothing is at {landed}; the server may "
-                "have restored it under another name",
+                f"the restore was accepted but {landed} holds a different resource; the "
+                "server may have restored the entry under another name",
                 exits.OUTCOME_UNCERTAIN,
             )
     return {
@@ -531,7 +563,19 @@ def reconcile(profile: Any, *, session: Session, step: plans.Step) -> dict[str, 
         if present.status == 404:
             return {"action": step.action, "state": "verified", "verified": "destroyed"}
         return {"action": step.action, "state": "pending"}
-    # A restore consumes the source, so its absence is what confirms the move.
+    # A restore consumes the source. For trash, its absence is necessary but not
+    # sufficient: an occupied target makes the server restore under another name.
     if present.status == 404:
+        if step.action == "trash.restore":
+            target = str(step.details["original_href"])
+            try:
+                restored_id = file_id(profile, session=session, href=target)
+            except FileError:
+                return {"action": step.action, "state": "uncertain"}
+            expected = str(step.details["file_id"])
+            return {
+                "action": step.action,
+                "state": "verified" if restored_id == expected else "uncertain",
+            }
         return {"action": step.action, "state": "verified"}
     return {"action": step.action, "state": "pending"}

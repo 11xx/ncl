@@ -24,18 +24,22 @@ with a filtered account of it — but it is never restored or purged.
 A restore is a `MOVE` of the trash entry onto the server's `restore`
 pseudo-collection. That collection always reports itself as existing, so
 `Overwrite: F` makes every restore a `412`; the header is therefore omitted,
-and the protection it would give is obtained at planning time instead.
+and the protection it would give is enforced by observations around the move
+instead.
 
 That protection matters, because the server does not overwrite when the
 original path is occupied — it restores *beside* the occupant under a name
 nobody asked for, such as `notes (restored).md`. A plan promising the original
 path would then be describing something the server was never going to do, so a
-restore onto an occupied path is refused before anything is sent, naming the
-remedy: move or delete what is there first.
+restore onto an occupied path is refused while planning and checked again
+immediately before the move, naming the remedy: move or delete what is there
+first.
 
-Past the `MOVE` something has been restored and the only question left is
-where, so a location that cannot be confirmed afterwards is uncertainty rather
-than failure.
+Each trash entry carries Nextcloud's stable file identifier. Past the `MOVE`,
+the resource at the promised location must carry that same identifier; source
+absence alone is not proof, because an interloper could have won the final race
+and caused the restore to land under another name. A location or identity that
+cannot be confirmed afterwards is uncertainty rather than failure.
 
 ## Purging
 

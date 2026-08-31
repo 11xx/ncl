@@ -359,6 +359,8 @@ with a recipient address, an iTIP `request-status`, and — when the status is a
 `2.x` success — the `VFREEBUSY` itself. Periods are reported as UTC intervals
 and an `FBTYPE`, defaulting to `BUSY` when the parameter is absent. Nothing
 else is reported: a busy period carries no summary, no attendees, and no href.
+Every period must carry a timezone offset; a floating server value is malformed
+rather than interpreted through the machine's local timezone.
 
 Every refusal here fails toward busy. A recipient the server did not answer
 successfully is reported as unanswered with its status, never as a free

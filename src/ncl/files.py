@@ -873,6 +873,12 @@ def validate_step(step: plans.Step) -> None:
             raise plans.PlanError(
                 "file write steps need an exists classification", exits.PLAN_STALE
             )
+        if step.details["exists"]:
+            _strong_etag(step.etag, "a streamed file replacement")
+        elif step.etag:
+            raise plans.PlanError(
+                "streamed file creations cannot carry an ETag", exits.PLAN_STALE
+            )
         return
     _content_type(step.content_type)
     exists = step.details.get("exists")
@@ -929,6 +935,7 @@ def _execute_upload(profile: Any, *, session: Session, step: plans.Step) -> dict
         digest=str(details["sha256"]),
         token=str(details["upload_token"]),
         overwrite=bool(details.get("exists")),
+        expected_etag=step.etag,
     )
     # Past the assembling MOVE the file exists, so every way of failing to
     # confirm it is uncertainty rather than failure.
@@ -940,8 +947,16 @@ def _execute_upload(profile: Any, *, session: Session, step: plans.Step) -> dict
                 f"the assembled file is {written.size} bytes, not {details['size']}",
                 exits.OUTCOME_UNCERTAIN,
             )
-    except FileError as exc:
-        raise FileError(exc.message, exits.OUTCOME_UNCERTAIN) from exc
+        if uploads.remote_digest(
+            profile, session=session, href=target, size=int(details["size"])
+        ) != _frozen_digest(step):
+            raise FileError(
+                f"the assembled file at {target} does not match the frozen content",
+                exits.OUTCOME_UNCERTAIN,
+            )
+    except Exception as exc:
+        message = getattr(exc, "message", "the assembled file could not be verified")
+        raise FileError(str(message), exits.OUTCOME_UNCERTAIN) from exc
     return {
         "action": step.action,
         "href": target,
@@ -1036,12 +1051,16 @@ def _reconcile_upload(profile: Any, *, session: Session, step: plans.Step) -> di
     size = int(step.details["size"])
     stored = stat_resource(profile, session=session, href=target, missing_ok=True)
     if stored is None:
-        return {"state": "pending"}
+        return {"state": "uncertain" if step.details["exists"] else "pending"}
     if stored.collection or stored.size != size:
         return {"state": "uncertain", "size": stored.size}
     digest = uploads.remote_digest(profile, session=session, href=target, size=size)
     if digest == _frozen_digest(step):
         return {"state": "verified", "etag": stored.etag, "size": stored.size}
+    if step.details["exists"] and etag.normalize_strong(stored.etag) == etag.normalize_strong(
+        step.etag
+    ):
+        return {"state": "pending", "etag": stored.etag, "size": stored.size}
     return {"state": "uncertain", "size": stored.size}
 
 

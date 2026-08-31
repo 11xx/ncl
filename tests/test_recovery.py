@@ -49,10 +49,12 @@ def trash_entry(
     name: str = "notes.md",
     deleted: str = "1788000000",
     size: str = "12",
+    file_id: str = "340",
 ) -> str:
     return (
         f"<d:response><d:href>{href}</d:href><d:propstat><d:prop>"
         f"<d:resourcetype/><d:getcontentlength>{size}</d:getcontentlength>"
+        f"<oc:fileid>{file_id}</oc:fileid>"
         f"<nc:trashbin-filename>{name}</nc:trashbin-filename>"
         f"<nc:trashbin-original-location>{location}</nc:trashbin-original-location>"
         f"<nc:trashbin-deletion-time>{deleted}</nc:trashbin-deletion-time>"
@@ -137,12 +139,12 @@ def test_a_restore_omits_overwrite_because_the_endpoint_always_reports_existing(
         PROFILE, session=transport, account_name=ACCOUNT, href=ENTRY
     )
     executing, calls = transport_for(
-        response(201), response(207, multistatus(file_entry(ORIGINAL)))
+        response(404), response(201), response(207, fileid_response())
     )
 
     result = recovery.execute(PROFILE, session=executing, step=plan.steps[0])
 
-    move = calls.requests[0]
+    move = calls.requests[1]
     assert move["method"] == "MOVE"
     assert "Overwrite" not in move["headers"]
     assert move["headers"]["Destination"].endswith("/trashbin/alice/restore/notes.md")
@@ -156,12 +158,64 @@ def test_a_restore_the_server_accepted_but_cannot_be_found_is_uncertain():
     plan = recovery.plan_restore(
         PROFILE, session=transport, account_name=ACCOUNT, href=ENTRY
     )
-    executing, _ = transport_for(response(201), response(207, multistatus()))
+    executing, _ = transport_for(response(404), response(201), response(404))
 
     with pytest.raises(files.FileError) as error:
         recovery.execute(PROFILE, session=executing, step=plan.steps[0])
 
     assert error.value.code == exits.OUTCOME_UNCERTAIN
+
+
+def test_a_restore_rechecks_occupancy_immediately_before_the_move():
+    transport, _ = transport_for(
+        response(207, multistatus(trash_entry())), response(404)
+    )
+    plan = recovery.plan_restore(
+        PROFILE, session=transport, account_name=ACCOUNT, href=ENTRY
+    )
+    executing, calls = transport_for(response(207, multistatus(file_entry(ORIGINAL))))
+
+    with pytest.raises(files.FileError, match="became occupied") as error:
+        recovery.execute(PROFILE, session=executing, step=plan.steps[0])
+
+    assert error.value.code == exits.CONFLICT
+    assert [item["method"] for item in calls.requests] == ["PROPFIND"]
+
+
+def test_a_restore_does_not_verify_an_interloper_that_won_the_final_race():
+    transport, _ = transport_for(
+        response(207, multistatus(trash_entry())), response(404)
+    )
+    plan = recovery.plan_restore(
+        PROFILE, session=transport, account_name=ACCOUNT, href=ENTRY
+    )
+    wrong_identity = fileid_response("999")
+    executing, _ = transport_for(
+        response(404), response(201), response(207, wrong_identity)
+    )
+
+    with pytest.raises(files.FileError, match="different resource") as error:
+        recovery.execute(PROFILE, session=executing, step=plan.steps[0])
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+
+
+def test_reconciling_a_trash_restore_requires_the_frozen_file_identity():
+    transport, _ = transport_for(
+        response(207, multistatus(trash_entry())), response(404)
+    )
+    plan = recovery.plan_restore(
+        PROFILE, session=transport, account_name=ACCOUNT, href=ENTRY
+    )
+    reconciling, _ = transport_for(
+        response(404), response(207, fileid_response("999"))
+    )
+
+    outcome = recovery.reconcile(
+        PROFILE, session=reconciling, step=plan.steps[0]
+    )
+
+    assert outcome["state"] == "uncertain"
 
 
 def test_a_purge_records_that_it_cannot_be_taken_back():

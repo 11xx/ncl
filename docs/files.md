@@ -63,7 +63,8 @@ Every result is checked against both the requested subtree and the allowlist,
 and a result outside either is a refusal rather than a filtered-out row: a
 server returning what it was not asked for is not a server whose other answers
 can be trusted. A row the server reports as failed is malformed rather than
-skipped.
+skipped. `--limit` is enforced on the answer as well as sent in the request, so
+a server that ignores the bound is refused rather than allowed to enlarge it.
 
 Which conditions a server answers is not uniform. A rejected search is reported
 as possibly naming an unsupported condition rather than as a malformed request,
@@ -89,20 +90,27 @@ created, numbered parts are `PUT` into it, and a `MOVE` of the directory's
 operation, consuming the directory. Parts are named zero-padded so a server
 ordering them lexicographically and one ordering them numerically assemble the
 same bytes. Nothing exists at the destination until that final `MOVE`, so a
-failure part-way through leaves the destination untouched; the upload directory
-is removed on the way out, and failing to remove it never replaces the error
-that caused it.
+failure part-way through a creation leaves the destination untouched. A
+replacement uploads every part first, conditionally deletes only the destination
+revision whose ETag the plan froze, then assembles with `Overwrite: F`. A newer
+revision is never overwritten, and a resource that appears between deletion and
+assembly is left in place. Once the conditional deletion succeeds, any
+unconfirmed outcome is uncertain and the removed revision remains recoverable
+from the trash. The upload directory is removed on the way out, and failing to
+remove it never replaces the error that caused it.
 
-Reconciling a streamed write reads the stored file back in windows and hashes
-it, rather than pulling it into memory. A matching length is not a matching
-file — two different files of one length are the ordinary case — so a
+Applying and reconciling a streamed write read the stored file back in windows
+and hash it, rather than pulling it into memory. A matching length is not a
+matching file — two different files of one length are the ordinary case — so a
 destination whose bytes do not hash to the frozen identity stays uncertain.
 
 `ncl files read --offset <n> [--length <n>]` reads one window, and writes it at
 its own offset in `--output`, because a ranged read is normally one of several.
 A server may ignore `Range` and answer `200` with the whole entity; that is
 legal, and returning it as though it were the requested window would misplace
-every byte the caller then indexes, so it is refused instead.
+every byte the caller then indexes, so it is refused instead. A `206` answer is
+also held to the exact interval in `Content-Range`; bytes from another offset
+are never written under the requested one.
 
 Recursive traversal is still not implemented; `ncl files find` answers the
 question it was usually wanted for.

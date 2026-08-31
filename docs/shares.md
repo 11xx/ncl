@@ -47,7 +47,8 @@ cannot create is still listed, and one it has no name for is labelled
 `unsupported:<n>` rather than dropped.
 
 Permissions are reported as names decoded from the bitmask OCS packs them into:
-`read`, `update`, `create`, `delete`, `share`.
+`read`, `update`, `create`, `delete`, `share`. A bit outside that model is a
+refusal rather than silently narrower reach.
 
 ## Creating and revoking
 
@@ -55,7 +56,9 @@ Permissions are reported as names decoded from the bitmask OCS packs them into:
 `--group <gid>`, and grants `read` unless `--permissions` says otherwise. It
 freezes a plan and sends nothing. `ncl share delete <id>` freezes the
 revocation of a share it has read first, so the preview says what is being
-taken away.
+taken away. The share's href must be inside the files allowlist: an unscoped
+listing may reveal an out-of-scope share, but it does not grant authority to
+revoke it.
 
 A link password is read from a file with `--password-from`, never from an
 argument: a password in `argv` is visible to every process on the host and
