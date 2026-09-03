@@ -563,12 +563,37 @@ def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, An
                 "server may have restored the entry under another name",
                 exits.OUTCOME_UNCERTAIN,
             )
-    return {
+    else:
+        from .files import stat_resource
+
+        try:
+            restored = stat_resource(
+                profile, session=session, href=str(landed), missing_ok=True
+            )
+        except Exception as exc:
+            raise FileError(
+                f"the restore was accepted but {landed} cannot be confirmed",
+                exits.OUTCOME_UNCERTAIN,
+            ) from exc
+        expected_size = step.details.get("size")
+        if (
+            restored is None
+            or restored.collection
+            or (expected_size is not None and restored.size != expected_size)
+        ):
+            raise FileError(
+                f"the restore was accepted but {landed} does not read back as the planned revision",
+                exits.OUTCOME_UNCERTAIN,
+            )
+    result = {
         "action": step.action,
         "href": source,
         "restored": landed,
         "verified": True,
     }
+    if step.action == "version.restore":
+        result["size"] = restored.size
+    return result
 
 
 def reconcile(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
@@ -599,5 +624,24 @@ def reconcile(profile: Any, *, session: Session, step: plans.Step) -> dict[str, 
                 "action": step.action,
                 "state": "verified" if restored_id == expected else "uncertain",
             }
-        return {"action": step.action, "state": "verified"}
+        from .files import stat_resource
+
+        try:
+            restored = stat_resource(
+                profile,
+                session=session,
+                href=str(step.details["file_href"]),
+                missing_ok=True,
+            )
+        except FileError:
+            return {"action": step.action, "state": "uncertain"}
+        expected_size = step.details.get("size")
+        state = (
+            "uncertain"
+            if restored is None
+            or restored.collection
+            or (expected_size is not None and restored.size != expected_size)
+            else "verified"
+        )
+        return {"action": step.action, "state": state}
     return {"action": step.action, "state": "pending"}

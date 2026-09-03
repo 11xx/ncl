@@ -63,6 +63,7 @@ right until a value contains a semicolon.
 A contact is addressed by resource href, never by name. Two people share a name
 far more often than two events share a summary, and a contact resolved by name
 is the wrong person rather than a missing one.
+Each contact read stays on its exact href and refuses a redirect.
 
 `ncl contacts list <book>` makes one bounded `addressbook-query` `REPORT`, not
 one request per card. Every response entry must carry an href that is a direct
