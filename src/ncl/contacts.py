@@ -286,6 +286,28 @@ def resolve(books: list[AddressBook], target: str) -> AddressBook:
 _UNSUPPORTED = ("MEMBER", "KIND", "RELATED", "GEO", "X-ADDRESSBOOKSERVER-KIND")
 
 
+def _name_parts(raw: bytes) -> tuple[str, ...]:
+    """Split the card's own `N` into its parts.
+
+    A parsed value has already had its escapes removed, so splitting one turns
+    an escaped `\\;` inside a surname into a field boundary. Splitting the
+    property as the server sent it keeps such a surname whole.
+    """
+    depth = 0
+    for line in vcard.unfold(raw):
+        segment, separator, value = line.partition(":")
+        if not separator:
+            continue
+        name = segment.split(";", 1)[0].rsplit(".", 1)[-1].strip().upper()
+        if name == "BEGIN":
+            depth += 1
+        elif name == "END":
+            depth -= 1
+        elif depth == 1 and name == "N":
+            return vcard.structured(value)
+    return ()
+
+
 def reference(profile: Any, *, book_href: str, href: str, etag: str, raw: bytes) -> ContactRef:
     """Reduce one card to the fields it is found and addressed by."""
     try:
@@ -307,7 +329,7 @@ def reference(profile: Any, *, book_href: str, href: str, etag: str, raw: bytes)
     uid = vcard.first(properties, "UID")
     if not uid:
         raise ContactError(f"the contact at {href} has no UID")
-    name = vcard.structured(vcard.first(properties, "N"))
+    name = _name_parts(raw)
     return ContactRef(
         book_href=book_href,
         href=href,
@@ -483,28 +505,6 @@ def plan_create(profile: Any, *, book_href: str, fields: Mapping[str, object]) -
             ),
         ),
     )
-
-
-def _name_parts(raw: bytes) -> tuple[str, ...]:
-    """Split the card's own `N` into its parts.
-
-    A parsed value has already had its escapes removed, so splitting one turns
-    an escaped `\\;` inside a surname into a field boundary. Splitting the
-    property as the server sent it keeps such a surname whole.
-    """
-    depth = 0
-    for line in vcard.unfold(raw):
-        segment, separator, value = line.partition(":")
-        if not separator:
-            continue
-        name = segment.split(";", 1)[0].rsplit(".", 1)[-1].strip().upper()
-        if name == "BEGIN":
-            depth += 1
-        elif name == "END":
-            depth -= 1
-        elif depth == 1 and name == "N":
-            return vcard.structured(value)
-    return ()
 
 
 def _strong_etag(reference: ContactRef, action: str) -> str:
@@ -693,7 +693,15 @@ def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, An
         )
     result = {"action": step.action, "href": target, "uid": step.details.get("uid", "")}
     if step.action == "contact.delete":
-        check = session.request("GET", target, headers={"Accept": "text/vcard"}, max_redirects=0)
+        try:
+            check = session.request(
+                "GET", target, headers={"Accept": "text/vcard"}, max_redirects=0
+            )
+        except (ContactError, SessionError) as exc:
+            raise ContactError(
+                f"the absence of {target} could not be verified after deletion",
+                exits.OUTCOME_UNCERTAIN,
+            ) from exc
         if check.status != 404:
             raise ContactError(
                 "the server accepted deletion, but the contact is still readable",

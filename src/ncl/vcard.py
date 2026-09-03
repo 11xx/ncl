@@ -89,14 +89,20 @@ def build(*, uid: str, fields: Mapping[str, object]) -> bytes:
 
 
 def splice(raw: bytes, replacements: Mapping[str, tuple[str, ...] | None]) -> bytes:
-    """Replace top-level properties while preserving every unrelated byte."""
+    """Replace top-level properties while preserving every unrelated byte.
+
+    Replacing a grouped property, `item1.EMAIL`, also removes the other
+    properties carrying that group. A group holds the labels describing one
+    value, and a label kept beside a replaced value describes something the
+    card does not carry.
+    """
     try:
         raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise VcardError("the vCard was not valid UTF-8") from exc
     ending = b"\r\n" if b"\r\n" in raw else b"\n"
     physical = raw.splitlines(keepends=True)
-    spans: list[tuple[int, int, str, int]] = []
+    spans: list[tuple[int, int, str, str]] = []
     depth = 0
     card_end = -1
     index = 0
@@ -110,12 +116,13 @@ def splice(raw: bytes, replacements: Mapping[str, tuple[str, ...] | None]) -> by
         segment, separator, value = logical.partition(b":")
         if not separator:
             continue
-        raw_name = segment.split(b";", 1)[0].rsplit(b".", 1)[-1]
+        prefix, _, raw_name = segment.split(b";", 1)[0].rpartition(b".")
         name = raw_name.decode("utf-8").strip().upper()
+        group = prefix.decode("utf-8").strip().upper()
         if name == "BEGIN":
             depth += 1
         if depth == 1 and name not in {"BEGIN", "END"}:
-            spans.append((start, index, name, depth))
+            spans.append((start, index, name, group))
         if name == "END" and depth == 1:
             card_end = start
         if name == "END":
@@ -124,14 +131,22 @@ def splice(raw: bytes, replacements: Mapping[str, tuple[str, ...] | None]) -> by
         raise VcardError("the vCard did not close the card it opened")
     wanted = {name.upper(): values for name, values in replacements.items()}
     first = {name: next((s for s in spans if s[2] == name), None) for name in wanted}
+    replaced_groups = {group for _, _, name, group in spans if name in wanted and group}
     output: list[bytes] = []
-    span_at = {start: (end, name) for start, end, name, _ in spans if name in wanted}
+    span_at = {
+        start: (end, name if name in wanted else None)
+        for start, end, name, group in spans
+        if name in wanted or group in replaced_groups
+    }
     inserted: set[str] = set()
     index = 0
     while index < len(physical):
         span = span_at.get(index)
         if span:
             end, name = span
+            if name is None:
+                index = end
+                continue
             if name not in inserted:
                 values = wanted[name]
                 if values is not None:

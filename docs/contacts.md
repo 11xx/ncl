@@ -105,9 +105,11 @@ An update splices only the requested top-level properties into the raw card.
 Every other byte, including `PHOTO`, unknown properties, folding, and nested
 components, remains untouched. Changing the family or given name rewrites only
 those two parts of `N`, so additional names, prefixes, and suffixes survive an
-edit that did not name them. Group cards carrying `KIND` or `MEMBER`,
-resources holding multiple cards, and resources without a strong ETag are
-refused rather than rewritten around.
+edit that did not name them. Replacing a grouped property, `item1.EMAIL`, also
+removes the labels grouped with it, because they describe the value being
+replaced. Group cards carrying `KIND` or `MEMBER`, resources holding multiple
+cards, and resources without a strong ETag are refused rather than rewritten
+around.
 
 Creates use `If-None-Match: *`; updates and deletes use the strong ETag in
 `If-Match`. A successful write is read back and compared as vCard properties,
