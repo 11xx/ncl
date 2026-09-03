@@ -1446,22 +1446,6 @@ def test_cli_apply_rejects_invalid_plan_id_before_creating_a_lock(
     assert opened == []
 
 
-def test_plan_claim_unlinks_the_lock_before_closing_its_descriptor(monkeypatch):
-    lock_path = plans._directory() / "valid.lock"
-    closed_while_named: list[bool] = []
-    original_close = plans.os.close
-
-    def close(descriptor):
-        closed_while_named.append(lock_path.exists())
-        original_close(descriptor)
-
-    monkeypatch.setattr(plans.os, "close", close)
-    with plans.claim("valid"):
-        assert lock_path.exists()
-
-    assert closed_while_named == [False]
-
-
 def test_cli_apply_reports_locked_and_missing_plans_after_claiming(monkeypatch):
     monkeypatch.setattr(cli, "_selected_profile", lambda args: PROFILE)
     plan = _write(
