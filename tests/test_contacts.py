@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+from unittest.mock import Mock
 
 import pytest
 from test_auth import FakeTransport, home_response, principal_response, response
@@ -246,6 +247,19 @@ def test_structure_the_reference_does_not_model_is_named():
     found = contacts.reference(PROFILE, book_href=BOOK, href=CARD_HREF, etag="", raw=raw)
 
     assert set(found.unsupported) == {"KIND", "MEMBER"}
+
+
+def test_a_redirected_contact_read_is_refused():
+    transport = Mock()
+    transport.request.return_value = response(302, headers={"Location": BOOK + "other"})
+
+    with pytest.raises(contacts.ContactError) as error:
+        contacts.fetch(PROFILE, session=transport, href=CARD_HREF)
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+    transport.request.assert_called_once_with(
+        "GET", CARD_HREF, headers={"Accept": "text/vcard"}, max_redirects=0
+    )
 
 
 # --- collections -------------------------------------------------------------

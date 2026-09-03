@@ -406,7 +406,18 @@ def fetch(profile: Any, *, session: Session, href: str) -> tuple[ContactRef, byt
     book = _scoped(profile, target.rsplit("/", 1)[0] + "/") if len(segments) > 1 else None
     if book is None:
         raise ContactError(f"{target} names no address book", exits.USAGE)
-    response = session.request("GET", target, headers={"Accept": "text/vcard"})
+    response = session.request(
+        "GET", target, headers={"Accept": "text/vcard"}, max_redirects=0
+    )
+    if (
+        300 <= response.status < 400
+        or response.header("Location")
+        or (response.url and response.url != target)
+    ):
+        raise ContactError(
+            f"the server redirected the contact at {target}; the resource must remain exact",
+            exits.MALFORMED_RESPONSE,
+        )
     if response.status == 404:
         raise ContactError(f"no contact exists at {target}", exits.TARGET_NOT_FOUND)
     if response.status != 200:
