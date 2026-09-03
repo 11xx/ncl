@@ -108,7 +108,7 @@ SEE AND CHANGE WHO ELSE CAN REACH A FILE
   ncl share show <id>
   ncl share create <href> (--public | --user <uid> | --group <gid>)
   ncl share update <id> [--permissions P] [--expires D | --clear-expires] \
-[--password-from F | --clear-password] [--note N] [--label L]
+    [--password-from F | --clear-password] [--note N] [--label L]
   ncl share delete <id>
 
   A share is the only mutation here that hands a resource to somebody else, and

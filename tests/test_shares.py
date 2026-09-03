@@ -646,6 +646,44 @@ def test_reconcile_refuses_to_guess_between_two_new_shares():
     assert error.value.code == exits.OUTCOME_UNCERTAIN
 
 
+def test_reconciling_a_revocation_the_server_no_longer_knows_is_verified():
+    step = plans.freeze_step(
+        action="share.delete",
+        href=HREF,
+        etag="",
+        summary="revoke",
+        details={"share_id": "7"},
+    )
+
+    outcome = shares.reconcile(
+        PROFILE,
+        session=transport_for(ocs_response([], http=404, status=404, message="not found")),
+        step=step,
+    )
+
+    assert outcome["state"] == "verified"
+    assert outcome["revoked"] == "7"
+
+
+def test_reconciling_a_revocation_still_present_is_pending():
+    step = plans.freeze_step(
+        action="share.delete",
+        href=HREF,
+        etag="",
+        summary="revoke",
+        details={"share_id": "7"},
+    )
+
+    outcome = shares.reconcile(
+        PROFILE,
+        session=transport_for(ocs_response([share_record()])),
+        step=step,
+    )
+
+    assert outcome["state"] == "pending"
+    assert outcome["share_id"] == "7"
+
+
 def test_a_frozen_step_naming_an_uncreatable_share_type_is_stale():
     step = plans.freeze_step(
         action="share.create",
