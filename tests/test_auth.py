@@ -50,7 +50,13 @@ class FakeTransport:
 
     def request(self, method, url, *, headers=None, data=None, timeout=None):
         self.requests.append(
-            {"method": method, "url": url, "headers": dict(headers or {}), "data": data}
+            {
+                "method": method,
+                "url": url,
+                "headers": dict(headers or {}),
+                "data": data,
+                "timeout": timeout,
+            }
         )
         response = self.responses.pop(0)
         if isinstance(response, Exception):
@@ -151,6 +157,44 @@ def test_session_builds_authenticated_request(monkeypatch):
     assert request["url"] == "https://cloud.example.invalid/remote.php/dav/"
     expected = base64.b64encode(b"alice:fixture-secret").decode()
     assert request["headers"]["Authorization"] == f"Basic {expected}"
+
+
+def test_session_reads_the_credential_once_per_session(monkeypatch):
+    seed_credentials(
+        monkeypatch,
+        {"login_name": "alice", "app_password": "fixture-secret"},
+    )
+    original = secrets.load_credential
+    loads = 0
+
+    def counting_load(profile):
+        nonlocal loads
+        loads += 1
+        return original(profile)
+
+    monkeypatch.setattr(secrets, "load_credential", counting_load)
+    transport = FakeTransport([response(200), response(200)])
+    session = Session(PROFILE, transport=transport)
+
+    session.request("GET", "/one")
+    session.request("GET", "/two")
+
+    assert loads == 1
+
+
+def test_session_passes_a_per_request_timeout(monkeypatch):
+    seed_credentials(
+        monkeypatch,
+        {"login_name": "alice", "app_password": "fixture-secret"},
+    )
+    transport = FakeTransport([response(200), response(200)])
+    session = Session(PROFILE, transport=transport, timeout=17)
+
+    session.request("GET", "/one", timeout=300)
+    session.request("GET", "/two")
+
+    assert transport.requests[0]["timeout"] == 300
+    assert transport.requests[1]["timeout"] == 17
 
 
 def test_session_refuses_cross_origin_redirect_without_resending_credentials(monkeypatch):

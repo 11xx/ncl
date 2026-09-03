@@ -179,7 +179,11 @@ def absolute_url(profile: Any, url_or_path: str) -> str:
 
 
 class Session:
-    """Authenticated requests for one profile."""
+    """Authenticated requests for one profile.
+
+    The credential is read from its backend when an invocation first needs it,
+    held only in this object, and never written anywhere.
+    """
 
     def __init__(
         self,
@@ -191,6 +195,7 @@ class Session:
         self.profile = profile
         self.transport = transport or UrllibTransport()
         self.timeout = timeout
+        self._credential: secrets.Credential | None = None
 
     def request(
         self,
@@ -200,30 +205,38 @@ class Session:
         headers: Mapping[str, str] | None = None,
         data: bytes | str | None = None,
         max_redirects: int = 5,
+        timeout: float | None = None,
     ) -> Response:
         url = absolute_url(self.profile, url_or_path)
-        try:
-            credential = secrets.load_credential(self.profile)
-        except secrets.SecretError as exc:
-            raise SessionError(
-                "the selected profile's secret backend failed", exits.PRECONDITION_FAILED
-            ) from exc
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:
-            raise SessionError(
-                "the selected profile's secret backend failed", exits.PRECONDITION_FAILED
-            ) from exc
-        if credential is None:
-            raise SessionError(
-                "the selected profile has no stored credential", exits.NO_CREDENTIAL
+        if self._credential is None:
+            try:
+                credential = secrets.load_credential(self.profile)
+            except secrets.SecretError as exc:
+                raise SessionError(
+                    "the selected profile's secret backend failed", exits.PRECONDITION_FAILED
+                ) from exc
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                raise SessionError(
+                    "the selected profile's secret backend failed", exits.PRECONDITION_FAILED
+                ) from exc
+            if credential is None:
+                raise SessionError(
+                    "the selected profile has no stored credential", exits.NO_CREDENTIAL
+                )
+            self._credential = credential
+            representations = render.credential_representations(
+                credential.login_name, credential.app_password
             )
+            for representation in representations.values():
+                render.register_secret(representation)
+
+        credential = self._credential
         login_name = credential.login_name
         app_password = credential.app_password
 
         representations = render.credential_representations(login_name, app_password)
-        for representation in representations.values():
-            render.register_secret(representation)
         request_headers = {**dict(headers or {}), "Authorization": representations["basic"]}
         request_data = data.encode("utf-8") if isinstance(data, str) else data
         current_method = method.upper()
@@ -234,7 +247,7 @@ class Session:
                     url,
                     headers=request_headers,
                     data=request_data,
-                    timeout=self.timeout,
+                    timeout=timeout if timeout is not None else self.timeout,
                 )
             except SessionError:
                 raise

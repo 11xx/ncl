@@ -27,7 +27,8 @@ Remove this section when that stops being true.
 ## Invariants
 
 - **The credential never becomes an argument.** It is read from the configured
-  secret backend at the moment of the request and never appears in `argv`, an
+  secret backend when an invocation first needs it, held only in that process,
+  and never appears in `argv`, an
   environment variable this tool sets, a log line, an error message, a test
   fixture, or a `--json` payload. `ncl login` obtains it through Login Flow v2
   and writes it straight to the backend, so the human never handles it either.
