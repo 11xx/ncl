@@ -34,6 +34,7 @@ from . import (
     secrets,
     session,
     shares,
+    sync,
     todos,
     uploads,
     vcard,
@@ -209,6 +210,13 @@ def build_parser() -> argparse.ArgumentParser:
     cal_collection.add_argument(
         "calendar", help="Calendar href, or an unambiguous display name"
     )
+
+    cal_changes = cal_commands.add_parser(
+        "changes", help="Report resources changed or removed since a cursor"
+    )
+    _add_options(cal_changes)
+    cal_changes.add_argument("calendar", help="Calendar href, or an unambiguous display name")
+    cal_changes.add_argument("--since", metavar="CURSOR", help="Opaque cursor from an earlier call")
 
     cal_events = cal_commands.add_parser(
         "events",
@@ -533,6 +541,15 @@ def build_parser() -> argparse.ArgumentParser:
     contacts_list = contact_commands.add_parser("list", help="List one address book")
     _add_options(contacts_list)
     contacts_list.add_argument("book", help="Address book href, or an unambiguous name")
+
+    contacts_changes = contact_commands.add_parser(
+        "changes", help="Report resources changed or removed since a cursor"
+    )
+    _add_options(contacts_changes)
+    contacts_changes.add_argument("book", help="Address book href, or an unambiguous name")
+    contacts_changes.add_argument(
+        "--since", metavar="CURSOR", help="Opaque cursor from an earlier call"
+    )
 
     contacts_find = contact_commands.add_parser(
         "find", help="Filter one address book by name, mail, phone, or organisation"
@@ -1247,6 +1264,24 @@ def _run_cal(args: argparse.Namespace) -> int:
                 render.emit(f"{key}: {_plain(value)}")
         return exits.OK
 
+    if args.cal_command == "changes":
+        found = sync.changes(
+            profile,
+            session=transport,
+            href=_resolved_calendar(profile, transport, args.calendar),
+            since=args.since,
+            allowlist=profile.calendars,
+        )
+        if args.json:
+            _json(found.as_dict())
+        else:
+            render.emit(f"cursor: {found.cursor}")
+            for href, etag in found.changed:
+                render.emit(f"changed  {etag}  {href}")
+            for href in found.removed:
+                render.emit(f"removed  {href}")
+        return exits.OK
+
     if args.cal_command == "events":
         href = _resolved_calendar(profile, transport, args.calendar)
         found = events.query(
@@ -1520,6 +1555,24 @@ def _run_contacts(args: argparse.Namespace) -> int:
                 scope = "allowed" if book.in_scope else "not-allowlisted"
                 render.emit(f"{access} {scope:15} {book.display_name}")
                 render.emit(f"      {book.href}")
+        return exits.OK
+
+    if args.contacts_command == "changes":
+        found = sync.changes(
+            profile,
+            session=transport,
+            href=_resolved_book(profile, transport, args.book),
+            since=args.since,
+            allowlist=profile.addressbooks,
+        )
+        if args.json:
+            _json(found.as_dict())
+        else:
+            render.emit(f"cursor: {found.cursor}")
+            for href, etag in found.changed:
+                render.emit(f"changed  {etag}  {href}")
+            for href in found.removed:
+                render.emit(f"removed  {href}")
         return exits.OK
 
     if args.contacts_command in {"list", "find"}:
@@ -2209,6 +2262,7 @@ def _main(argv: list[str] | None = None) -> int:
         uploads.UploadError,
         ocs.OcsError,
         shares.ShareError,
+        sync.SyncError,
         plans.PlanError,
     ) as exc:
         return _error(exc, json_output)

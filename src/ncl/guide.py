@@ -43,6 +43,7 @@ READ
   ncl cal occurrences <calendar> --from <iso> --to <iso>
   ncl cal show <event-href>
   ncl cal collection <calendar>
+  ncl cal changes <calendar> [--since <cursor>]
   ncl cal freebusy --from <iso> --to <iso> [--attendee mailto:...]
 
   The window is required, and times need an explicit UTC offset: a local time
@@ -77,6 +78,8 @@ READ
   accepts. That set is worth reading before writing into a collection someone
   else made — most servers fix it at creation, so a calendar without VTODO can
   never host a task.
+  `cal changes` uses one read-only report to return an opaque collection cursor
+  and the resources changed or removed since that cursor.
 
 UNDO A DELETION OR AN OVERWRITE
   ncl trash list
@@ -129,12 +132,15 @@ SEE AND CHANGE WHO ELSE CAN REACH A FILE
 READ CONTACTS
   ncl contacts books
   ncl contacts list <book>
+  ncl contacts changes <book> [--since <cursor>]
   ncl contacts find <book> <term>
   ncl contacts show <contact-href>
 
   Address books are DAV collections beside the calendars, bounded by their own
   `addressbooks` allowlist. That key is optional, and absent means none is
   reachable — an unstated scope is empty, never open.
+  `contacts changes` returns an opaque book cursor and the cards changed or
+  removed since it, using one read-only report.
 
   A contact is addressed by href. Two people share a name far more often than
   two events share a summary, so a contact resolved by name is the wrong person
