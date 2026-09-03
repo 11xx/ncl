@@ -374,6 +374,116 @@ def plan_delete(
     )
 
 
+def plan_update(
+    profile: Any,
+    *,
+    session: Session,
+    account_name: str,
+    share_id: str,
+    permissions: str | None = None,
+    expires: str | None = None,
+    clear_expires: bool = False,
+    password: str | None = None,
+    clear_password: bool = False,
+    note: str | None = None,
+    label: str | None = None,
+) -> plans.Plan:
+    """Freeze changes to one share and name their effect on its reach."""
+    if expires is not None and clear_expires:
+        raise ShareError("--expires and --clear-expires cannot be combined", exits.USAGE)
+    if password is not None and clear_password:
+        raise ShareError("--password-from and --clear-password cannot be combined", exits.USAGE)
+    if all(
+        value is None
+        for value in (permissions, expires, password, note, label)
+    ) and not (clear_expires or clear_password):
+        raise ShareError("an update must name at least one change", exits.USAGE)
+    if permissions is not None and permissions not in PERMISSION_SETS:
+        raise ShareError(f"{permissions!r} is not a permission set", exits.USAGE)
+
+    share = fetch(profile, session=session, account_name=account_name, share_id=share_id)
+    if not profiles.in_scope(share.href, profile.files_roots):
+        raise ShareError(
+            f"share {share.share_id} is outside this profile's files allowlist, so it can "
+            "be seen but not revoked",
+            exits.SCOPE_DENIED,
+        )
+    if share.share_type not in CREATABLE:
+        raise ShareError(
+            f"{share.share_type} shares are not changed by this tool",
+            exits.UNSUPPORTED_STRUCTURE,
+        )
+
+    before = {
+        "permissions": list(share.permissions),
+        "expires": share.expires,
+        "note": share.note,
+        "label": share.label,
+        "password_protected": share.password_protected,
+    }
+    after = dict(before)
+    form: dict[str, Any] = {}
+    if permissions is not None:
+        after["permissions"] = list(_permissions(PERMISSION_SETS[permissions]))
+        form["permissions"] = PERMISSION_SETS[permissions]
+    if expires is not None:
+        after["expires"] = _expiry(expires)
+        form["expireDate"] = after["expires"]
+    elif clear_expires:
+        after["expires"] = ""
+        form["expireDate"] = ""
+    if password is not None:
+        after["password_protected"] = True
+    elif clear_password:
+        after["password_protected"] = False
+        form["password"] = ""
+    if note is not None:
+        after["note"] = note.strip()
+        form["note"] = after["note"]
+    if label is not None:
+        after["label"] = label.strip()
+        form["label"] = after["label"]
+    if after == before:
+        raise ShareError("the requested update changes nothing", exits.USAGE)
+
+    gained = sorted(set(after["permissions"]) - set(before["permissions"]))
+    withdrawn = sorted(set(before["permissions"]) - set(after["permissions"]))
+    reach = (
+        "anyone holding the link"
+        if share.share_type == "public_link"
+        else f"{share.share_type} {share.recipient}"
+    )
+    summary = f"update the {share.share_type} share of {share.path}"
+    return plans.write_bundle(
+        profile=profile,
+        summary=summary,
+        steps=(
+            plans.freeze_step(
+                action="share.update",
+                href=share.href,
+                etag="",
+                summary=summary,
+                payload=(password or "").encode(),
+                details={
+                    "share_id": share.share_id,
+                    "share_type": share.share_type,
+                    "path": share.path,
+                    "recipient": share.recipient,
+                    "before": before,
+                    "after": after,
+                    "form": form,
+                    "gained": gained,
+                    "withdrawn": withdrawn,
+                    "reach": reach,
+                    "grants": after["permissions"],
+                    "password_protected": after["password_protected"],
+                    "secret_payload": True,
+                },
+            ),
+        ),
+    )
+
+
 def validate_step(step: plans.Step) -> None:
     """Reject a frozen share step before the bundle makes its first request."""
     details = step.details
@@ -393,6 +503,24 @@ def validate_step(step: plans.Step) -> None:
                 "the plan's share type and recipient disagree", exits.PLAN_STALE
             )
         return
+    if step.action == "share.update":
+        before = details.get("before")
+        after = details.get("after")
+        if not str(details.get("share_id") or "").isdigit():
+            raise plans.PlanError("the plan names no share to update", exits.PLAN_STALE)
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            raise plans.PlanError("the plan names no update states", exits.PLAN_STALE)
+        if not isinstance(before.get("permissions"), list) or not isinstance(
+            after.get("permissions"), list
+        ):
+            raise plans.PlanError("the plan names invalid update permissions", exits.PLAN_STALE)
+        if not isinstance(details.get("form"), dict) or (
+            not details["form"] and not plans.payload_bytes(step)
+        ):
+            raise plans.PlanError("the plan names no update fields", exits.PLAN_STALE)
+        if after == before:
+            raise plans.PlanError("the plan's update changes nothing", exits.PLAN_STALE)
+        return
     if step.action == "share.delete":
         if not str(details.get("share_id") or "").isdigit():
             raise plans.PlanError("the plan names no share to revoke", exits.PLAN_STALE)
@@ -400,11 +528,14 @@ def validate_step(step: plans.Step) -> None:
     raise plans.PlanError(f"unsupported share action {step.action}", exits.PLAN_STALE)
 
 
-def _created(profile: Any, data: Any, *, account_name: str) -> Share:
+def _returned_share(
+    profile: Any, data: Any, *, account_name: str, operation: str
+) -> Share:
     records = data if isinstance(data, list) else [data]
     if len(records) != 1:
         raise ShareError(
-            "the server did not report exactly one created share", exits.OUTCOME_UNCERTAIN
+            f"the server did not report exactly one {operation} share",
+            exits.OUTCOME_UNCERTAIN,
         )
     return _share(profile, records[0], account_name=account_name)
 
@@ -448,12 +579,58 @@ def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, An
                     exits.OUTCOME_UNCERTAIN,
                 ) from exc
             raise ShareError(exc.message, exc.code) from exc
-        share = _created(profile, data, account_name=_account_of(details["path"], step.href))
+        share = _returned_share(
+            profile,
+            data,
+            account_name=_account_of(details["path"], step.href),
+            operation="created",
+        )
         return {
             "action": step.action,
             "href": step.href,
             "share": share.as_dict(),
             "granted_beyond_plan": _widened(details, share),
+        }
+
+    if step.action == "share.update":
+        share_id = details["share_id"]
+        form = dict(details["form"])
+        password = plans.payload_bytes(step).decode("utf-8")
+        if password:
+            form["password"] = password
+        try:
+            data = ocs.request(
+                profile,
+                session=session,
+                method="PUT",
+                url=ocs.path(*_API, share_id),
+                form=form,
+            )
+        except ocs.OcsError as exc:
+            if exc.code in {
+                exits.SERVER_ERROR,
+                exits.UNREACHABLE,
+                exits.MALFORMED_RESPONSE,
+            }:
+                raise ShareError(
+                    f"the request to update share {share_id} was sent but its answer "
+                    "was lost; reconcile decides whether it applied",
+                    exits.OUTCOME_UNCERTAIN,
+                ) from exc
+            raise ShareError(exc.message, exc.code) from exc
+        share = _returned_share(
+            profile,
+            data,
+            account_name=_account_of(details["path"], step.href),
+            operation="updated",
+        )
+        planned = set(details["after"]["permissions"])
+        return {
+            "action": step.action,
+            "href": step.href,
+            "share": share.as_dict(),
+            "granted_beyond_plan": sorted(set(share.permissions) - planned),
+            "withheld_beyond_plan": sorted(planned - set(share.permissions)),
         }
 
     share_id = details["share_id"]
@@ -498,6 +675,29 @@ def _account_of(path: str, href: str) -> str:
 def reconcile(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
     """Read the server back to settle a share step whose outcome is unknown."""
     account_name = _account_of(step.details.get("path", ""), step.href)
+    if step.action == "share.update":
+        share_id = step.details["share_id"]
+        try:
+            share = fetch(
+                profile, session=session, account_name=account_name, share_id=share_id
+            )
+        except ocs.OcsError as exc:
+            if exc.code == exits.TARGET_NOT_FOUND:
+                return {"action": step.action, "state": "uncertain"}
+            raise
+        observed = {
+            "permissions": list(share.permissions),
+            "expires": share.expires,
+            "note": share.note,
+            "label": share.label,
+            "password_protected": share.password_protected,
+        }
+        if observed == step.details["after"]:
+            return {"action": step.action, "state": "verified", "share": share.as_dict()}
+        if observed == step.details["before"]:
+            return {"action": step.action, "state": "pending"}
+        return {"action": step.action, "state": "uncertain"}
+
     if step.action == "share.delete":
         share_id = step.details["share_id"]
         try:
