@@ -103,6 +103,59 @@ def test_the_assembling_move_carries_the_destination_and_refuses_to_overwrite(so
     assert assembling["url"].endswith("/.file")
     assert assembling["headers"]["Destination"] == TARGET
     assert assembling["headers"]["Overwrite"] == "F"
+    assert all(
+        item["timeout"] == uploads.UPLOAD_TIMEOUT
+        for item in fake.requests
+        if item["method"] == "PUT"
+    )
+
+
+def test_a_leftover_upload_directory_is_removed_and_recreated(source):
+    size, digest = uploads.measure(source)
+    transport, fake = transport_for(
+        response(405), response(204), response(201), response(201), response(201)
+    )
+
+    uploads.stream_upload(
+        PROFILE,
+        session=transport,
+        account_name=ACCOUNT,
+        source=source,
+        destination=TARGET,
+        size=size,
+        digest=digest,
+        token="tok",
+        overwrite=False,
+        expected_etag="",
+    )
+
+    assert [item["method"] for item in fake.requests[:4]] == [
+        "MKCOL",
+        "DELETE",
+        "MKCOL",
+        "PUT",
+    ]
+
+
+def test_a_directory_that_survives_its_own_removal_is_a_conflict(source):
+    size, digest = uploads.measure(source)
+    transport, _ = transport_for(response(405), response(204), response(405))
+
+    with pytest.raises(uploads.UploadError) as error:
+        uploads.stream_upload(
+            PROFILE,
+            session=transport,
+            account_name=ACCOUNT,
+            source=source,
+            destination=TARGET,
+            size=size,
+            digest=digest,
+            token="tok",
+            overwrite=False,
+            expected_etag="",
+        )
+
+    assert error.value.code == exits.CONFLICT
 
 
 def test_a_streamed_replacement_assembles_over_the_occupant(source):

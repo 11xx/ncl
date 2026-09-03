@@ -42,6 +42,9 @@ INLINE_LIMIT = 8 * 1024 * 1024
 #: small enough that a failure retries little and memory holds one part.
 CHUNK_SIZE = 10 * 1024 * 1024
 
+#: A 10 MiB part on a slow link can exceed the session's 30-second default.
+UPLOAD_TIMEOUT = 300.0
+
 #: Where Nextcloud assembles a chunked upload.
 _DAV = "DAV:"
 _ETAG_PROPFIND = (
@@ -182,9 +185,14 @@ def stream_upload(
         raise UploadError("a streamed creation cannot carry a destination ETag", exits.CONFLICT)
     created = session.request("MKCOL", directory)
     if created.status == 405:
-        raise UploadError(
-            "an upload directory with this identity already exists", exits.CONFLICT
-        )
+        # The directory is named by this plan's own random token, so a leftover
+        # directory with this identity belongs to this upload.
+        session.request("DELETE", directory)
+        created = session.request("MKCOL", directory)
+        if created.status == 405:
+            raise UploadError(
+                "an upload directory with this identity already exists", exits.CONFLICT
+            )
     if created.status != 201:
         raise UploadError(
             f"the upload directory could not be created ({created.status}); this server "
@@ -204,6 +212,7 @@ def stream_upload(
                 f"{directory}{index:05d}",
                 headers={"Content-Type": "application/octet-stream"},
                 data=block,
+                timeout=UPLOAD_TIMEOUT,
             )
             if response.status not in {200, 201, 204}:
                 raise UploadError(
@@ -233,7 +242,11 @@ def stream_upload(
         headers = {"Destination": destination, "Overwrite": "T" if overwrite else "F"}
         assembly_started = True
         assembled = session.request(
-            "MOVE", f"{directory}{ASSEMBLY}", headers=headers, max_redirects=0
+            "MOVE",
+            f"{directory}{ASSEMBLY}",
+            headers=headers,
+            max_redirects=0,
+            timeout=UPLOAD_TIMEOUT,
         )
         if assembled.status == 412:
             assembly_started = False
