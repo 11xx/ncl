@@ -15,6 +15,7 @@ more.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from . import exits
@@ -33,6 +34,127 @@ class VcardError(RuntimeError):
 #: present rather than as content: a listing that inlined a photo would be
 #: dominated by base64 nobody asked for, and a terminal would be unusable.
 BINARY_PROPERTIES = frozenset({"PHOTO", "LOGO", "SOUND", "KEY"})
+
+
+def escape(value: str) -> str:
+    """Escape one vCard text value."""
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace(";", "\\;").replace(",", "\\,")
+
+
+def fold(line: str) -> str:
+    """Fold a logical line without splitting a UTF-8 code point."""
+    chunks: list[str] = []
+    current = ""
+    limit = 75
+    for character in line:
+        encoded = (current + character).encode("utf-8")
+        if current and len(encoded) > limit:
+            chunks.append(current)
+            current = character
+            limit = 74
+        else:
+            current += character
+    chunks.append(current)
+    return "\r\n ".join(chunks)
+
+
+def render_property(name: str, value: str, parameters: Mapping[str, str] = {}) -> str:
+    """Render one folded vCard property line."""
+    prefix = name + "".join(f";{key}={item}" for key, item in parameters.items())
+    return fold(f"{prefix}:{value}")
+
+
+def build(*, uid: str, fields: Mapping[str, object]) -> bytes:
+    """Build one vCard 3.0 resource from writable fields."""
+    full_name = str(fields.get("fn") or "")
+    if not full_name:
+        raise VcardError("FN is required", exits.USAGE)
+    lines = ["BEGIN:VCARD", "VERSION:3.0", render_property("UID", escape(uid))]
+    lines.append(render_property("FN", escape(full_name)))
+    family = escape(str(fields.get("family") or ""))
+    given = escape(str(fields.get("given") or ""))
+    lines.append(render_property("N", f"{family};{given};;;"))
+    for field, name in (("email", "EMAIL"), ("tel", "TEL")):
+        for value in fields.get(field, ()) or ():
+            lines.append(render_property(name, escape(str(value))))
+    for field, name in (("org", "ORG"), ("title", "TITLE"), ("note", "NOTE"), ("birthday", "BDAY")):
+        value = fields.get(field)
+        if value:
+            lines.append(render_property(name, escape(str(value))))
+    categories = fields.get("categories", ()) or ()
+    if categories:
+        lines.append(render_property("CATEGORIES", ",".join(escape(str(v)) for v in categories)))
+    lines.append("END:VCARD")
+    return ("\r\n".join(lines) + "\r\n").encode("utf-8")
+
+
+def splice(raw: bytes, replacements: Mapping[str, tuple[str, ...] | None]) -> bytes:
+    """Replace top-level properties while preserving every unrelated byte."""
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise VcardError("the vCard was not valid UTF-8") from exc
+    ending = b"\r\n" if b"\r\n" in raw else b"\n"
+    physical = raw.splitlines(keepends=True)
+    spans: list[tuple[int, int, str, int]] = []
+    depth = 0
+    card_end = -1
+    index = 0
+    while index < len(physical):
+        start = index
+        index += 1
+        while index < len(physical) and physical[index][:1] in {b" ", b"\t"}:
+            index += 1
+        logical = b"".join(part.rstrip(b"\r\n") for part in physical[start:index])
+        logical = logical.replace(b"\r", b"")
+        segment, separator, value = logical.partition(b":")
+        if not separator:
+            continue
+        raw_name = segment.split(b";", 1)[0].rsplit(b".", 1)[-1]
+        name = raw_name.decode("utf-8").strip().upper()
+        if name == "BEGIN":
+            depth += 1
+        if depth == 1 and name not in {"BEGIN", "END"}:
+            spans.append((start, index, name, depth))
+        if name == "END" and depth == 1:
+            card_end = start
+        if name == "END":
+            depth -= 1
+    wanted = {name.upper(): values for name, values in replacements.items()}
+    first = {name: next((s for s in spans if s[2] == name), None) for name in wanted}
+    output: list[bytes] = []
+    span_at = {start: (end, name) for start, end, name, _ in spans if name in wanted}
+    inserted: set[str] = set()
+    index = 0
+    while index < len(physical):
+        span = span_at.get(index)
+        if span:
+            end, name = span
+            if name not in inserted:
+                values = wanted[name]
+                if values is not None:
+                    for value in values:
+                        output.append(
+                            render_property(name, value).replace("\r\n", ending.decode()).encode()
+                            + ending
+                        )
+                inserted.add(name)
+            index = end
+            continue
+        if index == card_end:
+            for name, values in wanted.items():
+                if name in inserted or first[name] is not None:
+                    continue
+                if values is not None:
+                    for value in values:
+                        output.append(
+                            render_property(name, value).replace("\r\n", ending.decode()).encode()
+                            + ending
+                        )
+                inserted.add(name)
+        output.append(physical[index])
+        index += 1
+    return b"".join(output)
 
 
 @dataclass(frozen=True)
@@ -201,8 +323,7 @@ def parse(raw: bytes) -> list[Property]:
                 raise VcardError("the vCard ended a component it had not begun")
             if components[-1] != component:
                 raise VcardError(
-                    f"the vCard closed {component or 'nothing'} "
-                    f"while {components[-1]} was open"
+                    f"the vCard closed {component or 'nothing'} while {components[-1]} was open"
                 )
             components.pop()
             continue
@@ -223,8 +344,7 @@ def parse(raw: bytes) -> list[Property]:
         version = declared.value.strip()
         if version and version not in VERSIONS:
             raise VcardError(
-                f"the vCard declared version {version!r}; "
-                f"this reads {', '.join(sorted(VERSIONS))}"
+                f"the vCard declared version {version!r}; this reads {', '.join(sorted(VERSIONS))}"
             )
     return properties
 
