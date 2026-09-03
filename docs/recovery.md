@@ -65,6 +65,8 @@ current content is not among the versions listed.
 Restoring a version is safe in a way purging is not: replacing the current
 content makes that content a version in turn, so nothing is lost. The preview
 names which revision would win.
+A restore is confirmed by reading the file back at the planned size; an
+unconfirmed readback is uncertainty.
 
 ## Not modelled
 

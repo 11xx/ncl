@@ -407,3 +407,70 @@ def test_a_version_restore_names_the_revision_that_would_win():
     assert plan.steps[0].action == "version.restore"
     assert "1788000001" in plan.summary
     assert plan.steps[0].details["file_href"] == ORIGINAL
+
+
+def test_a_version_restore_reads_the_file_back_at_the_planned_size():
+    planning, _ = transport_for(
+        response(207, fileid_response()),
+        response(207, multistatus(version_entry("1788000001"))),
+    )
+    plan = recovery.plan_version_restore(
+        PROFILE,
+        session=planning,
+        account_name=ACCOUNT,
+        file_href=ORIGINAL,
+        version_id="1788000001",
+    )
+    executing, _ = transport_for(
+        response(201), response(207, multistatus(file_entry(ORIGINAL, size="12")))
+    )
+
+    result = recovery.execute(PROFILE, session=executing, step=plan.steps[0])
+
+    assert result["verified"] is True
+    assert result["size"] == 12
+
+
+def test_a_version_restore_whose_readback_disagrees_is_uncertain():
+    planning, _ = transport_for(
+        response(207, fileid_response()),
+        response(207, multistatus(version_entry("1788000001"))),
+    )
+    plan = recovery.plan_version_restore(
+        PROFILE,
+        session=planning,
+        account_name=ACCOUNT,
+        file_href=ORIGINAL,
+        version_id="1788000001",
+    )
+    executing, _ = transport_for(
+        response(201), response(207, multistatus(file_entry(ORIGINAL, size="13")))
+    )
+
+    with pytest.raises(files.FileError) as error:
+        recovery.execute(PROFILE, session=executing, step=plan.steps[0])
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+
+
+def test_reconciling_a_version_restore_checks_the_file():
+    planning, _ = transport_for(
+        response(207, fileid_response()),
+        response(207, multistatus(version_entry("1788000001"))),
+    )
+    step = recovery.plan_version_restore(
+        PROFILE,
+        session=planning,
+        account_name=ACCOUNT,
+        file_href=ORIGINAL,
+        version_id="1788000001",
+    ).steps[0]
+    matching, _ = transport_for(
+        response(404), response(207, multistatus(file_entry(ORIGINAL, size="12")))
+    )
+    disagreeing, _ = transport_for(
+        response(404), response(207, multistatus(file_entry(ORIGINAL, size="13")))
+    )
+
+    assert recovery.reconcile(PROFILE, session=matching, step=step)["state"] == "verified"
+    assert recovery.reconcile(PROFILE, session=disagreeing, step=step)["state"] == "uncertain"
