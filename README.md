@@ -73,4 +73,4 @@ Alpha. Breaking changes are made whenever they produce a better design.
 
 ## License
 
-This is free and unencumbered software released into the public domain under the [Unlicense](LICENSE).
+This is free and unencumbered software released into the public domain under the [Unlicense](UNLICENSE).

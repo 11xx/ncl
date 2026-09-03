@@ -36,7 +36,7 @@ wheels = [
 
 [[package]]
 name = "ncl"
-version = "2026.8.17"
+version = "2026.9.3"
 source = { editable = "." }
 dependencies = [
     { name = "icalendar" },

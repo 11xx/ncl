@@ -4,7 +4,7 @@ version = "2026.09.03"
 description = "Programmatic Nextcloud access for AI agents: a deterministic CLI over CalDAV, CardDAV, WebDAV, and OCS for calendars, tasks, contacts, files, shares, trash, and versions."
 readme = "README.md"
 license = "Unlicense"
-license-files = ["LICENSE"]
+license-files = ["UNLICENSE"]
 requires-python = ">=3.11"
 dependencies = ["icalendar>=6", "python-dateutil>=2.9"]
 keywords = ["nextcloud", "caldav", "carddav", "webdav", "cli", "agents"]
@@ -18,6 +18,10 @@ classifiers = [
     "Topic :: Communications",
     "Topic :: Office/Business :: Scheduling",
 ]
+
+[project.urls]
+Repository = "https://github.com/11xx/ncl"
+Documentation = "https://github.com/11xx/ncl#documentation"
 
 [project.scripts]
 ncl = "ncl.cli:main"
