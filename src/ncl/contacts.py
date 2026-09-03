@@ -13,12 +13,14 @@ name is the wrong person rather than a missing one.
 
 from __future__ import annotations
 
+import secrets as token_source
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
-from . import exits, profiles, vcard
+from . import etag, exits, plans, profiles, vcard
 from .caldav import OC
 from .identity import DAV, _element_name, _parse_multistatus, _status_code
 from .identity import _propfind as _identity_propfind
@@ -450,3 +452,298 @@ def search(contacts: list[ContactRef], *, term: str) -> list[ContactRef]:
         or any(needle in address.casefold() for address in contact.emails)
         or any(needle in number.casefold() for number in contact.phones)
     ]
+
+
+def _details(reference: ContactRef) -> dict[str, str]:
+    return {
+        "book_href": reference.book_href,
+        "uid": reference.uid,
+        "full_name": reference.full_name,
+    }
+
+
+def plan_create(profile: Any, *, book_href: str, fields: Mapping[str, object]) -> plans.Plan:
+    book = _scoped(profile, book_href)
+    uid = f"{token_source.token_hex(16)}@ncl"
+    payload = vcard.build(uid=uid, fields=fields)
+    href = book.rstrip("/") + f"/{uid}.vcf"
+    full_name = str(fields.get("fn") or "")
+    return plans.write_bundle(
+        profile=profile,
+        summary=full_name,
+        steps=(
+            plans.freeze_step(
+                action="contact.create",
+                href=href,
+                etag="",
+                summary=full_name,
+                payload=payload,
+                content_type="text/vcard; charset=utf-8",
+                details={"book_href": book, "uid": uid, "full_name": full_name},
+            ),
+        ),
+    )
+
+
+def _name_parts(raw: bytes) -> tuple[str, ...]:
+    """Split the card's own `N` into its parts.
+
+    A parsed value has already had its escapes removed, so splitting one turns
+    an escaped `\\;` inside a surname into a field boundary. Splitting the
+    property as the server sent it keeps such a surname whole.
+    """
+    depth = 0
+    for line in vcard.unfold(raw):
+        segment, separator, value = line.partition(":")
+        if not separator:
+            continue
+        name = segment.split(";", 1)[0].rsplit(".", 1)[-1].strip().upper()
+        if name == "BEGIN":
+            depth += 1
+        elif name == "END":
+            depth -= 1
+        elif depth == 1 and name == "N":
+            return vcard.structured(value)
+    return ()
+
+
+def _strong_etag(reference: ContactRef, action: str) -> str:
+    strong = etag.normalize_strong(reference.etag)
+    if not strong:
+        raise ContactError(
+            f"the server returned no strong ETag for this contact, so a {action} cannot "
+            "be made conditional",
+            exits.MALFORMED_RESPONSE,
+        )
+    return strong
+
+
+def plan_update(
+    profile: Any, *, session: Session, href: str, changes: Mapping[str, object | None]
+) -> plans.Plan:
+    reference_, raw = fetch(profile, session=session, href=href)
+    group = set(reference_.unsupported) & {"KIND", "MEMBER"}
+    if group:
+        raise ContactError(
+            f"this contact carries {', '.join(sorted(group))}, which cannot be spliced safely",
+            exits.UNSUPPORTED_STRUCTURE,
+        )
+    strong = _strong_etag(reference_, "update")
+    replacements: dict[str, tuple[str, ...] | None] = {}
+    names = {
+        "fn": "FN",
+        "email": "EMAIL",
+        "tel": "TEL",
+        "org": "ORG",
+        "title": "TITLE",
+        "note": "NOTE",
+        "birthday": "BDAY",
+    }
+    for field, name in names.items():
+        if field not in changes:
+            continue
+        value = changes[field]
+        if value is None:
+            replacements[name] = None
+        elif field in {"email", "tel"}:
+            replacements[name] = tuple(vcard.escape(str(item)) for item in value)
+        else:
+            replacements[name] = (vcard.escape(str(value)),)
+    if "family" in changes or "given" in changes:
+        # A card's N carries additional names, prefixes, and suffixes past the
+        # two parts named here; rewriting only the parts asked for keeps the
+        # rest of somebody's name from vanishing on an unrelated edit.
+        parts = list(_name_parts(raw))
+        parts.extend("" for _ in range(5 - len(parts)))
+        for position, field in ((0, "family"), (1, "given")):
+            if field in changes:
+                parts[position] = str(changes[field] or "")
+        replacements["N"] = (";".join(vcard.escape(part) for part in parts),)
+    if "categories" in changes:
+        value = changes["categories"]
+        replacements["CATEGORIES"] = (
+            None if value is None else (",".join(vcard.escape(str(item)) for item in value),)
+        )
+    payload = vcard.splice(raw, replacements)
+    updated = reference(
+        profile, book_href=reference_.book_href, href=reference_.href, etag=strong, raw=payload
+    )
+    return plans.write_bundle(
+        profile=profile,
+        summary=updated.full_name,
+        steps=(
+            plans.freeze_step(
+                action="contact.update",
+                href=updated.href,
+                etag=strong,
+                summary=updated.full_name,
+                payload=payload,
+                content_type="text/vcard; charset=utf-8",
+                details=_details(updated),
+            ),
+        ),
+    )
+
+
+def plan_delete(profile: Any, *, session: Session, href: str) -> plans.Plan:
+    reference_, _ = fetch(profile, session=session, href=href)
+    strong = _strong_etag(reference_, "deletion")
+    return plans.write_bundle(
+        profile=profile,
+        summary=reference_.full_name,
+        steps=(
+            plans.freeze_step(
+                action="contact.delete",
+                href=reference_.href,
+                etag=strong,
+                summary=reference_.full_name,
+                details=_details(reference_),
+            ),
+        ),
+    )
+
+
+_ACTIONS = {"contact.create", "contact.update", "contact.delete"}
+
+
+def validate_step(step: plans.Step) -> None:
+    if step.action not in _ACTIONS:
+        raise plans.PlanError(f"unknown contact plan action {step.action!r}", exits.USAGE)
+    body = plans.payload_bytes(step)
+    if step.action == "contact.delete":
+        if body:
+            raise plans.PlanError(
+                "contact deletion steps must not carry a payload", exits.PLAN_STALE
+            )
+        if not etag.normalize_strong(step.etag):
+            raise plans.PlanError("contact deletion needs a strong ETag", exits.PLAN_STALE)
+    elif not step.content_type or not body:
+        raise plans.PlanError("contact write steps need content and a payload", exits.PLAN_STALE)
+    elif step.action == "contact.create" and step.etag:
+        raise plans.PlanError("contact creates cannot carry an ETag", exits.PLAN_STALE)
+    elif step.action == "contact.update" and not etag.normalize_strong(step.etag):
+        raise plans.PlanError("contact updates need a strong ETag", exits.PLAN_STALE)
+
+
+def _semantic(raw: bytes) -> set[tuple[str, tuple[tuple[str, tuple[str, ...]], ...], str]]:
+    cards_ = vcard.cards(raw)
+    if len(cards_) != 1:
+        raise vcard.VcardError("the resource did not contain exactly one vCard")
+    return {
+        (item.name, tuple(sorted(item.parameters.items())), item.value)
+        for item in cards_[0]
+        if item.name not in {"REV", "PRODID"}
+    }
+
+
+def _target(profile: Any, step: plans.Step) -> str:
+    return (
+        _scoped(profile, step.href.rsplit("/", 1)[0] + "/").rstrip("/")
+        + "/"
+        + step.href.rsplit("/", 1)[-1]
+    )
+
+
+def _refuse_redirect(response: Any, *, action: str, href: str) -> None:
+    if (
+        300 <= response.status < 400
+        or response.header("Location")
+        or (response.url and response.url != href)
+    ):
+        raise ContactError(
+            f"the server redirected the contact {action} at {href}; "
+            "the resource must remain exact",
+            exits.MALFORMED_RESPONSE,
+        )
+
+
+def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
+    validate_step(step)
+    target = _target(profile, step)
+    if step.action == "contact.delete":
+        response = session.request(
+            "DELETE", target, headers={"If-Match": step.etag}, max_redirects=0
+        )
+    else:
+        header = {"Content-Type": step.content_type}
+        header["If-None-Match" if step.action == "contact.create" else "If-Match"] = (
+            "*" if step.action == "contact.create" else step.etag
+        )
+        response = session.request(
+            "PUT", target, headers=header, data=plans.payload_bytes(step), max_redirects=0
+        )
+    _refuse_redirect(response, action=step.action, href=target)
+    if response.status == 412:
+        if step.action == "contact.create":
+            raise ContactError(
+                f"{target} already holds a resource; reconcile decides whether it is this plan's",
+                exits.OUTCOME_UNCERTAIN,
+            )
+        raise plans.PlanError(
+            f"the contact at {target} changed since the plan was made; "
+            "re-plan against its current state",
+            exits.CONFLICT,
+        )
+    if response.status == 404 and step.action != "contact.create":
+        raise ContactError(f"no contact exists at {target}", exits.TARGET_NOT_FOUND)
+    if response.status not in {200, 201, 204}:
+        raise ContactError(
+            f"the server refused the {step.action} with status {response.status}",
+            exits.SERVER_ERROR,
+        )
+    result = {"action": step.action, "href": target, "uid": step.details.get("uid", "")}
+    if step.action == "contact.delete":
+        check = session.request("GET", target, headers={"Accept": "text/vcard"}, max_redirects=0)
+        if check.status != 404:
+            raise ContactError(
+                "the server accepted deletion, but the contact is still readable",
+                exits.OUTCOME_UNCERTAIN,
+            )
+        result["verified"] = "deleted"
+        return result
+    try:
+        stored, raw = fetch(profile, session=session, href=target)
+        exact = _semantic(raw) == _semantic(plans.payload_bytes(step))
+    except (ContactError, vcard.VcardError, ValueError, TypeError) as exc:
+        raise ContactError(
+            f"the server accepted {step.action}, but its readback could not be verified",
+            exits.OUTCOME_UNCERTAIN,
+        ) from exc
+    if not exact:
+        raise ContactError(
+            f"the server stored something different at {target}", exits.OUTCOME_UNCERTAIN
+        )
+    result.update({"etag": stored.etag, "full_name": stored.full_name, "verified": True})
+    return result
+
+
+def reconcile(profile: Any, *, session: Session, step: plans.Step) -> dict[str, Any]:
+    validate_step(step)
+    target = _target(profile, step)
+    try:
+        stored, raw = fetch(profile, session=session, href=target)
+    except ContactError as exc:
+        if exc.code == exits.TARGET_NOT_FOUND:
+            return {
+                "state": "pending"
+                if step.action == "contact.create"
+                else "verified"
+                if step.action == "contact.delete"
+                else "uncertain"
+            }
+        raise ContactError(
+            f"the {step.action} readback could not be reconciled", exits.OUTCOME_UNCERTAIN
+        ) from exc
+    try:
+        if step.action != "contact.delete" and _semantic(raw) == _semantic(
+            plans.payload_bytes(step)
+        ):
+            return {"state": "verified"}
+    except (vcard.VcardError, ValueError, TypeError) as exc:
+        raise ContactError(
+            f"the {step.action} readback could not be reconciled",
+            exits.OUTCOME_UNCERTAIN,
+        ) from exc
+    if etag.normalize_strong(stored.etag) == etag.normalize_strong(step.etag):
+        return {"state": "pending"}
+    return {"state": "uncertain"}

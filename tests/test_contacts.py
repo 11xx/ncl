@@ -15,7 +15,7 @@ from unittest.mock import Mock
 import pytest
 from test_auth import FakeTransport, home_response, principal_response, response
 
-from ncl import cli, contacts, exits, secrets, session, vcard
+from ncl import cli, contacts, exits, plans, secrets, session, vcard
 from ncl.config import Profile
 
 PROFILE = Profile(
@@ -387,3 +387,158 @@ def test_the_cli_lists_contacts_without_the_photo(monkeypatch, tmp_path, capsys)
     payload = capsys.readouterr().out
     assert "A" * 100 not in payload
     assert json.loads(payload)["contacts"][0]["full_name"] == "Leon Green"
+
+
+def test_create_plan_freezes_conditional_vcard(monkeypatch):
+    monkeypatch.setattr(contacts.token_source, "token_hex", lambda _: "abc")
+
+    plan = contacts.plan_create(PROFILE, book_href=BOOK, fields={"fn": "Ada"})
+    step = plan.steps[0]
+
+    assert step.action == "contact.create"
+    assert step.href == BOOK + "abc@ncl.vcf"
+    assert step.etag == ""
+    assert step.content_type.startswith("text/vcard")
+    assert b"UID:abc@ncl" in plans.payload_bytes(step)
+    assert b"FN:Ada" in plans.payload_bytes(step)
+
+
+def test_update_plan_splices_and_freezes_strong_etag():
+    fake = FakeTransport([response(200, CARD.encode(), headers={"ETag": '"v1"'})])
+
+    plan = contacts.plan_update(
+        PROFILE,
+        session=session.Session(PROFILE, transport=fake),
+        href=CARD_HREF,
+        changes={"fn": "Changed"},
+    )
+    body = plans.payload_bytes(plan.steps[0])
+
+    assert plan.steps[0].etag == '"v1"'
+    assert b"FN:Changed\r\n" in body
+    assert ("PHOTO;ENCODING=b;TYPE=PNG:" + "A" * 4000 + "\r\n").encode() in body
+
+
+def test_update_plan_keeps_the_name_parts_it_was_not_asked_for():
+    card = CARD.replace("N:Green;Leon;;;", "N:Green;Leon;Ada;Dr.;PhD")
+    fake = FakeTransport([response(200, card.encode(), headers={"ETag": '"v1"'})])
+
+    plan = contacts.plan_update(
+        PROFILE,
+        session=session.Session(PROFILE, transport=fake),
+        href=CARD_HREF,
+        changes={"family": "Grey"},
+    )
+
+    assert b"N:Grey;Leon;Ada;Dr.;PhD\r\n" in plans.payload_bytes(plan.steps[0])
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        CARD.replace("END:VCARD", "KIND:group\r\nMEMBER:x\r\nEND:VCARD").encode(),
+        (CARD + CARD).encode(),
+    ],
+)
+def test_update_refuses_group_and_multi_card_resources(raw):
+    transport = Mock()
+    transport.request.return_value = response(200, raw, headers={"ETag": '"v1"'})
+
+    with pytest.raises(contacts.ContactError) as error:
+        contacts.plan_update(PROFILE, session=transport, href=CARD_HREF, changes={"fn": "Changed"})
+
+    assert error.value.code == exits.UNSUPPORTED_STRUCTURE
+
+
+def test_update_refuses_a_missing_strong_etag():
+    transport = Mock()
+    transport.request.return_value = response(200, CARD.encode())
+
+    with pytest.raises(contacts.ContactError) as error:
+        contacts.plan_update(PROFILE, session=transport, href=CARD_HREF, changes={"fn": "Changed"})
+
+    assert error.value.code == exits.MALFORMED_RESPONSE
+
+
+def test_cli_update_without_changes_is_usage():
+    assert cli.main(["contacts", "update", CARD_HREF]) == exits.USAGE
+
+
+def contact_step(action, *, payload=None, etag='"v1"'):
+    payload = CARD.encode() if payload is None else payload
+    return plans.freeze_step(
+        action=action,
+        href=CARD_HREF,
+        etag=etag,
+        summary="Leon Green",
+        payload=b"" if action == "contact.delete" else payload,
+        content_type="" if action == "contact.delete" else "text/vcard; charset=utf-8",
+        details={"book_href": BOOK, "uid": "leon-1", "full_name": "Leon Green"},
+    )
+
+
+def test_create_precondition_failure_is_uncertain():
+    transport = Mock()
+    transport.request.return_value = response(412)
+
+    with pytest.raises(contacts.ContactError) as error:
+        contacts.execute(PROFILE, session=transport, step=contact_step("contact.create", etag=""))
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+    assert transport.request.call_args.kwargs["headers"]["If-None-Match"] == "*"
+
+
+def test_update_readback_equal_modulo_revision_is_verified():
+    stored = CARD.replace("END:VCARD", "REV:20260903T120000Z\r\nEND:VCARD").encode()
+    transport = Mock()
+    transport.request.side_effect = [response(204), response(200, stored, headers={"ETag": '"v2"'})]
+
+    result = contacts.execute(PROFILE, session=transport, step=contact_step("contact.update"))
+
+    assert result["verified"] is True
+    assert transport.request.call_args_list[0].kwargs["headers"]["If-Match"] == '"v1"'
+
+
+def test_update_readback_difference_is_uncertain():
+    transport = Mock()
+    transport.request.side_effect = [
+        response(204),
+        response(200, CARD.replace("FN:Leon Green", "FN:Other").encode(),
+                 headers={"ETag": '"v2"'}),
+    ]
+
+    with pytest.raises(contacts.ContactError) as error:
+        contacts.execute(PROFILE, session=transport, step=contact_step("contact.update"))
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+
+
+def test_delete_verifies_not_found():
+    transport = Mock()
+    transport.request.side_effect = [response(204), response(404)]
+
+    result = contacts.execute(PROFILE, session=transport, step=contact_step("contact.delete"))
+
+    assert result["verified"] == "deleted"
+
+
+@pytest.mark.parametrize(
+    ("action", "responses", "state"),
+    [
+        ("contact.create", [response(404)], "pending"),
+        ("contact.delete", [response(404)], "verified"),
+        ("contact.update", [response(404)], "uncertain"),
+        ("contact.create", [response(200, CARD.encode(), headers={"ETag": '"v2"'})],
+         "verified"),
+        ("contact.update", [response(200, CARD.replace("FN:Leon Green", "FN:Other").encode(),
+                                             headers={"ETag": '"v1"'})], "pending"),
+        ("contact.delete", [response(200, CARD.encode(), headers={"ETag": '"v2"'})],
+         "uncertain"),
+    ],
+)
+def test_reconcile_classifies_contact_state(action, responses, state):
+    transport = Mock()
+    transport.request.side_effect = responses
+
+    step = contact_step(action, etag="" if action == "contact.create" else '"v1"')
+    assert contacts.reconcile(PROFILE, session=transport, step=step) == {"state": state}

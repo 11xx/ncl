@@ -94,10 +94,22 @@ phone, and organisation. The match happens locally rather than as a CardDAV
 semantics differ across servers, and a search that quietly means something else
 on the next server is worse than one that costs a listing.
 
-## Not modelled
+## Writing contacts
 
-Writing contacts — creating, updating, or deleting a card — is not implemented.
-A partial model that round-tripped would drop whatever it does not know, which
-for a contact means somebody's address disappearing on an unrelated edit; the
-raw card is returned instead so a caller can see everything that is there.
-Groups, `MEMBER` lists, and shared address books are read but not modelled.
+`contacts create`, `contacts update`, and `contacts delete` use the same frozen
+plan lifecycle as calendar mutations. They write full name, structured family
+and given names, repeatable email addresses and phone numbers, organisation,
+title, note, birthday, and categories.
+
+An update splices only the requested top-level properties into the raw card.
+Every other byte, including `PHOTO`, unknown properties, folding, and nested
+components, remains untouched. Changing the family or given name rewrites only
+those two parts of `N`, so additional names, prefixes, and suffixes survive an
+edit that did not name them. Group cards carrying `KIND` or `MEMBER`,
+resources holding multiple cards, and resources without a strong ETag are
+refused rather than rewritten around.
+
+Creates use `If-None-Match: *`; updates and deletes use the strong ETag in
+`If-Match`. A successful write is read back and compared as vCard properties,
+allowing the server to alter `REV`, `PRODID`, and line folding. Any other
+difference leaves the outcome uncertain.

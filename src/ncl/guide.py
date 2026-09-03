@@ -133,12 +133,15 @@ SEE AND CHANGE WHO ELSE CAN REACH A FILE
   server granted beyond the plan — Nextcloud adds the share bit to every public
   link.
 
-READ CONTACTS
+READ AND CHANGE CONTACTS
   ncl contacts books
   ncl contacts list <book>
   ncl contacts changes <book> [--since <cursor>]
   ncl contacts find <book> <term>
   ncl contacts show <contact-href>
+  ncl contacts create <book> --fn <name> [field options]
+  ncl contacts update <contact-href> [field options] [--clear <field>]
+  ncl contacts delete <contact-href>
 
   Address books are DAV collections beside the calendars, bounded by their own
   `addressbooks` allowlist. That key is optional, and absent means none is
@@ -152,7 +155,11 @@ READ CONTACTS
   photo is reported as present rather than inlined: it is routinely a hundred
   kilobytes of base64 and answers nothing that was asked. `contacts show`
   returns the raw vCard beside the typed view, and structure the view does not
-  model is named rather than dropped. Contacts are read-only here.
+  model is named rather than dropped.
+
+  An update splices the named properties into the raw card and leaves every
+  other byte of it alone; group cards, resources holding more than one card,
+  and resources without a strong ETag are refused rather than rewritten.
 
 WORK WITH TASKS
   ncl task list <calendar> [--status <status>]
