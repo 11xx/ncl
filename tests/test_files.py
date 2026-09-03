@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import json
 from collections.abc import Mapping
 
@@ -733,20 +732,22 @@ def _missing(href):
     return response(207, multistatus(failed_entry(href)))
 
 
-#: Twelve bytes, matching the size the metadata fixtures report, so a test that
-#: changes content without changing length is expressible.
-MOVED = b"contents-12."
-OTHER = b"different..."
-
-
-def _content(body: bytes = MOVED, *, etag: str = '"v1"'):
-    return response(200, body, {"ETag": etag})
+def _fileid(href, value="340"):
+    return response(
+        207,
+        multistatus(
+            f'<d:response xmlns:oc="http://owncloud.org/ns"><d:href>{href}</d:href>'
+            "<d:propstat><d:prop>"
+            f"<oc:fileid>{value}</oc:fileid>"
+            "</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+        ),
+    )
 
 
 def _planned_move(transport=None):
     """Freeze one move against the standard source revision."""
     transport = transport or FakeSession(
-        _stat(SCRIPT), _missing(DESTINATION), _content()
+        _stat(SCRIPT), _missing(DESTINATION), _fileid(SCRIPT)
     )
     return files.plan_move(
         PROFILE, session=transport, href=SCRIPT, destination=DESTINATION
@@ -757,10 +758,10 @@ def test_a_move_freezes_both_hrefs_and_refuses_to_overwrite_the_destination():
     transport = FakeSession(
         _stat(SCRIPT),
         _missing(DESTINATION),
-        _content(),
+        _fileid(SCRIPT),
         response(201),
         _stat(DESTINATION, etag='"v2"'),
-        _content(etag='"v2"'),
+        _fileid(DESTINATION),
         _missing(SCRIPT),
     )
 
@@ -822,7 +823,7 @@ def test_a_destination_outside_the_allowlist_is_refused_before_any_request():
 
 def test_a_move_the_server_reports_as_an_overwrite_is_uncertain():
     transport = FakeSession(
-        _stat(SCRIPT), _missing(DESTINATION), _content(), response(204)
+        _stat(SCRIPT), _missing(DESTINATION), _fileid(SCRIPT), response(204)
     )
     plan = files.plan_move(
         PROFILE, session=transport, href=SCRIPT, destination=DESTINATION
@@ -836,7 +837,7 @@ def test_a_move_the_server_reports_as_an_overwrite_is_uncertain():
 
 def test_a_move_the_server_forbids_is_a_server_refusal_not_a_conflict():
     transport = FakeSession(
-        _stat(SCRIPT), _missing(DESTINATION), _content(), response(403)
+        _stat(SCRIPT), _missing(DESTINATION), _fileid(SCRIPT), response(403)
     )
     plan = files.plan_move(
         PROFILE, session=transport, href=SCRIPT, destination=DESTINATION
@@ -850,7 +851,7 @@ def test_a_move_the_server_forbids_is_a_server_refusal_not_a_conflict():
 
 def test_a_move_the_server_refuses_with_412_conflicts_without_moving_anything():
     transport = FakeSession(
-        _stat(SCRIPT), _missing(DESTINATION), _content(), response(412)
+        _stat(SCRIPT), _missing(DESTINATION), _fileid(SCRIPT), response(412)
     )
     plan = files.plan_move(
         PROFILE, session=transport, href=SCRIPT, destination=DESTINATION
@@ -866,10 +867,10 @@ def test_a_move_whose_source_survives_is_uncertain_rather_than_verified():
     transport = FakeSession(
         _stat(SCRIPT),
         _missing(DESTINATION),
-        _content(),
+        _fileid(SCRIPT),
         response(201),
         _stat(DESTINATION, etag='"v2"'),
-        _content(etag='"v2"'),
+        _fileid(DESTINATION),
         _stat(SCRIPT),
     )
     plan = files.plan_move(
@@ -882,49 +883,28 @@ def test_a_move_whose_source_survives_is_uncertain_rather_than_verified():
     assert refusal.value.code == exits.OUTCOME_UNCERTAIN
 
 
-def test_a_move_freezes_the_content_identity_it_read_under_the_source_etag():
-    transport = FakeSession(_stat(SCRIPT), _missing(DESTINATION), _content())
+def test_a_move_freezes_the_file_identifier():
+    transport = FakeSession(_stat(SCRIPT), _missing(DESTINATION), _fileid(SCRIPT))
 
     step = files.plan_move(
         PROFILE, session=transport, href=SCRIPT, destination=DESTINATION
     ).steps[0]
-    read = next(item for item in transport.requests if item["method"] == "GET")
+    read = transport.requests[2]
 
+    assert read["method"] == "PROPFIND"
     assert read["url"] == SCRIPT
-    assert read["headers"]["If-Match"] == '"v1"'
-    assert step.details["sha256"] == hashlib.sha256(MOVED).hexdigest()
+    assert step.details["file_id"] == "340"
+    assert not any(item["method"] == "GET" for item in transport.requests)
 
 
-def test_a_source_that_changes_between_the_two_plan_time_reads_is_refused():
-    """The metadata and the bytes must describe one revision, or there is none."""
-    refused = FakeSession(_stat(SCRIPT), _missing(DESTINATION), response(412))
-
-    with pytest.raises(files.FileError) as raced:
-        files.plan_move(PROFILE, session=refused, href=SCRIPT, destination=DESTINATION)
-
-    assert raced.value.code == exits.CONFLICT
-    assert not any(item["method"] == "MOVE" for item in refused.requests)
-
-    # A server that ignores If-Match answers with the newer revision instead.
-    ignored = FakeSession(
-        _stat(SCRIPT), _missing(DESTINATION), _content(OTHER, etag='"v2"')
-    )
-
-    with pytest.raises(files.FileError) as drifted:
-        files.plan_move(PROFILE, session=ignored, href=SCRIPT, destination=DESTINATION)
-
-    assert drifted.value.code == exits.CONFLICT
-
-
-def test_a_destination_of_the_planned_size_but_other_content_is_uncertain():
-    """Size is not identity: two revisions of one length are not the same file."""
+def test_a_destination_of_the_planned_size_but_another_identifier_is_uncertain():
     transport = FakeSession(
         _stat(SCRIPT),
         _missing(DESTINATION),
-        _content(),
+        _fileid(SCRIPT),
         response(201),
         _stat(DESTINATION, etag='"v2"'),
-        _content(OTHER, etag='"v2"'),
+        _fileid(DESTINATION, "999"),
     )
     plan = files.plan_move(
         PROFILE, session=transport, href=SCRIPT, destination=DESTINATION
@@ -934,7 +914,6 @@ def test_a_destination_of_the_planned_size_but_other_content_is_uncertain():
         _apply_bundle(plan, transport)
 
     assert refusal.value.code == exits.OUTCOME_UNCERTAIN
-    assert len(OTHER) == len(MOVED)
 
 
 def test_a_destination_that_cannot_be_read_after_the_move_is_uncertain():
@@ -949,22 +928,24 @@ def test_a_destination_that_cannot_be_read_after_the_move_is_uncertain():
     assert refusal.value.code == exits.OUTCOME_UNCERTAIN
 
 
-def test_a_move_step_without_a_usable_content_identity_is_stale():
+def test_a_move_step_without_a_usable_file_identifier_is_stale():
     step = _planned_move().steps[0]
 
-    for digest in (None, "", "not-hex", "AB" * 32, "ab" * 31):
-        broken = dataclasses.replace(step, details={**step.details, "sha256": digest})
+    for identifier in (None, "", "abc", "-1", "1" * 21):
+        broken = dataclasses.replace(
+            step, details={**step.details, "file_id": identifier}
+        )
         with pytest.raises(plans.PlanError) as refusal:
             files.validate_step(broken)
         assert refusal.value.code == exits.PLAN_STALE
 
 
-def test_reconciliation_holds_the_destination_to_the_frozen_content():
+def test_reconciliation_holds_the_destination_to_the_frozen_identifier():
     plan = _planned_move()
     step = plan.steps[0]
 
     changed = FakeSession(
-        _stat(DESTINATION, etag='"v2"'), _missing(SCRIPT), _content(OTHER, etag='"v2"')
+        _stat(DESTINATION, etag='"v2"'), _missing(SCRIPT), _fileid(DESTINATION, "999")
     )
     assert files.reconcile(PROFILE, session=changed, step=step) == {"state": "uncertain"}
 
@@ -1026,7 +1007,7 @@ def test_a_move_that_never_reached_the_server_reconciles_as_pending():
 def test_a_completed_move_reconciles_as_verified():
     plan = _planned_move()
     reader = FakeSession(
-        _stat(DESTINATION, etag='"v2"'), _missing(SCRIPT), _content(etag='"v2"')
+        _stat(DESTINATION, etag='"v2"'), _missing(SCRIPT), _fileid(DESTINATION)
     )
 
     assert files.reconcile(PROFILE, session=reader, step=plan.steps[0]) == {

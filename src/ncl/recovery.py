@@ -27,7 +27,7 @@ from typing import Any
 from urllib.parse import quote, unquote, urlsplit
 
 from . import exits, plans, profiles, relocate
-from .files import FileError, _canonical, _segments
+from .files import FileError, _canonical, _segments, file_id
 from .identity import DAV, _element_name, _status_code
 from .session import Session, SessionError
 
@@ -104,12 +104,6 @@ _VERSION_PROPFIND = (
     "<d:getcontentlength/><d:getlastmodified/><d:getetag/><nc:version-label/>"
     "</d:prop></d:propfind>"
 )
-_FILEID_PROPFIND = (
-    '<?xml version="1.0" encoding="UTF-8"?>'
-    f'<d:propfind xmlns:d="DAV:" xmlns:o="{OC}"><d:prop><o:fileid/></d:prop></d:propfind>'
-)
-
-
 def _props(entry: ET.Element) -> dict[tuple[str, str], ET.Element]:
     found: dict[tuple[str, str], ET.Element] = {}
     for propstat in entry:
@@ -357,30 +351,6 @@ def plan_purge(
                 },
             ),
         ),
-    )
-
-
-def file_id(profile: Any, *, session: Session, href: str) -> str:
-    """Read the server's own identifier for a file, which versions are keyed by."""
-    response = session.request(
-        "PROPFIND",
-        href,
-        headers={"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
-        data=_FILEID_PROPFIND,
-    )
-    if response.status == 404:
-        raise FileError(f"no file exists at {href}", exits.TARGET_NOT_FOUND)
-    if response.status != 207:
-        raise FileError("the file identity request did not answer with Multi-Status")
-    for _raw, props in _responses(response.body):
-        value = _text(props, (OC, "fileid"))
-        if value:
-            if not value.isascii() or not value.isdigit():
-                raise FileError("the server returned a malformed file identifier")
-            return value
-    raise FileError(
-        "the server did not report a file identifier, so its versions cannot be addressed",
-        exits.UNSUPPORTED_STRUCTURE,
     )
 
 

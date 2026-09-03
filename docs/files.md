@@ -169,17 +169,13 @@ so a destination that already holds something is a conflict rather than a
 target to replace. The `If-Match` header carries the source ETag observed while
 planning, which RFC 4918 applies to the source of a `MOVE`; a server that
 ignores it leaves the move unconditional on the source, which is why the
-readback is what establishes the outcome. Planning freezes the source's content
-identity: a SHA-256 over bytes read under the very ETag the metadata reported,
-refusing the
-plan outright if the two reads describe different revisions. Size is not
-identity — two revisions of one length are indistinguishable by it — so a move
-is verified by reading the destination back as a file of the planned size
-*whose content hashes to the frozen digest*, and confirming the source returns
-absent. Once the server has accepted the `MOVE`, no failure past that point is
-a clean one: a read that fails, content that does not match, or a source that
-will not confirm its own absence all report an uncertain outcome, and
-reconciliation classifies the same way. A server reporting 204, which means the
+readback is what establishes the outcome. Planning reads `oc:fileid`, the
+identifier Nextcloud keeps across a `MOVE`. The destination is verified as a
+file of the planned size carrying that identifier, with the source absent.
+Nothing is downloaded, so the move costs the same for a gigabyte as for a note.
+Once the server has accepted the `MOVE`, every failure past that point reports
+an uncertain outcome, and reconciliation classifies the same way. A server
+reporting 204, which means the
 destination was overwritten, is likewise uncertain: `Overwrite: F` was sent to
 prevent exactly that.
 
