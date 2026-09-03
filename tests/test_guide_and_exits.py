@@ -84,6 +84,14 @@ def test_top_level_help_describes_resumable_plan_application(capsys):
     assert "Execute a frozen plan, once" not in help_text
 
 
+def test_version_flag_prints_the_package_version(capsys):
+    with pytest.raises(SystemExit) as stop:
+        cli.main(["--version"])
+
+    assert stop.value.code == 0
+    assert capsys.readouterr().out.startswith("ncl ")
+
+
 def test_every_exit_code_has_one_response():
     codes = {
         value
