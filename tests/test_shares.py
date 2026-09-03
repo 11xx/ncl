@@ -344,6 +344,58 @@ def test_creating_sends_the_frozen_form_including_the_password():
     assert "password=s3cret" in body
 
 
+def test_a_share_creation_whose_answer_was_lost_is_uncertain():
+    plan = shares.plan_create(
+        PROFILE,
+        session=transport_for(ocs_response([])),
+        account_name=ACCOUNT,
+        href=HREF,
+        share_type="public_link",
+    )
+
+    with plans.claim(plan.plan_id), pytest.raises(shares.ShareError) as error:
+        plans.apply(
+            PROFILE,
+            session=transport_for(response(500)),
+            plan=plan,
+            dispatchers={
+                "share.": plans.Dispatcher(
+                    shares.validate_step, shares.execute, shares.reconcile
+                )
+            },
+        )
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+    assert plans.read(plan.plan_id).progress[0].state == "uncertain"
+
+
+def test_a_share_creation_the_server_refused_is_not_uncertain():
+    plan = shares.plan_create(
+        PROFILE,
+        session=transport_for(ocs_response([])),
+        account_name=ACCOUNT,
+        href=HREF,
+        share_type="public_link",
+    )
+
+    with plans.claim(plan.plan_id), pytest.raises(shares.ShareError) as error:
+        plans.apply(
+            PROFILE,
+            session=transport_for(
+                ocs_response([], http=403, status=403, message="forbidden")
+            ),
+            plan=plan,
+            dispatchers={
+                "share.": plans.Dispatcher(
+                    shares.validate_step, shares.execute, shares.reconcile
+                )
+            },
+        )
+
+    assert error.value.code == exits.SCOPE_DENIED
+    assert plans.read(plan.plan_id).progress[0].state == "pending"
+
+
 def test_planning_a_revocation_requires_the_share_to_be_allowlisted():
     outside = share_record(id="77", path="/private/secret.txt")
 

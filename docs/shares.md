@@ -77,6 +77,10 @@ than passing over it: refusing it would refuse every public link this server
 makes, and staying silent would leave the approval describing something that
 did not happen.
 
+A creation whose answer was lost is recorded uncertain, because the request
+carries no precondition and a retry would create a second share; reconciliation
+compares the shares on the path with those that existed when the plan was frozen.
+
 Revoking a share that is already gone is the outcome the step wanted, and is
 reported as such, so a resumed plan stays finishable.
 

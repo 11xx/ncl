@@ -435,6 +435,18 @@ def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, An
                 form=form,
             )
         except ocs.OcsError as exc:
+            if exc.code in {
+                exits.SERVER_ERROR,
+                exits.UNREACHABLE,
+                exits.MALFORMED_RESPONSE,
+            }:
+                # The request is unconditional, so retrying after a lost answer could
+                # create a second share instead of recovering from a definite failure.
+                raise ShareError(
+                    f"the request to share {details['path']} was sent but its answer "
+                    "was lost; reconcile decides whether the share exists",
+                    exits.OUTCOME_UNCERTAIN,
+                ) from exc
             raise ShareError(exc.message, exc.code) from exc
         share = _created(profile, data, account_name=_account_of(details["path"], step.href))
         return {
