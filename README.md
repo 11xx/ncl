@@ -70,3 +70,7 @@ Reads are direct. Every write prints a plan and exits 40; `ncl apply <plan-id>` 
 ## Status
 
 Alpha. Breaking changes are made whenever they produce a better design.
+
+## License
+
+This is free and unencumbered software released into the public domain under the [Unlicense](LICENSE).
