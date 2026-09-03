@@ -1,3 +1,5 @@
+import pytest
+
 from ncl import vcard
 
 
@@ -40,3 +42,22 @@ def test_splice_keeps_lf_and_ignores_nested_properties():
     out = vcard.splice(raw, {"FN": ("Changed",)})
 
     assert out == (b"BEGIN:VCARD\nFN:Changed\nBEGIN:X-INNER\nFN:Inner\nEND:X-INNER\nEND:VCARD\n")
+
+
+def test_replacing_a_grouped_property_removes_its_group_siblings():
+    raw = (
+        b"BEGIN:VCARD\r\nVERSION:3.0\r\nitem1.EMAIL:a@b\r\nitem1.X-ABLabel:Work\r\n"
+        b"EMAIL:c@d\r\nX-KEEP:yes\r\nEND:VCARD\r\n"
+    )
+
+    out = vcard.splice(raw, {"EMAIL": ("new@e",)})
+
+    assert b"EMAIL:new@e\r\n" in out
+    assert b"item1." not in out
+    assert b"VERSION:3.0\r\n" in out
+    assert b"X-KEEP:yes\r\nEND:VCARD\r\n" in out
+
+
+def test_a_card_without_end_is_refused():
+    with pytest.raises(vcard.VcardError):
+        vcard.splice(b"BEGIN:VCARD\r\nFN:Leon\r\n", {"FN": ("Other",)})
