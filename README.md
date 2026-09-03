@@ -75,6 +75,8 @@ Reads are direct. Every write prints a plan and exits 40; `ncl apply <plan-id>` 
 
 `make check` runs the tests, ruff, and the build. Tests never touch a server.
 
+Versions are calendar dates, `YYYY.0M.0D`; the build normalizes the padding, so a declared `2026.09.03` produces artifacts named `2026.9.3`, which is PEP 440 at work rather than a mistake. `make install` is editable and pins the checkout's path, so install from the repository rather than from a worktree that will be removed.
+
 ## Status
 
 Alpha. Breaking changes are made whenever they produce a better design.
