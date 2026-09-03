@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import importlib.metadata
 import sys
 from pathlib import Path
 from typing import Any
@@ -133,6 +134,9 @@ def build_parser() -> argparse.ArgumentParser:
             "ncl — programmatic Nextcloud access for agents over CalDAV and WebDAV. "
             "Run `ncl` with no arguments for the workflow guide."
         ),
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"ncl {importlib.metadata.version('ncl')}"
     )
     parser.add_argument("--json", action="store_true", help="Emit JSON")
     parser.add_argument("--profile", help="Select a configured profile")
