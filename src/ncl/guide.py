@@ -107,6 +107,8 @@ SEE AND CHANGE WHO ELSE CAN REACH A FILE
   ncl share list [<href>] [--subfiles]
   ncl share show <id>
   ncl share create <href> (--public | --user <uid> | --group <gid>)
+  ncl share update <id> [--permissions P] [--expires D | --clear-expires] \
+[--password-from F | --clear-password] [--note N] [--label L]
   ncl share delete <id>
 
   A share is the only mutation here that hands a resource to somebody else, and
@@ -114,6 +116,8 @@ SEE AND CHANGE WHO ELSE CAN REACH A FILE
   the same whether or not the world can also read it. So creating one is
   planned and applied like a write, and the preview names who would gain access
   and at what permission.
+
+  An update keeps the link's URL and previews what it gains and withdraws.
 
   An unscoped listing reports every share this account made, including over
   paths the allowlist does not admit and types this tool cannot create. The

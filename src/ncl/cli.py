@@ -924,6 +924,31 @@ def build_parser() -> argparse.ArgumentParser:
     share_create.add_argument("--note", help="Note shown to the recipient")
     share_create.add_argument("--label", help="Label for this share, shown to its owner")
 
+    share_update = share_commands.add_parser(
+        "update", help="Plan changes to an existing share"
+    )
+    _add_options(share_update)
+    share_update.add_argument("share_id", help="Share id, as a listing reports it")
+    share_update.add_argument(
+        "--permissions", choices=sorted(shares.PERMISSION_SETS), help="What the share grants"
+    )
+    update_expiry = share_update.add_mutually_exclusive_group()
+    update_expiry.add_argument("--expires", help="Expiry date, ISO 8601, in the future")
+    update_expiry.add_argument(
+        "--clear-expires", action="store_true", help="Remove the share's expiry"
+    )
+    update_password = share_update.add_mutually_exclusive_group()
+    update_password.add_argument(
+        "--password-from",
+        metavar="PATH",
+        help="Read a link password from a file, so it never enters argv",
+    )
+    update_password.add_argument(
+        "--clear-password", action="store_true", help="Remove the share's password"
+    )
+    share_update.add_argument("--note", help="Note shown to the recipient")
+    share_update.add_argument("--label", help="Label for this share, shown to its owner")
+
     share_delete = share_commands.add_parser(
         "delete", help="Plan the revocation of one share"
     )
@@ -1157,6 +1182,15 @@ def _emit_plan(plan: Any, json_output: bool) -> int:
             if step.details.get("reach"):
                 render.emit(f"       grants  {', '.join(step.details.get('grants', ()))} "
                             f"to {step.details['reach']}")
+            if step.details.get("gained"):
+                render.emit(f"       gains   {', '.join(step.details['gained'])}")
+            if step.details.get("withdrawn"):
+                render.emit(f"       withdraws {', '.join(step.details['withdrawn'])}")
+            if "after" in step.details and (
+                step.details["after"].get("expires")
+                != step.details["before"].get("expires")
+            ):
+                render.emit(f"       expires {step.details['after'].get('expires') or 'never'}")
             if step.details.get("destination"):
                 render.emit(f"       to      {step.details['destination']}")
             if step.details.get("all_day"):
@@ -2090,6 +2124,22 @@ def _run_share(args: argparse.Namespace) -> int:
             permissions=args.permissions,
             password=_share_password(args.password_from),
             expires=args.expires,
+            note=args.note,
+            label=args.label,
+        )
+        return _emit_plan(plan, args.json)
+
+    if args.share_command == "update":
+        plan = shares.plan_update(
+            profile,
+            session=transport,
+            account_name=account,
+            share_id=args.share_id,
+            permissions=args.permissions,
+            expires=args.expires,
+            clear_expires=args.clear_expires,
+            password=_share_password(args.password_from),
+            clear_password=args.clear_password,
             note=args.note,
             label=args.label,
         )

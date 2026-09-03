@@ -243,6 +243,174 @@ def test_planning_a_public_link_sends_nothing_and_names_what_it_grants():
     assert [item["method"] for item in fake.requests] == ["GET"]
 
 
+def test_planning_an_update_names_what_it_gains_and_withdraws():
+    gaining = FakeTransport([ocs_response(share_record(permissions=1))])
+    plan = shares.plan_update(
+        PROFILE,
+        session=session.Session(PROFILE, transport=gaining),
+        account_name=ACCOUNT,
+        share_id="7",
+        permissions="write",
+    )
+
+    assert plan.steps[0].details["gained"] == ["create", "delete", "update"]
+    assert plan.steps[0].details["withdrawn"] == []
+    assert [item["method"] for item in gaining.requests] == ["GET"]
+
+    withdrawing = FakeTransport([ocs_response(share_record(permissions=31))])
+    plan = shares.plan_update(
+        PROFILE,
+        session=session.Session(PROFILE, transport=withdrawing),
+        account_name=ACCOUNT,
+        share_id="7",
+        permissions="read",
+    )
+
+    assert plan.steps[0].details["gained"] == []
+    assert plan.steps[0].details["withdrawn"] == ["create", "delete", "share", "update"]
+    assert [item["method"] for item in withdrawing.requests] == ["GET"]
+
+
+def test_updating_sends_only_the_changed_fields():
+    plan = shares.plan_update(
+        PROFILE,
+        session=transport_for(ocs_response(share_record())),
+        account_name=ACCOUNT,
+        share_id="7",
+        note="recipient note",
+        password="correct-horse",
+    )
+    assert "correct-horse" not in json.dumps(plan.steps[0].as_dict())
+    fake = FakeTransport(
+        [ocs_response(share_record(note="recipient note", password="protected"))]
+    )
+
+    shares.execute(
+        PROFILE, session=session.Session(PROFILE, transport=fake), step=plan.steps[0]
+    )
+
+    body = fake.requests[0]["data"].decode()
+    assert "note=recipient+note" in body
+    assert "password=correct-horse" in body
+    assert "permissions=" not in body
+
+
+def test_an_update_that_changes_nothing_is_refused():
+    with pytest.raises(shares.ShareError) as error:
+        shares.plan_update(
+            PROFILE,
+            session=transport_for(ocs_response(share_record())),
+            account_name=ACCOUNT,
+            share_id="7",
+            note="",
+        )
+
+    assert error.value.code == exits.USAGE
+
+
+def test_an_update_of_an_out_of_scope_share_is_refused():
+    with pytest.raises(shares.ShareError) as error:
+        shares.plan_update(
+            PROFILE,
+            session=transport_for(
+                ocs_response(share_record(path="/private/secret.txt"))
+            ),
+            account_name=ACCOUNT,
+            share_id="7",
+            note="private",
+        )
+
+    assert error.value.code == exits.SCOPE_DENIED
+
+
+def test_an_update_whose_answer_was_lost_is_uncertain():
+    plan = shares.plan_update(
+        PROFILE,
+        session=transport_for(ocs_response(share_record())),
+        account_name=ACCOUNT,
+        share_id="7",
+        note="recipient note",
+    )
+
+    with plans.claim(plan.plan_id), pytest.raises(shares.ShareError) as error:
+        plans.apply(
+            PROFILE,
+            session=transport_for(response(500)),
+            plan=plan,
+            dispatchers={
+                "share.": plans.Dispatcher(
+                    shares.validate_step, shares.execute, shares.reconcile
+                )
+            },
+        )
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+    assert plans.read(plan.plan_id).progress[0].state == "uncertain"
+
+
+def test_reconciling_an_update_reads_the_share_back():
+    plan = shares.plan_update(
+        PROFILE,
+        session=transport_for(ocs_response(share_record(permissions=1))),
+        account_name=ACCOUNT,
+        share_id="7",
+        permissions="write",
+    )
+
+    verified = shares.reconcile(
+        PROFILE,
+        session=transport_for(ocs_response(share_record(permissions=15))),
+        step=plan.steps[0],
+    )
+    pending = shares.reconcile(
+        PROFILE,
+        session=transport_for(ocs_response(share_record(permissions=1))),
+        step=plan.steps[0],
+    )
+    uncertain = shares.reconcile(
+        PROFILE,
+        session=transport_for(ocs_response(share_record(permissions=17))),
+        step=plan.steps[0],
+    )
+
+    assert verified["state"] == "verified"
+    assert verified["share"]["share_id"] == "7"
+    assert pending["state"] == "pending"
+    assert uncertain["state"] == "uncertain"
+
+
+def test_applying_reports_permissions_the_server_widened_or_withheld():
+    widening = shares.plan_update(
+        PROFILE,
+        session=transport_for(ocs_response(share_record(permissions=1))),
+        account_name=ACCOUNT,
+        share_id="7",
+        permissions="write",
+    )
+    widened = shares.execute(
+        PROFILE,
+        session=transport_for(ocs_response(share_record(permissions=31))),
+        step=widening.steps[0],
+    )
+    withholding = shares.plan_update(
+        PROFILE,
+        session=transport_for(ocs_response(share_record(permissions=31))),
+        account_name=ACCOUNT,
+        share_id="7",
+        permissions="write",
+    )
+    withheld = shares.execute(
+        PROFILE,
+        session=transport_for(ocs_response(share_record(permissions=1))),
+        step=withholding.steps[0],
+    )
+
+    assert widened["granted_beyond_plan"] == ["share"]
+    assert widened["withheld_beyond_plan"] == []
+    assert withheld["granted_beyond_plan"] == []
+    assert withheld["withheld_beyond_plan"] == ["create", "delete", "update"]
+
+
 def test_a_link_password_never_reaches_a_caller_visible_view():
     plan = shares.plan_create(
         PROFILE,

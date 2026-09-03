@@ -89,9 +89,21 @@ existed when the plan was frozen. Exactly one new share settles it. Two cannot
 be told apart, so reconciliation refuses to guess and says to revoke by id
 after listing.
 
+## Updating
+
+`ncl share update <id>` changes a share's permissions, expiry, password, note,
+or label in place, preserving the URL of a public link. The preview names
+permission gains and withdrawals separately because widening access and
+shortening it are opposite kinds of change.
+
+Applying reports `granted_beyond_plan` and `withheld_beyond_plan` when the
+server returns permissions that differ from the planned state. A lost answer
+is uncertain rather than retried. Reconciliation reads the share and compares
+its observable permissions, expiry, note, label, and password protection with
+the states before and after the planned update.
+
 ## Not modelled
 
-Changing an existing share — its permissions, expiry, password, or note — is
-not implemented; revoke and recreate. Shares received from other accounts are
-not listed, only shares this account made. Federated, circle, email, and
-conversation shares are read but never created.
+Shares received from other accounts are not listed, only shares this account
+made. Federated, circle, email, and conversation shares are read but never
+created.
