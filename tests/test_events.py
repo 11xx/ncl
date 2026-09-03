@@ -718,6 +718,39 @@ def test_create_plan_and_apply_verify_url_status_and_portable_description():
         plans.read(plan.plan_id)
 
 
+def test_a_create_answered_412_is_uncertain_and_reconciles_when_the_content_is_its_own(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    plan = mutate.plan_create(
+        PROFILE,
+        calendar_href=CAL,
+        summary="Created",
+        start=dt.datetime(2026, 9, 1, 11, tzinfo=dt.UTC),
+        end=dt.datetime(2026, 9, 1, 12, tzinfo=dt.UTC),
+    )
+    stored = plans.payload_bytes(plan.steps[0])
+
+    with pytest.raises(events.EventError) as error:
+        _apply_bundle(plan, _SequenceEventSession(_EventResponse(b"", status=412)))
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+    uncertain = plans.read(plan.plan_id)
+    assert uncertain.progress[0].state == "uncertain"
+
+    with plans.claim(plan.plan_id):
+        result = plans.reconcile(
+            PROFILE,
+            session=_SequenceEventSession(_EventResponse(stored, etag='"v2"')),
+            plan=uncertain,
+            dispatchers=cli._dispatchers(),
+        )
+
+    assert result["state"] == "verified"
+    with pytest.raises(plans.PlanError):
+        plans.read(plan.plan_id)
+
+
 def test_create_readback_verifies_the_planned_end():
     plan = mutate.plan_create(
         PROFILE,

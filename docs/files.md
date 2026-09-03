@@ -147,7 +147,9 @@ write is then read back and compared byte for byte. A deletion is followed by
 a depth-zero lookup that must report the resource absent. An ETag mismatch is
 a conflict; a successful request followed by different or indeterminate stored
 state is an uncertain outcome and blocks the plan until
-`ncl plan reconcile <plan-id>` reads the exact href. Reconciliation compares
+`ncl plan reconcile <plan-id>` reads the exact href. A creation answered 412 is
+uncertain rather than a conflict because something exists at the href and only
+reconciliation can tell whether it is this plan's earlier attempt. Reconciliation compares
 exact file bytes: exact planned content is verified, a missing create is
 pending, the old strong ETag with different content is pending for an existing
 write, a missing delete is verified, and changed content or ETag remains

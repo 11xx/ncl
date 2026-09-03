@@ -395,6 +395,17 @@ def test_create_update_complete_delete_apply_conditionally_and_read_back(tmp_pat
     assert delete_transport.requests[1]["url"] == TASK
 
 
+def test_a_task_create_answered_412_is_uncertain(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    plan = todos.plan_create(PROFILE, calendar_href=CAL, summary="Created", now=NOW)
+
+    with pytest.raises(todos.TodoError) as error:
+        _apply_bundle(plan, FakeSession(response(412)))
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+    assert plans.read(plan.plan_id).progress[0].state == "uncertain"
+
+
 def test_scope_and_etag_conditions_refuse_before_or_during_writes():
     transport = FakeSession()
     with pytest.raises(CalendarError) as scope_error:

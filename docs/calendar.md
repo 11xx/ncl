@@ -270,7 +270,9 @@ malformed response. A calendar deletion is established only when the exact
 href returns 404 after the `DELETE`; a redirect, persistent resource, or
 malformed or unexpected post-write readback is outcome-uncertain. The uncertain
 step blocks the ordered plan until `ncl plan reconcile <plan-id>` reads the
-exact href. Reconciliation compares semantic iCalendar content: an exact
+exact href. A creation answered 412 is uncertain rather than a conflict because
+something exists at the href and only reconciliation can tell whether it is
+this plan's earlier attempt. Reconciliation compares semantic iCalendar content: an exact
 planned create or update is verified, a missing create or an update with its
 old strong ETag and different content is pending, and changed conflicting state
 remains uncertain. A missing delete is verified; its old strong ETag still

@@ -360,7 +360,9 @@ CHANGE NOTHING BY ACCIDENT
   exact planned content verified, returns a demonstrably absent or unchanged
   effect to pending for retry, and keeps changed or conflicting state
   uncertain. Reconciliation reads only; it never retries or writes the
-  mutation.
+  mutation. A creation answered 412 is uncertain rather than a conflict:
+  something exists at the href, and reconciliation reads it to decide whether
+  it is this plan's.
 
   Applying claims the plan before loading it: a simultaneous claimant is
   locked out, and a plan consumed by another caller is not dispatched from an
