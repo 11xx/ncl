@@ -702,7 +702,7 @@ def reconcile(profile: Any, *, session: Session, step: plans.Step) -> dict[str, 
         share_id = step.details["share_id"]
         try:
             fetch(profile, session=session, account_name=account_name, share_id=share_id)
-        except ShareError as exc:
+        except ocs.OcsError as exc:
             if exc.code == exits.TARGET_NOT_FOUND:
                 return {"action": step.action, "state": "verified", "revoked": share_id}
             raise
