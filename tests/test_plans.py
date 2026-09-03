@@ -77,6 +77,18 @@ def reconcile_bundle(plan: plans.Plan, dispatch: plans.Dispatcher):
         )
 
 
+def test_claim_leaves_its_lock_file_in_place(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    plan_id = "persistent-lock"
+
+    with plans.claim(plan_id):
+        pass
+
+    assert (plans._path(plan_id).parent / f"{plan_id}.lock").exists()
+    with plans.claim(plan_id):
+        pass
+
+
 def test_bundle_writer_requires_ordered_nonempty_steps_and_redacts_payload():
     with pytest.raises(plans.PlanError) as error:
         plans.write_bundle(profile="home", summary="empty", steps=[])
