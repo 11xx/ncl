@@ -387,6 +387,21 @@ def test_apply_conditionally_writes_and_verifies_exact_readback():
         plans.read(plan.plan_id)
 
 
+def test_a_file_create_answered_412_is_uncertain():
+    plan = files.plan_write(
+        PROFILE,
+        session=FakeSession(_missing(SCRIPT)),
+        href=SCRIPT,
+        content=b"new",
+    )
+
+    with pytest.raises(files.FileError) as error:
+        _apply_bundle(plan, FakeSession(response(412)))
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+    assert plans.read(plan.plan_id).progress[0].state == "uncertain"
+
+
 def test_apply_keeps_a_plan_when_readback_differs():
     plan = files.plan_write(
         PROFILE,

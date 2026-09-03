@@ -311,7 +311,7 @@ def test_a_transport_failure_mid_upload_still_removes_the_directory(source):
     assert fake.requests[-1]["method"] == "DELETE"
 
 
-def test_an_occupied_destination_is_a_conflict(source):
+def test_an_occupied_destination_is_uncertain_for_a_creation(source):
     size, digest = uploads.measure(source)
     transport, _ = transport_for(response(201), response(201), response(412))
 
@@ -329,7 +329,7 @@ def test_an_occupied_destination_is_a_conflict(source):
             expected_etag="",
         )
 
-    assert error.value.code == exits.CONFLICT
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
 
 
 def test_a_server_without_chunked_upload_says_so(source):

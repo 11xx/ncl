@@ -974,23 +974,32 @@ def test_run_partial_failure_resume_and_uncertain_readback(tmp_path, monkeypatch
         response(200, first_raw, {"ETag": '"a"'}),
         response(412),
     )
-    with plans.claim(plan.plan_id), pytest.raises(plans.PlanError) as error:
+    with plans.claim(plan.plan_id), pytest.raises(runs.RunError) as error:
         plans.apply(PROFILE, session=failing, plan=plan, dispatchers=cli._dispatchers())
-    assert error.value.code == exits.CONFLICT
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
     stored = plans.read(plan.plan_id)
-    assert [item.state for item in stored.progress] == ["verified", "pending", "pending"]
+    assert [item.state for item in stored.progress] == ["verified", "uncertain", "pending"]
     assert [request["method"] for request in failing.requests] == ["PUT", "GET", "PUT"]
 
+    reconciling = FakeSession(response(200, second_raw, {"ETag": '"b"'}))
+    with plans.claim(stored.plan_id):
+        reconciled = plans.reconcile(
+            PROFILE,
+            session=reconciling,
+            plan=stored,
+            dispatchers=cli._dispatchers(),
+        )
+    assert reconciled["state"] == "verified"
+    stored = plans.read(plan.plan_id)
+
     resumed = FakeSession(
-        response(201),
-        response(200, second_raw, {"ETag": '"b"'}),
         response(201),
         response(200, root_raw, {"ETag": '"r"'}),
     )
     with plans.claim(stored.plan_id):
         result = plans.apply(PROFILE, session=resumed, plan=stored, dispatchers=cli._dispatchers())
     assert result["complete"] is True
-    assert [request["url"] for request in resumed.requests[::2]] == [second.href, root.href]
+    assert [request["url"] for request in resumed.requests[::2]] == [root.href]
 
     uncertain_plan = runs.plan_create(
         PROFILE,

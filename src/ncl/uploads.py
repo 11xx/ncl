@@ -238,6 +238,12 @@ def stream_upload(
         if assembled.status == 412:
             assembly_started = False
             replacement_started = False
+            if not overwrite:
+                raise UploadError(
+                    f"{destination} already holds a resource; reconcile decides whether "
+                    "it is this plan's",
+                    exits.OUTCOME_UNCERTAIN,
+                )
             raise UploadError(
                 f"{destination} gained a resource before assembly; nothing was overwritten",
                 exits.CONFLICT,

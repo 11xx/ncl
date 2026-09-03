@@ -1801,6 +1801,11 @@ def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, An
         )
         todos._refuse_redirect(response, action="run update", href=target)
     if response.status == 412:
+        if step.action == "run.create":
+            raise RunError(
+                f"{target} already holds a resource; reconcile decides whether it is this plan's",
+                exits.OUTCOME_UNCERTAIN,
+            )
         raise plans.PlanError(
             f"the run resource at {target} changed since the plan was made; re-plan",
             exits.CONFLICT,

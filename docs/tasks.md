@@ -58,8 +58,10 @@ components. Property order is irrelevant, and CATEGORIES member order is
 treated as a set; only server-managed `DTSTAMP` and `LAST-MODIFIED` refreshes
 are allowed. A delete is successful only after a GET of the exact href returns
 404. A redirect, persistent target, malformed readback, or unreachable
-readback marks the step outcome-uncertain and blocks the plan. `ncl plan
-reconcile <plan-id>` reads the first uncertain task: exact planned content is
+readback marks the step outcome-uncertain and blocks the plan. A creation
+answered 412 is uncertain rather than a conflict because something exists at
+the href and only reconciliation can tell whether it is this plan's earlier
+attempt. `ncl plan reconcile <plan-id>` reads the first uncertain task: exact planned content is
 verified; a missing create or an old strong ETag with different update content
 is pending; a changed or conflicting resource remains uncertain. A missing
 delete is verified, its old strong ETag still present is pending, and changed

@@ -999,6 +999,11 @@ def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, An
     )
 
     if response.status == 412:
+        if step.action == "files.write" and not step.details["exists"]:
+            raise FileError(
+                f"{target} already holds a resource; reconcile decides whether it is this plan's",
+                exits.OUTCOME_UNCERTAIN,
+            )
         raise plans.PlanError(
             f"the file at {target} changed since the plan was made; re-plan against "
             "its current state",
