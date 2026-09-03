@@ -93,6 +93,8 @@ same bytes. Nothing exists at the destination until that final `MOVE`, so a
 failure part-way through a creation leaves the destination untouched. A
 replacement uploads every part first, re-reads the destination ETag, and
 assembles onto the occupant with `Overwrite: T`.
+An upload directory left by an interrupted attempt is removed and recreated,
+because its name is the plan's own token.
 
 Overwriting rather than re-creating is what keeps the destination's file
 identifier, and Nextcloud keys version history, shares, tags, and comments to

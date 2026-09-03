@@ -658,7 +658,11 @@ def reconcile(
 
 @contextmanager
 def claim(plan_id: str):
-    """Hold a plan exclusively while it is read, executed, or reconciled."""
+    """Hold a plan exclusively while it is read, executed, or reconciled.
+
+    The lock file persists, while the kernel owns lock liveness through
+    ``flock``. This is the same rule used by ``login._profile_lock``.
+    """
     plan_path = _path(plan_id)
     path = plan_path.parent / f"{plan_id}.lock"
     try:
@@ -673,6 +677,4 @@ def claim(plan_id: str):
     try:
         yield
     finally:
-        with suppress(OSError):
-            path.unlink()
         os.close(descriptor)
