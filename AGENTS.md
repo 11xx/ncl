@@ -7,12 +7,13 @@ MCP server, no daemon, no browser automation, no prompt layer.
 
 **This is a Nextcloud client, not a calendar client.** It reaches calendars,
 tasks and checkpoint runs, contacts (read-only), files, the trash bin and file
-versions, and shares. The shape of the tool must not assume they are all it
-will ever do: exit codes, profiles, scope allowlists, the secret backend, the
-output boundary, and the plan/apply mutation boundary are app-agnostic and
-belong to the tool, while anything that knows what a VEVENT is belongs beside
-the calendar code. Adding Contacts, Files, Deck, or Notes should mean adding a
-module and its commands, not reworking the foundation.
+versions, shares, and the tags and comments on a file. The shape of the tool
+must not assume they are all it will ever do: exit codes, profiles, scope
+allowlists, the secret backend, the output boundary, and the plan/apply
+mutation boundary are app-agnostic and belong to the tool, while anything that
+knows what a VEVENT is belongs beside the calendar code. Adding Contacts,
+Files, Deck, or Notes should mean adding a module and its commands, not
+reworking the foundation.
 
 ## Status: alpha, and moving
 

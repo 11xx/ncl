@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from . import (
+    annotations,
     appointments,
     caldav,
     checks,
@@ -866,6 +867,67 @@ def build_parser() -> argparse.ArgumentParser:
     _add_options(files_delete)
     files_delete.add_argument("href", help="File href; collection deletion is refused")
 
+    files_tags = file_subcommands.add_parser(
+        "tags", help="List the tags one file carries"
+    )
+    _add_options(files_tags)
+    files_tags.add_argument("href", help="File href, inside the files allowlist")
+
+    files_tag = file_subcommands.add_parser(
+        "tag", help="Plan the assignment of an existing tag; assigns nothing yet"
+    )
+    _add_options(files_tag)
+    files_tag.add_argument("href", help="File href, inside the files allowlist")
+    files_tag.add_argument("name", help="Exact tag name, as `ncl tag list` reports it")
+
+    files_untag = file_subcommands.add_parser(
+        "untag", help="Plan the removal of one tag from a file; removes nothing yet"
+    )
+    _add_options(files_untag)
+    files_untag.add_argument("href", help="File href, inside the files allowlist")
+    files_untag.add_argument("name", help="Exact tag name the file carries")
+
+    files_comments = file_subcommands.add_parser(
+        "comments", help="List the comments on one file"
+    )
+    _add_options(files_comments)
+    files_comments.add_argument("href", help="File href, inside the files allowlist")
+
+    files_comment = file_subcommands.add_parser(
+        "comment", help="Plan a comment on one file; posts nothing yet"
+    )
+    _add_options(files_comment)
+    files_comment.add_argument("href", help="File href, inside the files allowlist")
+    files_comment.add_argument("--message", required=True, help="What the comment says")
+
+    files_uncomment = file_subcommands.add_parser(
+        "uncomment", help="Plan the removal of one comment this account left"
+    )
+    _add_options(files_uncomment)
+    files_uncomment.add_argument("href", help="File href, inside the files allowlist")
+    files_uncomment.add_argument(
+        "comment_id", metavar="comment-id", help="Comment id, as a listing reports it"
+    )
+
+    tag = commands.add_parser(
+        "tag",
+        help="See and create the instance's tags",
+        description=(
+            "System tags are instance-wide labels. Creating one is planned and applied, "
+            "and only an administrator account can take it back out."
+        ),
+    )
+    tag_commands = tag.add_subparsers(dest="tag_command", metavar="<subcommand>")
+
+    tag_list = tag_commands.add_parser("list", help="List every tag this account sees")
+    _add_options(tag_list)
+
+    tag_create = tag_commands.add_parser(
+        "create", help="Plan a new tag; creates nothing yet"
+    )
+    _add_options(tag_create)
+    tag_create.add_argument("name", help="Name for the new tag")
+
     trash = commands.add_parser(
         "trash",
         help="See, restore, or destroy what was deleted",
@@ -1218,8 +1280,12 @@ def _emit_plan(plan: Any, json_output: bool) -> int:
             )
             render.emit(f"       href    {step.href}")
             if step.details.get("reach"):
-                render.emit(f"       grants  {', '.join(step.details.get('grants', ()))} "
-                            f"to {step.details['reach']}")
+                grants = ", ".join(step.details.get("grants", ()))
+                render.emit(
+                    f"       grants  {grants} to {step.details['reach']}"
+                    if grants
+                    else f"       seen by {step.details['reach']}"
+                )
             if step.details.get("gained"):
                 render.emit(f"       gains   {', '.join(step.details['gained'])}")
             if step.details.get("withdrawn"):
@@ -1301,6 +1367,12 @@ def _dispatchers() -> dict[str, plans.Dispatcher]:
         ),
         "files.": plans.Dispatcher(files.validate_step, files.execute, files.reconcile),
         "share.": plans.Dispatcher(shares.validate_step, shares.execute, shares.reconcile),
+        "tag.": plans.Dispatcher(
+            annotations.validate_step, annotations.execute, annotations.reconcile
+        ),
+        "comment.": plans.Dispatcher(
+            annotations.validate_step, annotations.execute, annotations.reconcile
+        ),
         "trash.": plans.Dispatcher(
             recovery.validate_step, recovery.execute, recovery.reconcile
         ),
@@ -2136,6 +2208,65 @@ def _run_files(args: argparse.Namespace) -> int:
         plan = files.plan_delete(profile, session=transport, href=args.href)
         return _emit_plan(plan, args.json)
 
+    if args.files_command == "tags":
+        found = annotations.file_tags(profile, session=transport, href=args.href)
+        if args.json:
+            _json({"tags": [item.as_dict() for item in found]})
+        else:
+            for item in found:
+                render.emit(f"{item.id:>8}  {item.name}")
+        return exits.OK
+
+    if args.files_command in {"tag", "untag"}:
+        planner = annotations.plan_tag if args.files_command == "tag" else annotations.plan_untag
+        plan = planner(profile, session=transport, href=args.href, tag=args.name)
+        return _emit_plan(plan, args.json)
+
+    if args.files_command == "comments":
+        found = annotations.list_comments(profile, session=transport, href=args.href)
+        if args.json:
+            _json({"comments": [item.as_dict() for item in found]})
+        else:
+            for item in found:
+                render.emit(
+                    f"{item.id:>8}  {item.created}  {item.actor_name or item.actor_id}"
+                )
+                render.emit(f"          {item.message}")
+        return exits.OK
+
+    if args.files_command == "comment":
+        plan = annotations.plan_comment(
+            profile, session=transport, href=args.href, message=args.message
+        )
+        return _emit_plan(plan, args.json)
+
+    if args.files_command == "uncomment":
+        plan = annotations.plan_uncomment(
+            profile, session=transport, href=args.href, comment_id=args.comment_id
+        )
+        return _emit_plan(plan, args.json)
+
+    return exits.USAGE
+
+
+def _run_tag(args: argparse.Namespace) -> int:
+    profile = _selected_profile(args)
+
+    if args.tag_command == "list":
+        transport = session.Session(profile)
+        found = annotations.list_tags(profile, session=transport)
+        if args.json:
+            _json({"tags": [item.as_dict() for item in found]})
+        else:
+            for item in found:
+                assignable = "assignable" if item.can_assign else "not-assignable"
+                visible = "visible" if item.user_visible else "hidden"
+                render.emit(f"{item.id:>8}  {visible:<8} {assignable:<15} {item.name}")
+        return exits.OK
+
+    if args.tag_command == "create":
+        return _emit_plan(annotations.plan_create_tag(profile, name=args.name), args.json)
+
     return exits.USAGE
 
 
@@ -2373,6 +2504,8 @@ def _main(argv: list[str] | None = None) -> int:
             return _run_files(args)
         if args.command == "share":
             return _run_share(args)
+        if args.command == "tag":
+            return _run_tag(args)
         if args.command == "trash":
             return _run_trash(args)
         if args.command == "versions":
@@ -2399,6 +2532,7 @@ def _main(argv: list[str] | None = None) -> int:
         uploads.UploadError,
         ocs.OcsError,
         shares.ShareError,
+        annotations.AnnotationError,
         sync.SyncError,
         plans.PlanError,
     ) as exc:
