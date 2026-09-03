@@ -11,7 +11,7 @@ server nor browser automation.
 It reaches calendars, tasks, and contacts through CalDAV and CardDAV, files
 through WebDAV, and shares through OCS. Profiles, scope allowlists, exit codes,
 the secret backend, and the plan/apply boundary belong to the whole tool rather
-than either module.
+than any one module.
 
 THE ORDER
   ncl doctor                    Local preconditions. Run it first; it reports

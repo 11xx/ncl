@@ -104,6 +104,8 @@ _VERSION_PROPFIND = (
     "<d:getcontentlength/><d:getlastmodified/><d:getetag/><nc:version-label/>"
     "</d:prop></d:propfind>"
 )
+
+
 def _props(entry: ET.Element) -> dict[tuple[str, str], ET.Element]:
     found: dict[tuple[str, str], ET.Element] = {}
     for propstat in entry:

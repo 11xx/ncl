@@ -71,7 +71,6 @@ _PROPERTIES = frozenset(
         (DAV, "getlastmodified"),
         (DAV, "getetag"),
         (DAV, "getcontenttype"),
-        (OC, "fileid"),
     }
 )
 #: The alphabet a frozen SHA-256 identity is written in, lowercase so one
@@ -157,13 +156,31 @@ def file_id(profile: Any, *, session: Session, href: str) -> str:
     for entry in root:
         if _element_name(entry) != (DAV, "response"):
             continue
-        props, _absent = _prop_elements(entry)
-        element = props.get((OC, "fileid"))
-        value = (element.text or "").strip() if element is not None else ""
-        if value:
-            if not value.isascii() or not value.isdigit():
-                raise FileError("the server returned a malformed file identifier")
-            return value
+        for propstat in entry:
+            if _element_name(propstat) != (DAV, "propstat"):
+                continue
+            status = next(
+                (item for item in propstat if _element_name(item) == (DAV, "status")),
+                None,
+            )
+            code = _status_code(status.text if status is not None else None)
+            if code is None or not 200 <= code < 300:
+                continue
+            prop = next(
+                (item for item in propstat if _element_name(item) == (DAV, "prop")),
+                None,
+            )
+            if prop is None:
+                continue
+            element = next(
+                (item for item in prop if _element_name(item) == (OC, "fileid")),
+                None,
+            )
+            value = (element.text or "").strip() if element is not None else ""
+            if value:
+                if not value.isascii() or not value.isdigit():
+                    raise FileError("the server returned a malformed file identifier")
+                return value
     raise FileError(
         "the server did not report a file identifier, so its versions cannot be addressed",
         exits.UNSUPPORTED_STRUCTURE,
@@ -422,28 +439,14 @@ def stat_resource(
     raise FileError("the WebDAV response omitted the requested resource")
 
 
-def read_file(
-    profile: Any, *, session: Session, href: str, if_match: str = ""
-) -> tuple[FileRef, bytes]:
-    """Read one scoped file and retain its response metadata.
-
-    `if_match` ties the read to one exact revision. Without it a server that
-    moved on between a metadata read and this one answers with content the
-    caller would wrongly attribute to the revision it asked about; with it, the
-    server refuses instead.
-    """
+def read_file(profile: Any, *, session: Session, href: str) -> tuple[FileRef, bytes]:
+    """Read one scoped file and retain its response metadata."""
     target = _scoped(profile, href)
     headers = {"Accept": "*/*"}
-    if if_match:
-        headers["If-Match"] = if_match
     response = session.request("GET", target, headers=headers, max_redirects=0)
     _refuse_redirect(response, action="read", href=target)
     if response.status == 404:
         raise FileError(f"no file exists at {target}", exits.TARGET_NOT_FOUND)
-    if response.status == 412:
-        raise FileError(
-            f"the file at {target} changed while it was being read", exits.CONFLICT
-        )
     if response.status != 200:
         raise FileError("the file could not be read", exits.SERVER_ERROR)
     return (
