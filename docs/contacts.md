@@ -17,6 +17,16 @@ could not be used to configure one. A server generates books of its own — an
 `Accounts` book of system users, a `Recently contacted` book — and those appear
 as read-only.
 
+## Change detection
+
+`ncl contacts changes <book> [--since <cursor>]` uses one `sync-collection`
+`REPORT`. The first call without `--since` lists every resource and returns a
+cursor; passing it back reports only cards changed or removed since the call.
+The cursor is opaque server state belonging to that one collection, so the
+caller keeps it and pairs it with the same collection. An unknown cursor is a
+conflict; start again with a fresh call without `--since`. The files tree
+offers no sync token, so `files` has no corresponding command.
+
 ## vCard is not iCalendar
 
 Both are line-folded property lists with parameters, and there the resemblance

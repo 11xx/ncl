@@ -103,6 +103,18 @@ what one is. The component set is the property worth reading before writing:
 most servers fix `supported-calendar-component-set` at creation, so a
 collection made without VTODO can never host a task.
 
+## Change detection
+
+`ncl cal changes <calendar> [--since <cursor>]` uses one `sync-collection`
+`REPORT`. The first call without `--since` lists every resource and returns a
+cursor; passing that cursor back reports only resources changed or removed
+since the call. The cursor is opaque server state belonging to that one
+collection, so the caller keeps it and pairs it with the same collection.
+
+An unknown cursor is a conflict; start again with a fresh call without
+`--since`. The files tree offers no sync token, so `files` has no corresponding
+command.
+
 `ncl cal mkcalendar <href> --displayname <name>` plans the creation of one
 collection, with optional `--description`, `--color`, and repeatable
 `--component`. Absent `--component` the collection accepts both VEVENT and
