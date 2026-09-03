@@ -16,6 +16,14 @@ Alternatively, install it with pipx:
 pipx install .
 ```
 
+Or install straight from the repository, without a checkout:
+
+```console
+uv tool install git+https://github.com/11xx/ncl
+```
+
+`pipx install git+https://github.com/11xx/ncl` works the same way. The tool is distributed from git only; it is not published to a package index.
+
 `ncl` requires Python 3.11 or newer and one secret backend: `pass` or `secret-tool` (libsecret).
 
 ## Configure
