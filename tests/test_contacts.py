@@ -522,6 +522,32 @@ def test_delete_verifies_not_found():
     assert result["verified"] == "deleted"
 
 
+def test_a_delete_whose_readback_fails_is_uncertain():
+    transport = Mock()
+    transport.request.side_effect = [
+        response(204),
+        session.SessionError("the connection failed", exits.UNREACHABLE),
+    ]
+    plan = plans.write_bundle(
+        profile=PROFILE, summary="Leon Green", steps=(contact_step("contact.delete"),)
+    )
+
+    with pytest.raises(contacts.ContactError) as error, plans.claim(plan.plan_id):
+        plans.apply(
+            PROFILE,
+            session=transport,
+            plan=plan,
+            dispatchers={
+                "contact.": plans.Dispatcher(
+                    contacts.validate_step, contacts.execute, contacts.reconcile
+                )
+            },
+        )
+
+    assert error.value.code == exits.OUTCOME_UNCERTAIN
+    assert plans.read(plan.plan_id).progress[0].state == "uncertain"
+
+
 @pytest.mark.parametrize(
     ("action", "responses", "state"),
     [

@@ -693,7 +693,15 @@ def execute(profile: Any, *, session: Session, step: plans.Step) -> dict[str, An
         )
     result = {"action": step.action, "href": target, "uid": step.details.get("uid", "")}
     if step.action == "contact.delete":
-        check = session.request("GET", target, headers={"Accept": "text/vcard"}, max_redirects=0)
+        try:
+            check = session.request(
+                "GET", target, headers={"Accept": "text/vcard"}, max_redirects=0
+            )
+        except (ContactError, SessionError) as exc:
+            raise ContactError(
+                f"the absence of {target} could not be verified after deletion",
+                exits.OUTCOME_UNCERTAIN,
+            ) from exc
         if check.status != 404:
             raise ContactError(
                 "the server accepted deletion, but the contact is still readable",
