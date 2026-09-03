@@ -17,6 +17,8 @@ from . import etag, exits, plans, profiles, relocate, uploads
 from .identity import DAV, _element_name, _status_code
 from .session import Session, SessionError, absolute_url
 
+OC = "http://owncloud.org/ns"
+
 
 class FileError(RuntimeError):
     """A file resource or WebDAV response was not usable."""
@@ -58,6 +60,10 @@ _PROPFIND = (
     "<d:getetag/><d:getcontenttype/>"
     "</d:prop></d:propfind>"
 )
+_FILEID_PROPFIND = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    f'<d:propfind xmlns:d="DAV:" xmlns:o="{OC}"><d:prop><o:fileid/></d:prop></d:propfind>'
+)
 _PROPERTIES = frozenset(
     {
         (DAV, "resourcetype"),
@@ -65,6 +71,7 @@ _PROPERTIES = frozenset(
         (DAV, "getlastmodified"),
         (DAV, "getetag"),
         (DAV, "getcontenttype"),
+        (OC, "fileid"),
     }
 )
 #: The alphabet a frozen SHA-256 identity is written in, lowercase so one
@@ -127,6 +134,40 @@ def _size(value: str, *, collection: bool) -> int | None:
         raise FileError("the server returned a malformed file size")
     parsed = int(value)
     return None if collection else parsed
+
+
+def file_id(profile: Any, *, session: Session, href: str) -> str:
+    """Read the server's own identifier for a file."""
+    response = session.request(
+        "PROPFIND",
+        href,
+        headers={"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
+        data=_FILEID_PROPFIND,
+    )
+    if response.status == 404:
+        raise FileError(f"no file exists at {href}", exits.TARGET_NOT_FOUND)
+    if response.status != 207:
+        raise FileError("the file identity request did not answer with Multi-Status")
+    try:
+        root = ET.fromstring(response.body)
+    except ET.ParseError as exc:
+        raise FileError("the response was not valid XML") from exc
+    if _element_name(root) != (DAV, "multistatus"):
+        raise FileError("the response was not a Multi-Status response")
+    for entry in root:
+        if _element_name(entry) != (DAV, "response"):
+            continue
+        props, _absent = _prop_elements(entry)
+        element = props.get((OC, "fileid"))
+        value = (element.text or "").strip() if element is not None else ""
+        if value:
+            if not value.isascii() or not value.isdigit():
+                raise FileError("the server returned a malformed file identifier")
+            return value
+    raise FileError(
+        "the server did not report a file identifier, so its versions cannot be addressed",
+        exits.UNSUPPORTED_STRUCTURE,
+    )
 
 
 def _prop_elements(
@@ -594,30 +635,6 @@ def plan_delete(profile: Any, *, session: Session, href: str) -> plans.Plan:
     )
 
 
-def _freeze_content(
-    profile: Any, *, session: Session, reference: FileRef, source_etag: str
-) -> str:
-    """Return the SHA-256 identity of the revision a move is planned against.
-
-    Size is not identity. Two revisions of the same length are indistinguishable
-    by it, so a move verified on length alone accepts a destination holding
-    content that was never planned. The digest is taken over bytes read under
-    the very ETag the metadata reported, and a revision that changed between the
-    two reads is refused rather than hashed — the alternative is a plan that
-    promises a state which never existed.
-    """
-    stored, content = read_file(
-        profile, session=session, href=reference.href, if_match=source_etag
-    )
-    returned = etag.normalize_strong(stored.etag)
-    if (returned is not None and returned != source_etag) or len(content) != reference.size:
-        raise FileError(
-            f"{reference.href} changed while its move was being planned; plan it again",
-            exits.CONFLICT,
-        )
-    return hashlib.sha256(content).hexdigest()
-
-
 def _frozen_digest(step: plans.Step) -> str:
     """Return the content identity a move step froze, refusing a malformed one."""
     digest = step.details.get("sha256")
@@ -630,25 +647,6 @@ def _frozen_digest(step: plans.Step) -> str:
             "a move step needs a SHA-256 content identity", exits.PLAN_STALE
         )
     return digest
-
-
-def _destination_matches(
-    profile: Any, *, session: Session, step: plans.Step, destination: str
-) -> FileRef:
-    """Read the moved resource back and hold it to the frozen identity."""
-    moved = stat_resource(profile, session=session, href=destination, missing_ok=True)
-    if moved is None or moved.collection or moved.size != step.details.get("size"):
-        raise FileError(
-            f"the resource at {destination} is not the file that was moved",
-            exits.OUTCOME_UNCERTAIN,
-        )
-    _, content = read_file(profile, session=session, href=destination)
-    if hashlib.sha256(content).hexdigest() != _frozen_digest(step):
-        raise FileError(
-            f"the content at {destination} is not the content that was moved",
-            exits.OUTCOME_UNCERTAIN,
-        )
-    return moved
 
 
 def plan_move(profile: Any, *, session: Session, href: str, destination: str) -> plans.Plan:
@@ -678,9 +676,7 @@ def plan_move(profile: Any, *, session: Session, href: str, destination: str) ->
             f"{target} already holds a resource; nothing was moved", exits.CONFLICT
         )
     source_etag = _strong_etag(existing.etag, "a file move")
-    digest = _freeze_content(
-        profile, session=session, reference=existing, source_etag=source_etag
-    )
+    identifier = file_id(profile, session=session, href=source)
     return plans.write_bundle(
         profile=profile,
         summary=existing.name,
@@ -690,7 +686,11 @@ def plan_move(profile: Any, *, session: Session, href: str, destination: str) ->
                 href=source,
                 etag=source_etag,
                 summary=existing.name,
-                details={"destination": target, "size": existing.size, "sha256": digest},
+                details={
+                    "destination": target,
+                    "size": existing.size,
+                    "file_id": identifier,
+                },
             ),
         ),
     )
@@ -735,12 +735,23 @@ def _execute_move(profile: Any, *, session: Session, step: plans.Step) -> dict[s
     )
     # Past this line the server has accepted the move, so nothing that follows
     # can report a clean failure: every way of not establishing the outcome —
-    # a read that fails, content that does not hash to the frozen identity, a
+    # a read that fails, a destination without the frozen identifier, a
     # source that will not confirm its own absence — is uncertainty.
     try:
-        moved = _destination_matches(
-            profile, session=session, step=step, destination=destination
+        moved = stat_resource(
+            profile, session=session, href=destination, missing_ok=True
         )
+        if moved is None or moved.collection or moved.size != step.details.get("size"):
+            raise FileError(
+                f"the resource at {destination} is not the file that was moved",
+                exits.OUTCOME_UNCERTAIN,
+            )
+        if file_id(profile, session=session, href=destination) != step.details["file_id"]:
+            raise FileError(
+                f"the resource at {destination} does not carry the identifier of the file "
+                "that was moved",
+                exits.OUTCOME_UNCERTAIN,
+            )
         if stat_resource(profile, session=session, href=source, missing_ok=True) is not None:
             raise FileError(
                 f"the server still reports a file at {source} after the move",
@@ -795,13 +806,13 @@ def _reconcile_move(profile: Any, *, session: Session, step: plans.Step) -> dict
     if remaining is not None or moved.collection or moved.size != step.details.get("size"):
         return {"state": "uncertain"}
     try:
-        _, content = read_file(profile, session=session, href=destination)
+        landed = file_id(profile, session=session, href=destination)
     except FileError:
         # A destination that exists but cannot be read leaves the move
         # unestablished, which is the one thing reconciliation must not call
         # verified.
         return {"state": "uncertain"}
-    if hashlib.sha256(content).hexdigest() != _frozen_digest(step):
+    if landed != step.details.get("file_id"):
         return {"state": "uncertain"}
     return {"state": "verified"}
 
@@ -838,7 +849,17 @@ def validate_step(step: plans.Step) -> None:
             raise plans.PlanError("file move steps must not carry a payload", exits.PLAN_STALE)
         if not str(step.details.get("destination", "")):
             raise plans.PlanError("a move step needs a destination", exits.PLAN_STALE)
-        _frozen_digest(step)
+        identifier = step.details.get("file_id")
+        if (
+            not isinstance(identifier, str)
+            or not identifier
+            or not identifier.isascii()
+            or not identifier.isdigit()
+            or len(identifier) > 20
+        ):
+            raise plans.PlanError(
+                "a move step needs the file identifier it froze", exits.PLAN_STALE
+            )
         _strong_etag(step.etag, "a file move")
         return
     if step.action == "files.mkcol":

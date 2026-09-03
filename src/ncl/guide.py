@@ -324,9 +324,10 @@ CHANGE NOTHING BY ACCIDENT
   so existing references still resolve, and `Overwrite: F` means an occupied
   destination refuses instead of being replaced. A move addresses the resource,
   so a recurring master travels with every override that shares its file and no
-  occurrence can be moved away from its series. A file move freezes the exact
-  content it read while planning and holds the destination to that identity
-  afterwards, so a same-sized replacement cannot pass as the file that moved.
+  occurrence can be moved away from its series. A file move freezes the server's
+  identifier for the file while planning and holds the destination to it
+  afterwards, so a same-sized replacement cannot pass as the file that moved and
+  nothing is downloaded to prove it.
 
   Creating a collection is the one mutation that enlarges what the tool can
   reach, because the allowlist is a prefix list and a new collection under an
