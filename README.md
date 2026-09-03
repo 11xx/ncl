@@ -60,6 +60,7 @@ Reads are direct. Every write prints a plan and exits 40; `ncl apply <plan-id>` 
 - [Files](docs/files.md) — File operations over WebDAV.
 - [Recovery](docs/recovery.md) — Restoring deletions and overwritten content.
 - [Shares](docs/shares.md) — Share operations over OCS.
+- [Annotations](docs/annotations.md) — Tags and comments on files.
 - [Contributor invariants](AGENTS.md) — The design and safety invariants contributors keep.
 
 ## Development

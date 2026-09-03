@@ -133,6 +133,27 @@ SEE AND CHANGE WHO ELSE CAN REACH A FILE
   server granted beyond the plan — Nextcloud adds the share bit to every public
   link.
 
+SAY SOMETHING ABOUT A FILE
+  ncl tag list
+  ncl tag create <name>
+  ncl files tags <file-href>
+  ncl files tag <file-href> <tag-name>
+  ncl files untag <file-href> <tag-name>
+  ncl files comments <file-href>
+  ncl files comment <file-href> --message <text>
+  ncl files uncomment <file-href> <comment-id>
+
+  A tag is visible to everyone who can see the file and the tag list is
+  instance-wide, so assigning one is planned like a share and the preview names
+  the tag, the file, and that reach. Tags are addressed by exact name; two tags
+  sharing one are ambiguous rather than guessed between.
+
+  Creating a tag cannot be taken back from here: the server refuses a tag's
+  deletion to anything but an administrator account, so the plan records the
+  creation as irreversible the way a purge does. Only a comment's author may
+  remove it. Custom DAV properties are not offered, because the server accepts
+  a PROPPATCH of an arbitrary property and then does not store it.
+
 READ AND CHANGE CONTACTS
   ncl contacts books
   ncl contacts list <book>
