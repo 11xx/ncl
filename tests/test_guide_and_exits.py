@@ -50,6 +50,14 @@ def test_guide_is_nonempty_and_names_only_registered_commands():
     assert mentioned, "the guide names no commands at all"
 
 
+def test_guide_states_the_replacement_and_permission_contracts():
+    text = guide.render()
+    assert "Overwrite: T" in text
+    assert "unmodelled:" in text
+    assert "overwrite disabled" not in text
+    assert "refused rather than hidden" not in text
+
+
 def test_bare_cli_preserves_multiline_appointment_examples(capsys):
     assert cli.main([]) == exits.OK
 

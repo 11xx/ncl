@@ -8,9 +8,10 @@ GUIDE = """ncl — use a Nextcloud instance programmatically, from a command lin
 directly instead of driving a browser, and is deliberately neither an MCP
 server nor browser automation.
 
-It reaches calendars through CalDAV and files through WebDAV. Profiles, scope
-allowlists, exit codes, the secret backend, and the plan/apply boundary belong
-to the whole tool rather than either module.
+It reaches calendars, tasks, and contacts through CalDAV and CardDAV, files
+through WebDAV, and shares through OCS. Profiles, scope allowlists, exit codes,
+the secret backend, and the plan/apply boundary belong to the whole tool rather
+than either module.
 
 THE ORDER
   ncl doctor                    Local preconditions. Run it first; it reports
@@ -115,8 +116,9 @@ SEE AND CHANGE WHO ELSE CAN REACH A FILE
   paths the allowlist does not admit and types this tool cannot create. The
   allowlist bounds what may be reached; a listing that hid a public link
   because its path was unconfigured would answer the wrong question. Revoking
-  one still requires its file href to be allowlisted, and unknown permission
-  bits are refused rather than hidden.
+  one still requires its file href to be allowlisted. A permission bit this
+  tool does not model is named `unmodelled:<n>` rather than refused, and
+  applying reports it as reach the plan did not promise.
 
   A link password comes from `--password-from <file>`, never an argument, and
   its length is withheld from plan output along with its value. `--permissions`
@@ -263,17 +265,23 @@ REACH ALLOWLISTED FILES
 
   File hrefs must be inside one of the profile's `files_roots`. Only content
   declared as textual and decodable as UTF-8 is sent to redacted stdout; binary
-  and non-UTF-8 content needs `--output`.
+  and non-UTF-8 content needs `--output`. Every file request stays on its exact
+  href and refuses redirects. An existing output path is refused unless
+  `--force` is explicit.
 
   A write larger than a few megabytes streams in parts through the server's
   chunked upload rather than freezing its bytes in the plan. What the plan
   freezes then is the source's size and SHA-256, and applying refuses if the
-  file changed underneath. A replacement conditionally deletes only the ETag
-  the plan observed before assembling with overwrite disabled; after that
-  deletion any unconfirmed outcome is uncertain and the old revision remains
-  in trash. Applying hashes the assembled bytes in windows. A ranged read
-  writes its window at its own offset only when `Content-Range` confirms that
-  interval; a server that ignores or shifts the range is refused.
+  file changed underneath. A replacement uploads every part first, re-reads the
+  destination's ETag, and assembles onto the occupant with `Overwrite: T`, which
+  keeps the file identifier that version history, shares, tags, and comments
+  are keyed to; the displaced revision becomes a version. The server enforces
+  no precondition on that assembly, so a write landing between the ETag read
+  and the assembling MOVE is displaced into version history rather than
+  refused, and an unconfirmed assembly is uncertain. Applying hashes the
+  assembled bytes in windows. A ranged read writes its window at its own offset
+  only when `Content-Range` confirms that interval; a server that ignores or
+  shifts the range is refused.
 
   `files find` asks the server where a file is rather than walking the tree
   for it, and needs at least one condition: a search with none is a recursive
@@ -282,11 +290,6 @@ REACH ALLOWLISTED FILES
   result outside the searched subtree or outside the allowlist is a refusal,
   not a filtered row — the server chose what matched, so its answer is where
   a scope escape would arrive.
-
-  unknown, or non-UTF-8 content requires `files read --output <path>` to write
-  its exact bytes to a local file. Every file request stays on its exact href
-  and refuses redirects. An existing output path is refused unless `--force`
-  is explicit.
 
 CHANGE NOTHING BY ACCIDENT
   ncl cal create <calendar> --summary S --from <iso> --to <iso>
