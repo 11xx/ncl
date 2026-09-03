@@ -460,8 +460,31 @@ def test_update_refuses_a_missing_strong_etag():
     assert error.value.code == exits.MALFORMED_RESPONSE
 
 
+def test_a_surname_with_an_escaped_semicolon_survives_the_typed_view_and_an_update():
+    card = CARD.replace("N:Green;Leon;;;", "N:Smith\\;Jones;Ada;;;").encode()
+    fake = FakeTransport([response(200, card, headers={"ETag": '"v1"'})])
+
+    view = contacts.reference(PROFILE, book_href=BOOK, href=CARD_HREF, etag='"v1"', raw=card)
+    plan = contacts.plan_update(
+        PROFILE,
+        session=session.Session(PROFILE, transport=fake),
+        href=CARD_HREF,
+        changes={"given": "Bea"},
+    )
+
+    assert view.family_name == "Smith;Jones"
+    assert view.given_name == "Ada"
+    assert b"N:Smith\\;Jones;Bea;;;\r\n" in plans.payload_bytes(plan.steps[0])
+
+
 def test_cli_update_without_changes_is_usage():
     assert cli.main(["contacts", "update", CARD_HREF]) == exits.USAGE
+
+
+def test_setting_and_clearing_one_field_is_a_usage_error():
+    assert cli.main(["contacts", "update", CARD_HREF, "--org", "Acme", "--clear", "org"]) == (
+        exits.USAGE
+    )
 
 
 def contact_step(action, *, payload=None, etag='"v1"'):
