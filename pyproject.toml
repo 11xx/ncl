@@ -1,7 +1,7 @@
 [project]
 name = "ncl"
 version = "2026.08.17"
-description = "Programmatic Nextcloud access for AI agents: a CLI covering calendars and tasks today, and further Nextcloud apps as they are added."
+description = "Programmatic Nextcloud access for AI agents: a deterministic CLI over CalDAV, CardDAV, WebDAV, and OCS for calendars, tasks, contacts, files, shares, trash, and versions."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["icalendar>=6", "python-dateutil>=2.9"]
