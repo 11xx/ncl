@@ -120,6 +120,8 @@ def splice(raw: bytes, replacements: Mapping[str, tuple[str, ...] | None]) -> by
             card_end = start
         if name == "END":
             depth -= 1
+    if card_end < 0:
+        raise VcardError("the vCard did not close the card it opened")
     wanted = {name.upper(): values for name, values in replacements.items()}
     first = {name: next((s for s in spans if s[2] == name), None) for name in wanted}
     output: list[bytes] = []

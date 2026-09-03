@@ -547,6 +547,44 @@ def build_parser() -> argparse.ArgumentParser:
     _add_options(contacts_show)
     contacts_show.add_argument("href", help="Contact resource href")
 
+    def contact_fields(parser: argparse.ArgumentParser, *, require_name: bool) -> None:
+        parser.add_argument("--fn", required=require_name, help="Full name, as displayed")
+        parser.add_argument("--family")
+        parser.add_argument("--given")
+        parser.add_argument("--email", action="append", help="Repeatable; replaces the set")
+        parser.add_argument("--tel", action="append", help="Repeatable; replaces the set")
+        parser.add_argument("--org")
+        parser.add_argument("--title")
+        parser.add_argument("--note")
+        parser.add_argument("--birthday", help="YYYY-MM-DD")
+        parser.add_argument(
+            "--category",
+            action="append",
+            dest="categories",
+            help="Repeatable; replaces the set",
+        )
+
+    contacts_create = contact_commands.add_parser("create", help="Plan a contact creation")
+    _add_options(contacts_create)
+    contacts_create.add_argument("book", help="Address book href, or an unambiguous name")
+    contact_fields(contacts_create, require_name=True)
+
+    contacts_update = contact_commands.add_parser("update", help="Plan a contact update")
+    _add_options(contacts_update)
+    contacts_update.add_argument("href", help="Contact resource href")
+    contact_fields(contacts_update, require_name=False)
+    contacts_update.add_argument(
+        "--clear",
+        action="append",
+        default=[],
+        choices=("email", "tel", "org", "title", "note", "birthday", "categories"),
+        help="Remove a field from the card; repeatable",
+    )
+
+    contacts_delete = contact_commands.add_parser("delete", help="Plan a contact deletion")
+    _add_options(contacts_delete)
+    contacts_delete.add_argument("href", help="Contact resource href")
+
     task = commands.add_parser(
         "task",
         help="Tasks in CalDAV collections",
@@ -1202,6 +1240,7 @@ def _emit_run_plan(value: Any, *, json_output: bool) -> int:
 def _dispatchers() -> dict[str, plans.Dispatcher]:
     return {
         "cal.": plans.Dispatcher(mutate.validate_step, mutate.execute, mutate.reconcile),
+        "contact.": plans.Dispatcher(contacts.validate_step, contacts.execute, contacts.reconcile),
         "task.": plans.Dispatcher(todos.validate_step, todos.execute, todos.reconcile),
         "run.": plans.Dispatcher(
             runs.validate_step,
@@ -1504,9 +1543,57 @@ def _resolved_book(profile, transport, target: str) -> str:
     return contacts.resolve(books, target).href
 
 
+_CONTACT_FIELDS = (
+    "fn",
+    "family",
+    "given",
+    "email",
+    "tel",
+    "org",
+    "title",
+    "note",
+    "birthday",
+    "categories",
+)
+
+
+def _contact_changes(args: argparse.Namespace) -> dict[str, Any]:
+    """Read one update's field options as the changes the plan is asked for."""
+    changes: dict[str, Any] = {
+        name: getattr(args, name) for name in _CONTACT_FIELDS if getattr(args, name) is not None
+    }
+    both = sorted(set(args.clear) & set(changes))
+    if both:
+        raise contacts.ContactError(
+            f"{', '.join(both)} was both set and cleared; ask for one of the two",
+            exits.USAGE,
+        )
+    if not changes and not args.clear:
+        raise contacts.ContactError("a contact update needs at least one change", exits.USAGE)
+    changes.update(dict.fromkeys(args.clear))
+    return changes
+
+
 def _run_contacts(args: argparse.Namespace) -> int:
+    changes = _contact_changes(args) if args.contacts_command == "update" else {}
     profile = _selected_profile(args)
     transport = session.Session(profile)
+
+    if args.contacts_command == "create":
+        book = _resolved_book(profile, transport, args.book)
+        fields = {name: getattr(args, name) for name in _CONTACT_FIELDS}
+        return _emit_plan(contacts.plan_create(profile, book_href=book, fields=fields), args.json)
+
+    if args.contacts_command == "update":
+        return _emit_plan(
+            contacts.plan_update(profile, session=transport, href=args.href, changes=changes),
+            args.json,
+        )
+
+    if args.contacts_command == "delete":
+        return _emit_plan(
+            contacts.plan_delete(profile, session=transport, href=args.href), args.json
+        )
 
     if args.contacts_command == "books":
         principal = identity.discover(profile, session=transport).principal_url
