@@ -8,7 +8,9 @@ creation says that it cannot be taken back.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
+from email.utils import format_datetime
 
 import pytest
 from test_auth import FakeTransport, home_response, principal_response, response
@@ -532,12 +534,21 @@ def test_reconciling_a_posted_comment_counts_only_this_accounts_matching_message
         PROFILE, session=planning, href=FILE, message="looks good"
     )
     step = plan.steps[0]
-    later = "Fri, 04 Sep 2026 10:11:12 GMT"
+    floor = dt.datetime.fromisoformat(step.details["planned_at"])
+    earlier = format_datetime(floor - dt.timedelta(seconds=1), usegmt=True)
+    later = format_datetime(floor + dt.timedelta(seconds=1), usegmt=True)
 
     pending, _fake = transport_for(
         response(207, comment_listing()), principal_response(), home_response()
     )
     assert annotations.reconcile(PROFILE, session=pending, step=step)["state"] == "pending"
+
+    stale, _fake = transport_for(
+        response(207, comment_listing(comment_entry("6", "looks good", created=earlier))),
+        principal_response(),
+        home_response(),
+    )
+    assert annotations.reconcile(PROFILE, session=stale, step=step)["state"] == "pending"
 
     verified, _fake = transport_for(
         response(207, comment_listing(comment_entry("7", "looks good", created=later))),
