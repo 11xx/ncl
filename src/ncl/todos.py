@@ -21,7 +21,7 @@ from .caldav import CalendarError, _canonical
 from .identity import CALDAV, DAV, _element_name, _status_code
 from .session import Session, SessionError
 
-PRODID = "-//ai-agent-nextcloud//ncl//EN"
+PRODID = "-//ncl//ncl//EN"
 
 TODO_STATUSES = ("NEEDS-ACTION", "IN-PROCESS", "COMPLETED", "CANCELLED")
 PRIORITY_RANGE = range(0, 10)

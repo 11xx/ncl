@@ -30,7 +30,7 @@ from .identity import CALDAV, DAV, _element_name
 from .scheduling import SchedulingError, SchedulingIdentity, canonical_address
 from .session import Session
 
-PRODID = "-//ai-agent-nextcloud//ncl//EN"
+PRODID = "-//ncl//ncl//EN"
 
 #: The iTIP request status prefix a server uses for a delivered answer. RFC 5546
 #: numbers success ``2.x``; every other class is a refusal for that recipient.

@@ -18,7 +18,7 @@ from .caldav import CalendarError
 from .events import EventError
 from .session import Session, SessionError
 
-PRODID = "-//ai-agent-nextcloud//ncl//EN"
+PRODID = "-//ncl//ncl//EN"
 
 
 def _stamp(moment: dt.datetime) -> dt.datetime:
